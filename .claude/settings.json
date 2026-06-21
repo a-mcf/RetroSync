@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make *)",
+      "Bash(podman *)",
+      "Bash(go *)",
+      "Bash(git *)",
+      "Bash(gh repo *)",
+      "Bash(gh pr *)",
+      "Bash(gh api *)",
+      "Bash(gh auth *)"
+    ]
+  }
+}
