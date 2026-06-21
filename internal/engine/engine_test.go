@@ -713,6 +713,411 @@ func TestPoll_PrimaryVanished_Conflict_PeersUntouched(t *testing.T) {
 	h.assertFile("peerB", []byte("V1"), srcMtime)
 }
 
+// --- Conflict resolution -------------------------------------------------
+
+// backupSuffix mirrors engine.backupSuffix for test assertions: the
+// filesystem-safe sibling-backup suffix for a resolution at t.
+func backupSuffix(t time.Time) string {
+	return ".retrosync-conflict-" + t.UTC().Format("20060102T150405.000000000Z")
+}
+
+// activateConflicted sets up primary + peer, activates cleanly, then mutates the
+// peer out-of-band and polls to flag the conflict. Returns the harness, the
+// primary's (winner-candidate) save mtime, and the time the conflict was
+// flagged. After this the binding is conflicted (paused) and ready to resolve.
+//   - primary "p.srm": "PRIMARY" at primaryMtime (the eventual winner content)
+//   - peer    "q.srm": "PEER-WROTE" at peerMtime (the loser's divergent content)
+func activateConflicted(t *testing.T) (h *harness, primaryMtime, peerMtime time.Time) {
+	t.Helper()
+	h = newHarness(t, steppingClock(t0, time.Second))
+	primaryMtime = t0.Add(-time.Hour)
+	peerMtime = t0.Add(2 * time.Hour)
+	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
+	h.addNode("peer", "q.srm", nil, t0, false)
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+		t.Fatal(err)
+	}
+	// After activation the peer holds PRIMARY@primaryMtime; mutate it out of band.
+	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), peerMtime)
+	if err := h.engine.Poll(ctx(), gameID); err != nil {
+		t.Fatal(err)
+	}
+	if h.binding().ConflictAt == nil {
+		t.Fatal("setup: expected the binding to be conflicted")
+	}
+	return h, primaryMtime, peerMtime
+}
+
+func TestResolveConflict_PrimaryWins_BacksUpLoserAndFansOut(t *testing.T) {
+	h, primaryMtime, peerMtime := activateConflicted(t)
+
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// The <ts> in the backup path is the RESOLUTION time, which the engine also
+	// records as last_synced on the (now-cleared) binding.
+	resolvedAt := h.binding().LastSynced
+	if resolvedAt == nil {
+		t.Fatal("last_synced should be set after resolution")
+	}
+	// The loser's ORIGINAL file was backed up to <path>.retrosync-conflict-<ts>
+	// on the loser's node, with the loser's original bytes + mtime.
+	suffix := backupSuffix(*resolvedAt)
+	backupPath := "q.srm" + suffix
+	bf, ok := h.fake("peer").Get(backupPath)
+	if !ok {
+		t.Fatalf("loser backup %q not found; paths=%v", backupPath, h.fake("peer").Paths())
+	}
+	if string(bf.Data) != "PEER-WROTE" {
+		t.Fatalf("backup content = %q want PEER-WROTE", bf.Data)
+	}
+	if !bf.Mtime.Equal(peerMtime) {
+		t.Fatalf("backup mtime = %v want %v (loser's original)", bf.Mtime, peerMtime)
+	}
+
+	// Every peer now holds the WINNER's bytes + mtime.
+	h.assertFile("peer", []byte("PRIMARY"), primaryMtime)
+
+	// Manifest updated for winner + every written node to the winner's mtime/size.
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.Mtime == nil || !m.Mtime.Equal(primaryMtime) {
+			t.Fatalf("%s manifest mtime = %v want %v", id, m.Mtime, primaryMtime)
+		}
+		if m.Size == nil || *m.Size != int64(len("PRIMARY")) {
+			t.Fatalf("%s manifest size = %v want %d", id, m.Size, len("PRIMARY"))
+		}
+	}
+
+	// conflict_at cleared (last_synced asserted above).
+	if b := h.binding(); b.ConflictAt != nil {
+		t.Fatalf("conflict_at should be cleared, got %v", b.ConflictAt)
+	}
+
+	// sync_log has the backup row (message names the backup path) and the fan-out
+	// ok row. There is 1 backup + 1 fan-out copy here.
+	entries, err := h.store.ListLogByGame(ctx(), gameID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backups, fanouts int
+	for _, e := range entries {
+		if e.Outcome != store.OutcomeOK {
+			continue
+		}
+		if strings.Contains(e.Message, "conflict-resolve backup") {
+			backups++
+			if !strings.Contains(e.Message, backupPath) {
+				t.Fatalf("backup log message should name the backup path, got %q", e.Message)
+			}
+		} else {
+			fanouts++
+		}
+	}
+	if backups != 1 {
+		t.Fatalf("backup log rows = %d want 1", backups)
+	}
+	if fanouts < 1 {
+		t.Fatalf("expected at least one fan-out ok row, got %d", fanouts)
+	}
+}
+
+func TestResolveConflict_NotConflicted_Errors_NothingMutated(t *testing.T) {
+	h, srcMtime := activateClean(t) // clean, no conflict
+	okBefore := h.logCount(store.OutcomeOK)
+	writesBefore := len(h.fake("peer").Writes()) // activation already wrote once
+
+	err := h.engine.ResolveConflict(ctx(), gameID, "primary")
+	if !errors.Is(err, engine.ErrNotConflicted) {
+		t.Fatalf("want ErrNotConflicted, got %v", err)
+	}
+	// Nothing mutated: no new writes/logs, no backup files, binding untouched.
+	if got := h.logCount(store.OutcomeOK); got != okBefore {
+		t.Fatalf("ResolveConflict on a clean binding logged rows: %d -> %d", okBefore, got)
+	}
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("no new writes expected: %d -> %d", writesBefore, got)
+	}
+	h.assertFile("peer", []byte("V1"), srcMtime)
+}
+
+func TestResolveConflict_WinnerNotInScope_Errors_NothingMutated(t *testing.T) {
+	h, _, _ := activateConflicted(t)
+	conflictBefore := h.binding().ConflictAt
+	okBefore := h.logCount(store.OutcomeOK)
+
+	err := h.engine.ResolveConflict(ctx(), gameID, "ghost-node")
+	if !errors.Is(err, engine.ErrNoPath) {
+		t.Fatalf("want ErrNoPath, got %v", err)
+	}
+	if got := h.binding().ConflictAt; got == nil || !got.Equal(*conflictBefore) {
+		t.Fatalf("conflict_at must remain set/unchanged, got %v", got)
+	}
+	if got := h.logCount(store.OutcomeOK); got != okBefore {
+		t.Fatalf("nothing should have been logged: %d -> %d", okBefore, got)
+	}
+}
+
+func TestResolveConflict_WinnerHasNoFile_Errors_NothingMutated(t *testing.T) {
+	h, _, peerMtime := activateConflicted(t)
+	conflictBefore := h.binding().ConflictAt
+	writesBefore := len(h.fake("peer").Writes()) // activation wrote once
+	// Remove the primary's file so the chosen winner has nothing to fan out.
+	h.fake("primary").Remove("p.srm")
+
+	err := h.engine.ResolveConflict(ctx(), gameID, "primary")
+	if !errors.Is(err, engine.ErrSourceMissing) {
+		t.Fatalf("want ErrSourceMissing, got %v", err)
+	}
+	// Still conflicted, peer untouched (no backup, no overwrite).
+	if got := h.binding().ConflictAt; got == nil || !got.Equal(*conflictBefore) {
+		t.Fatalf("conflict_at must remain set, got %v", got)
+	}
+	h.assertFile("peer", []byte("PEER-WROTE"), peerMtime)
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("no new writes (incl. backup) expected when the winner has no file: %d -> %d", writesBefore, got)
+	}
+}
+
+func TestResolveConflict_NodeWithoutFile_NoBackup_StillReceivesWinner(t *testing.T) {
+	// Three nodes: primary (winner) + peerA (has a divergent file) + peerB (NO
+	// file). peerB must get NO backup but must still RECEIVE the winner's file.
+	h := newHarness(t, steppingClock(t0, time.Second))
+	primaryMtime := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
+	h.addNode("peerA", "a.srm", nil, t0, false)
+	h.addNode("peerB", "b.srm", nil, t0, false)
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+		t.Fatal(err)
+	}
+	// peerA mutates out of band (becomes a loser with a file); peerB is then wiped
+	// so it has NO file at resolution time.
+	peerAMtime := t0.Add(2 * time.Hour)
+	h.fake("peerA").Mutate("a.srm", []byte("A-WROTE"), peerAMtime)
+	if err := h.engine.Poll(ctx(), gameID); err != nil {
+		t.Fatal(err)
+	}
+	if h.binding().ConflictAt == nil {
+		t.Fatal("setup: expected conflict")
+	}
+	h.fake("peerB").Remove("b.srm")
+
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	resolvedAt := h.binding().LastSynced
+	if resolvedAt == nil {
+		t.Fatal("last_synced should be set after resolution")
+	}
+	suffix := backupSuffix(*resolvedAt)
+	// peerA (had a file) got a backup with its original bytes.
+	bf, ok := h.fake("peerA").Get("a.srm" + suffix)
+	if !ok {
+		t.Fatalf("peerA backup missing; paths=%v", h.fake("peerA").Paths())
+	}
+	if string(bf.Data) != "A-WROTE" || !bf.Mtime.Equal(peerAMtime) {
+		t.Fatalf("peerA backup = %q@%v want A-WROTE@%v", bf.Data, bf.Mtime, peerAMtime)
+	}
+	// peerB (no file) got NO backup...
+	if _, ok := h.fake("peerB").Get("b.srm" + suffix); ok {
+		t.Fatal("peerB had no file; it must NOT have a backup")
+	}
+	// ...but STILL received the winner's file.
+	h.assertFile("peerB", []byte("PRIMARY"), primaryMtime)
+	h.assertFile("peerA", []byte("PRIMARY"), primaryMtime)
+}
+
+func TestResolveConflict_FanOutFails_LeavesConflictSet_Reresolvable(t *testing.T) {
+	// A WriteAtomic failure during fan-out must leave conflict_at STILL set and
+	// return the error, so the resolution can be retried.
+	h, primaryMtime, peerMtime := activateConflicted(t)
+	conflictBefore := h.binding().ConflictAt
+
+	boom := errors.New("sftp: connection reset")
+	// Fail only the fan-out WRITE to the peer's real path (not the backup path),
+	// so the backup succeeds but the overwrite fails.
+	h.fake("peer").FailWriteAtomic("q.srm", boom)
+
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); !errors.Is(err, boom) {
+		t.Fatalf("want fan-out write error, got %v", err)
+	}
+	// Conflict must remain set (re-resolvable).
+	if got := h.binding().ConflictAt; got == nil || !got.Equal(*conflictBefore) {
+		t.Fatalf("conflict_at must remain set after a partial fan-out, got %v", got)
+	}
+	// The backup of the loser's ORIGINAL file was written before the failed
+	// overwrite (insurance held). The fan-out failed so last_synced was not set;
+	// locate the backup by its conflict-backup prefix.
+	var backupPath string
+	for _, p := range h.fake("peer").Paths() {
+		if strings.HasPrefix(p, "q.srm.retrosync-conflict-") {
+			backupPath = p
+		}
+	}
+	if backupPath == "" {
+		t.Fatalf("loser backup must exist even on a failed fan-out; paths=%v", h.fake("peer").Paths())
+	}
+	bf, _ := h.fake("peer").Get(backupPath)
+	if string(bf.Data) != "PEER-WROTE" || !bf.Mtime.Equal(peerMtime) {
+		t.Fatalf("backup = %q@%v want PEER-WROTE@%v", bf.Data, bf.Mtime, peerMtime)
+	}
+
+	// Recover: clear the failure and re-resolve. It now succeeds.
+	h.fake("peer").FailWriteAtomic("q.srm", nil)
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+		t.Fatalf("re-resolve after recovery: %v", err)
+	}
+	h.assertFile("peer", []byte("PRIMARY"), primaryMtime)
+	if h.binding().ConflictAt != nil {
+		t.Fatal("conflict_at should be cleared after a successful re-resolution")
+	}
+}
+
+// subSecondClock returns a Clock whose successive values share the SAME
+// wall-clock second but differ by 1ns per call. It exists to prove the
+// backup-suffix collision fix: two resolves in the same second must compute
+// DIFFERENT backup paths. With the old whole-second suffix every value here
+// formats identically (collision); with sub-second precision they differ.
+func subSecondClock(start time.Time) engine.Clock {
+	cur := start
+	return func() time.Time {
+		t := cur
+		cur = cur.Add(time.Nanosecond)
+		return t
+	}
+}
+
+func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *testing.T) {
+	// Two resolutions of the SAME binding within one wall-clock second (a
+	// double-click, or a retry after a partial fan-out) must NOT compute the same
+	// backup path: the second WriteAtomic would otherwise clobber the first
+	// loser's only preserved snapshot. The clock returns sub-second-distinct times
+	// in the same second, so the two backups must land at DIFFERENT paths.
+	//
+	// This test would FAIL against the old whole-second suffix format: both
+	// resolutions would format to the identical <ts>, the second backup would
+	// overwrite the first, and only one snapshot would survive.
+	start := time.Date(2026, 6, 21, 12, 0, 0, 1, time.UTC) // ...:00.000000001Z
+	h := newHarness(t, subSecondClock(start))
+	primaryMtime := t0.Add(-time.Hour)
+	peerMtime1 := t0.Add(2 * time.Hour)
+	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
+	h.addNode("peer", "q.srm", nil, t0, false)
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// First conflict: peer diverges, poll flags it, then resolve (primary wins).
+	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE-1"), peerMtime1)
+	if err := h.engine.Poll(ctx(), gameID); err != nil {
+		t.Fatal(err)
+	}
+	if h.binding().ConflictAt == nil {
+		t.Fatal("setup: expected first conflict")
+	}
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	firstResolvedAt := *h.binding().LastSynced
+	firstBackup := "q.srm" + backupSuffix(firstResolvedAt)
+	if _, ok := h.fake("peer").Get(firstBackup); !ok {
+		t.Fatalf("first backup %q missing; paths=%v", firstBackup, h.fake("peer").Paths())
+	}
+
+	// Second conflict on the SAME binding, resolved later in the SAME second.
+	peerMtime2 := t0.Add(3 * time.Hour)
+	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE-2"), peerMtime2)
+	if err := h.engine.Poll(ctx(), gameID); err != nil {
+		t.Fatal(err)
+	}
+	if h.binding().ConflictAt == nil {
+		t.Fatal("setup: expected second conflict")
+	}
+	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	secondResolvedAt := *h.binding().LastSynced
+	secondBackup := "q.srm" + backupSuffix(secondResolvedAt)
+
+	// Both resolutions happened in the same wall-clock second...
+	if firstResolvedAt.Truncate(time.Second) != secondResolvedAt.Truncate(time.Second) {
+		t.Fatalf("test premise broken: resolutions not in the same second: %v vs %v", firstResolvedAt, secondResolvedAt)
+	}
+	// ...yet the backup paths must be DISTINCT (the fix).
+	if firstBackup == secondBackup {
+		t.Fatalf("same-second resolves produced the SAME backup path %q: the second clobbers the first loser's only snapshot", firstBackup)
+	}
+
+	// Both snapshots must coexist with their original divergent bytes intact.
+	bf1, ok := h.fake("peer").Get(firstBackup)
+	if !ok {
+		t.Fatalf("first backup %q was clobbered; paths=%v", firstBackup, h.fake("peer").Paths())
+	}
+	if string(bf1.Data) != "PEER-WROTE-1" || !bf1.Mtime.Equal(peerMtime1) {
+		t.Fatalf("first backup = %q@%v want PEER-WROTE-1@%v", bf1.Data, bf1.Mtime, peerMtime1)
+	}
+	bf2, ok := h.fake("peer").Get(secondBackup)
+	if !ok {
+		t.Fatalf("second backup %q missing; paths=%v", secondBackup, h.fake("peer").Paths())
+	}
+	if string(bf2.Data) != "PEER-WROTE-2" || !bf2.Mtime.Equal(peerMtime2) {
+		t.Fatalf("second backup = %q@%v want PEER-WROTE-2@%v", bf2.Data, bf2.Mtime, peerMtime2)
+	}
+}
+
+// --- NodeStates ----------------------------------------------------------
+
+func TestNodeStates_PerNodePresentMtimeSize_SortedByNodeID(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	pMtime := t0.Add(-time.Hour)
+	aMtime := t0.Add(2 * time.Hour)
+	// Register out of node-id order to prove the result is sorted.
+	h.addNode("primary", "p.srm", []byte("PRIMARY"), pMtime, true)
+	h.addNode("alpha", "a.srm", []byte("ALPHALONG"), aMtime, true)
+	h.addNode("zeta", "z.srm", nil, t0, false) // absent
+
+	states, err := h.engine.NodeStates(ctx(), gameID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{"alpha", "primary", "zeta"}
+	if len(states) != len(wantIDs) {
+		t.Fatalf("got %d states want %d: %+v", len(states), len(wantIDs), states)
+	}
+	for i, want := range wantIDs {
+		if states[i].NodeID != want {
+			t.Fatalf("states[%d].NodeID = %q want %q (sorted)", i, states[i].NodeID, want)
+		}
+	}
+	byNode := map[string]engine.NodeState{}
+	for _, s := range states {
+		byNode[s.NodeID] = s
+	}
+	if s := byNode["alpha"]; !s.Present || !s.Mtime.Equal(aMtime) || s.Size != int64(len("ALPHALONG")) {
+		t.Fatalf("alpha = %+v want present @%v size %d", s, aMtime, len("ALPHALONG"))
+	}
+	if s := byNode["primary"]; !s.Present || !s.Mtime.Equal(pMtime) || s.Size != int64(len("PRIMARY")) {
+		t.Fatalf("primary = %+v want present @%v size %d", s, pMtime, len("PRIMARY"))
+	}
+	// Absent node: Present=false, zero mtime/size.
+	if s := byNode["zeta"]; s.Present || !s.Mtime.IsZero() || s.Size != 0 {
+		t.Fatalf("zeta = %+v want absent (Present=false, zero mtime/size)", s)
+	}
+}
+
+func TestNodeStates_StatError_IsReturned(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	h.addNode("primary", "p.srm", []byte("PRIMARY"), t0, true)
+	boom := errors.New("sftp: host down")
+	h.fake("primary").FailStat("p.srm", boom)
+
+	if _, err := h.engine.NodeStates(ctx(), gameID); !errors.Is(err, boom) {
+		t.Fatalf("a non-ErrNotExist Stat error must be returned, got %v", err)
+	}
+}
+
 // --- finalPass conflict message distinguishable in sync_log --------------
 
 func TestDeactivate_ConflictMessage_MarksFinalPass(t *testing.T) {
