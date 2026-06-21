@@ -337,10 +337,20 @@ func (s *Server) userOwnsNode(ctx context.Context, u store.User, nodeID string) 
 	return n.OwnerUserID != nil && *n.OwnerUserID == u.ID, nil
 }
 
-// refreshDashboard re-renders the full dashboard. HTMX swaps it into the page;
-// a non-HTMX form post sees the same HTML (progressive enhancement). On a build
-// error it falls back to a redirect to "/".
+// refreshDashboard re-renders the full dashboard with an implicit 200. HTMX
+// swaps it into the page; a non-HTMX form post sees the same HTML (progressive
+// enhancement). On a build error it falls back to a redirect to "/".
 func (s *Server) refreshDashboard(w http.ResponseWriter, r *http.Request, u store.User) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	s.writeDashboardFragment(w, r, u)
+}
+
+// writeDashboardFragment renders the dashboard body without writing a status
+// line, so callers that have already set a non-200 status (e.g. the
+// resolve-conflict "already resolved" 409 refresh) can reuse the same HTML. On a
+// build error it redirects to "/" — but only if no status/body has been written
+// yet (the caller must not have called WriteHeader before a possible failure).
+func (s *Server) writeDashboardFragment(w http.ResponseWriter, r *http.Request, u store.User) {
 	data, err := s.buildDashboard(r.Context(), u)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "refresh dashboard build failed", "err", err.Error())
@@ -348,7 +358,6 @@ func (s *Server) refreshDashboard(w http.ResponseWriter, r *http.Request, u stor
 		return
 	}
 	data.CSRF = s.csrfFor(r)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.templates.ExecuteTemplate(w, "dashboard", data); err != nil {
 		s.logger.ErrorContext(r.Context(), "refresh dashboard render failed", "err", err.Error())
 	}

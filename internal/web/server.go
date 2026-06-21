@@ -8,9 +8,12 @@
 // buttons, the activation "use my save" modal, force-takeover, and per-session
 // CSRF protection on every state-changing POST. The web layer drives play-sync
 // only through the narrow Actioner interface (no internal/reach import).
-// Conflict RESOLUTION (the "Use <node>" winner action) and the /games /nodes
-// registry editing UI remain out of scope; their hook points are marked
-// TODO(slice-conflict-resolve) / TODO(slice-registry).
+//
+// Slice-9 adds conflict RESOLUTION: the dashboard conflict banner, the conflict
+// modal (GET /games/{id}/conflict) that surfaces every node's live state, and
+// the owner/admin-gated, CSRF-protected POST /api/games/{id}/resolve-conflict
+// that drives the engine's ResolveConflict. The /games /nodes registry editing
+// UI remains out of scope; its hook point is marked TODO(slice-registry).
 package web
 
 import (
@@ -23,6 +26,7 @@ import (
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/auth"
+	"github.com/a-mcf/retrosync/internal/engine"
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
@@ -39,13 +43,25 @@ type ctxKey int
 const userCtxKey ctxKey = iota
 
 // Actioner is the narrow play-sync surface the web layer drives for the action
-// endpoints (activate / deactivate). It is deliberately small and reach-free:
-// the web package must NOT import internal/reach or any persistence driver — it
-// depends only on this interface, which *engine.Engine satisfies. main.go wires
+// endpoints (activate / deactivate / resolve-conflict). It is deliberately small
+// and reach-free: the web package must NOT import internal/reach or any
+// persistence driver — it depends only on this interface, which *engine.Engine
+// satisfies. The web package MAY depend on internal/engine for the NodeState
+// value type (engine is core play-sync logic, not infrastructure). main.go wires
 // the real engine; tests pass a recording stub.
 type Actioner interface {
 	Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string, force bool) error
 	Deactivate(ctx context.Context, gameID string) error
+	// ResolveConflict makes winnerNodeID's current save the authority for a
+	// conflicted binding, fanning it out to every other in-scope peer (after
+	// backing each loser up) and clearing the conflict flag. The single most
+	// destructive action in the system: the POST handler gates it on
+	// owner-or-admin AND CSRF before ever reaching here.
+	ResolveConflict(ctx context.Context, gameID, winnerNodeID string) error
+	// NodeStates returns the live per-node state (mtime, size, presence) of every
+	// in-scope node, read-only, for the conflict modal to render so the human can
+	// pick a winner with full disclosure.
+	NodeStates(ctx context.Context, gameID string) ([]engine.NodeState, error)
 }
 
 // Server holds the web service's dependencies. Construct with New; build the
@@ -153,9 +169,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/games/{id}/activate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleActivate))))
 	mux.Handle("POST /api/games/{id}/deactivate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleDeactivate))))
 
-	// TODO(slice-conflict-resolve): POST /api/games/{id}/resolve-conflict and the
-	// "Use <node>" winner modal/buttons (the dashboard already DISPLAYS conflict
-	// state; the resolve action is out of scope this slice).
+	// Conflict resolution (slice-9). The modal fragment is a read-only GET
+	// (viewable by any authenticated user, consistent with "can see others'
+	// sessions" — docs/ui.md / brief D). The resolve POST is the single most
+	// destructive action in the system: it is wrapped in requireCSRF AND re-checks
+	// owner-or-admin inside the handler before touching the engine.
+	mux.Handle("GET /games/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
+	mux.Handle("POST /api/games/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
+
 	// TODO(slice-registry): GET/POST /games, /nodes registry editing + node
 	// smoke-test.
 

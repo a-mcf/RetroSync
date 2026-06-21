@@ -89,6 +89,14 @@ section > h2 {
   padding: 0.5rem 0.75rem;
   margin-top: 0.5rem;
 }
+/* The "Resolve conflict" button inside the red banner. */
+.conflict-btn {
+  display: block;
+  margin-top: 0.6rem;
+  border-color: var(--bad);
+  background: var(--bad);
+  color: #0b0d10;
+}
 
 /* Big tap targets. The "Play on <node>" action is meant to be the largest
    thing on the page once slice-actions wires it up. */

@@ -44,8 +44,15 @@
           <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
           <div class="sub">Bound on <strong>{{.PrimaryNode}}</strong> since {{.Since}}</div>
           {{if .Conflict}}
-            <div class="conflict">Sync paused — more than one node changed. (Resolve in a later release.)</div>
-            <!-- TODO(slice-actions): per-node "Use &lt;node&gt;" winner buttons -->
+            <div class="conflict">
+              <strong>Sync paused — more than one node changed.</strong>
+              retrosync won't choose for you.
+              <button class="btn conflict-btn"
+                      hx-get="/games/{{.GameID}}/conflict"
+                      hx-target="#modal" hx-swap="innerHTML">
+                Resolve conflict
+              </button>
+            </div>
           {{end}}
           {{if .Peers}}
           <ul class="peers">
@@ -53,8 +60,8 @@
           </ul>
           {{end}}
           <div class="sub">Last sync: {{.LastSync}}</div>
-          <!-- TODO(slice-conflict-resolve): per-node "Use <node>" winner buttons
-               and a "Sync now" action; this slice wires only "Done playing". -->
+          <!-- TODO(slice-actions): a "Sync now" action; this slice wires
+               "Done playing" and (when conflicted) "Resolve conflict". -->
           <p>
             <form hx-post="/api/games/{{.GameID}}/deactivate"
                   hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
