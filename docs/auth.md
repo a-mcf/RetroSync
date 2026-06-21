@@ -1,0 +1,34 @@
+# Auth
+
+## Identities
+
+- **Users** log into the web UI with username + password (argon2). Sessions in a server-side cookie store.
+- **Nodes** are not authenticated peers — retrosync reaches into them. For a Deck it reads the Syncthing share locally on the server. For a MiSTer it SSHs in. For an Anbernic running KNULLI/Batocera, similar SSH/SFTP.
+
+There's no per-node API token because nodes don't call retrosync; retrosync calls nodes (or reads files local to itself).
+
+## Roles
+
+- `user` — can act on their own nodes. Can bind games to nodes they own. Can see other users' active sessions but not modify them.
+- `admin` — can edit the registry, force-takeovers across users, add nodes, delete games.
+
+Single-tenant household — keep this minimal, two roles is enough.
+
+## Reaching nodes
+
+For each node, retrosync needs credentials *to itself*, not to the user. Stored encrypted in the registry:
+
+- **Syncthing-share node** (Deck): `backup_root` is a path on the server's filesystem. No creds needed beyond filesystem permissions.
+- **SSH/SFTP node** (MiSTer, Anbernic): username + password (or key). Read in from a file on disk that's mode 0600 and owned by the retrosync user. Don't store cleartext in SQLite — keep it in a sidecar `secrets.yaml` referenced by node id, or use the host's existing secret store (sops-encrypted file, vault agent, etc).
+
+The MiSTer-specific note: root fs is read-only there; SSH key auth requires rebuilding linux.img. Until then, password auth + the secret store is the path.
+
+## Pairing a new device
+
+Power-user flow (admin, via `/decks` or `/nodes`):
+
+1. Add the node entry: id, kind, display, reach-config.
+2. retrosync runs a smoke test (stat a known path; SSH echo).
+3. Smoke pass → node appears as available; users can map game paths to it.
+
+No QR-code pairing dance. Family-scale; the admin can set a few up by hand.
