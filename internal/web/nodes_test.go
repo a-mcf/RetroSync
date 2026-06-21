@@ -104,7 +104,7 @@ func TestCreateNode_DuplicateID_409(t *testing.T) {
 	}
 }
 
-func TestCreateNode_BadKind_422(t *testing.T) {
+func TestCreateNode_BadKind_400(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
