@@ -67,4 +67,8 @@ retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root pr
 
 ## Deployment
 
-Single binary + SQLite file (or a directory of JSON; see data-model.md). Reverse-proxied behind the existing internal ingress. Ansible role to install on the same host that runs the household Syncthing.
+RetroSync runs in **Kubernetes** as a **sidecar to Syncthing**: the `retrosync` container and the household `syncthing` container share a pod and a **shared volume** that holds the per-device Syncthing save shares. This preserves the local-side model from above — RetroSync still reads those shares as ordinary local filesystem paths (now a shared pod volume), and still writes back out of band via **SSH/SFTP** into the device, never through Syncthing.
+
+The database is **Postgres** provisioned by **CNPG** (CloudNativePG) in the cluster; RetroSync connects via `DATABASE_URL`. See data-model.md for the `Store` interface and the pgx/podman integration tests.
+
+The service is reverse-proxied behind the existing internal ingress. (The earlier single-binary + SQLite-on-a-host plan is superseded by this sidecar + CNPG layout.)

@@ -120,5 +120,8 @@ PK: (game_id, node_id). The poll loop updates this; conflict detection compares 
 
 ## Storage choice
 
-- **SQLite** is the default. Simple, single-file, supports the unique constraint on active_bindings cleanly.
-- **JSON files** were considered. Fine for the registry, painful for sync_log and the unique constraint. Skip.
+- **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the unique constraint on `active_bindings`, JSONB for `reach_config`, `ON DELETE CASCADE` for `game_paths`, and a managed/HA operator in k8s.
+- All business logic depends on a Go **`Store` interface** (`internal/store`), never on the driver. There are two implementations: a thread-safe in-memory store (used by fast unit tests) and a pgx v5 Postgres store. Both run an identical **conformance suite** (`internal/store/storetest`) so they cannot drift in behavior.
+- Access is via **pgx v5** with hand-written parameterized queries — no ORM, no sqlc. Migrations are embedded (`embed.FS`) and applied programmatically at startup and in tests (`internal/migrate`).
+- Integration tests run against a real Postgres started with **podman** (gated by a build tag / `DATABASE_URL`); plain `go test ./...` needs no database.
+- **SQLite** was the original default — single-file and simple — but Postgres/CNPG fits the k8s sidecar deployment better. **JSON files** were also considered: fine for the registry, painful for `sync_log` and the unique constraint. Skipped.

@@ -40,6 +40,8 @@ Mitigations:
 - Refuse activation if the binding node's last_seen is too old (configurable threshold).
 - Long term: optional retrosync agent on the node that pushes save updates direct to the server, bypassing the Syncthing-as-transport limitation.
 
+Decision: ship RetroSync as a **sidecar to Syncthing** in the same Kubernetes pod, reading the Syncthing shares off a **shared pod volume** as a local filesystem (see architecture.md). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently," so we keep the mitigations above (prominent last-seen, activation refusal past a threshold) rather than removing the transport. The optional node-side push agent remains the v2 escape hatch.
+
 ## Writeback for syncthing-share nodes
 
 Today's plan: read via local Syncthing share, write back via SSH/SFTP into the device. That requires the device to also be SSH-reachable. For locked-down devices (a stock SteamOS Deck *can* be SSH'd to; a household Anbernic running KNULLI can; some can't), we'd need a fallback.

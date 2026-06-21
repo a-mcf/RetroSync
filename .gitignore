@@ -1,0 +1,12 @@
+# Build artifacts
+/retrosync
+/bin/
+*.exe
+
+# Local secrets / env
+.env
+secrets.yaml
+
+# Editor / OS cruft
+.DS_Store
+*.swp
