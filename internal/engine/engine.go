@@ -751,7 +751,13 @@ func (e *Engine) manifestMap(ctx context.Context, gameID string) (map[string]sto
 
 func (e *Engine) setManifest(ctx context.Context, gameID, nodeID string, meta reach.FileMeta, now time.Time) error {
 	size := meta.Size
-	mtime := meta.Mtime
+	// Truncate to the comparison resolution before storing so the manifest value
+	// matches what a later changed() compare will use, regardless of where it is
+	// persisted. This is belt-and-suspenders: changed() truncates both sides too,
+	// so correctness does not depend on it — but storing the truncated value keeps
+	// stored and compared mtimes at the same precision (and matches what Postgres
+	// timestamptz would store anyway).
+	mtime := meta.Mtime.UTC().Truncate(mtimeResolution)
 	m := store.ManifestEntry{
 		GameID:      gameID,
 		NodeID:      nodeID,
@@ -772,13 +778,42 @@ func (e *Engine) appendLog(ctx context.Context, le store.LogEntry) error {
 	return nil
 }
 
+// mtimeResolution is the resolution at which two mtimes are compared for
+// change-detection. The filesystem reports mtimes at nanosecond precision, but
+// Postgres timestamptz (where the manifest mtime round-trips) stores only
+// MICROSECOND precision — so a stat mtime of …252204219 becomes …252204000
+// after a manifest write+read. Comparing the raw values with exact equality
+// then flags an UNCHANGED file as changed on the next poll, producing a spurious
+// conflict after every write. Truncating both sides to the limiting (Postgres)
+// resolution makes the comparison precision-agnostic. Microsecond is the right
+// granularity: it matches the store's actual precision and is still fine enough
+// to detect a legitimate rapid change (second-granularity would be too coarse).
+const mtimeResolution = time.Microsecond
+
+// mtimeEqual reports whether two mtimes are equal at the comparison resolution
+// (microsecond). Both are normalized to UTC and truncated to mtimeResolution
+// before comparing so that sub-microsecond nanoseconds — which Postgres
+// timestamptz cannot store — do not register as a change. This is harmless for
+// the memory-store path (full-precision values truncate identically on both
+// sides) and fixes the Postgres path.
+func mtimeEqual(a, b time.Time) bool {
+	return a.UTC().Truncate(mtimeResolution).Equal(b.UTC().Truncate(mtimeResolution))
+}
+
 // changed reports whether the current stat (cur, present) differs from the
 // manifest entry me. Rules:
 //   - present on disk but no manifest row, or manifest has no mtime/size => changed
 //     (a newly-appeared file).
 //   - absent on disk but the manifest recorded it as present => changed (deleted).
 //   - both absent => not changed.
-//   - present on both => changed iff mtime or size differs.
+//   - present on both => changed iff mtime (at microsecond resolution) or size
+//     differs.
+//
+// The mtime comparison uses mtimeEqual rather than time.Equal: a file's stat
+// mtime carries nanosecond precision the manifest's Postgres-backed timestamptz
+// cannot store, so exact equality would spuriously flag an unchanged file as
+// changed after every manifest round-trip. Size stays an exact integer compare
+// (no precision issue).
 func changed(me store.ManifestEntry, cur reach.FileMeta, present bool) bool {
 	hadFile := me.Mtime != nil && me.Size != nil
 	if !present {
@@ -787,7 +822,7 @@ func changed(me store.ManifestEntry, cur reach.FileMeta, present bool) bool {
 	if !hadFile {
 		return true // appeared
 	}
-	return !me.Mtime.Equal(cur.Mtime) || *me.Size != cur.Size
+	return !mtimeEqual(*me.Mtime, cur.Mtime) || *me.Size != cur.Size
 }
 
 // sourceNodeID resolves the first-sync source from a direction. "from-primary"
