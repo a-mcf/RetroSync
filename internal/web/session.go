@@ -1,0 +1,123 @@
+package web
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// sessionCookieName is the cookie that carries the opaque session token.
+const sessionCookieName = "retrosync_session"
+
+// sessionTTL bounds how long a session is valid. A household tool doesn't need
+// aggressive expiry; a week keeps a Deck logged in across a play week.
+const sessionTTL = 7 * 24 * time.Hour
+
+// session is one logged-in session: which user it authenticates and when it
+// expires.
+type session struct {
+	userID  string
+	expires time.Time
+}
+
+// sessionManager is an in-memory, token-keyed session store.
+//
+// NOTE: sessions are kept only in process memory; they do NOT survive a
+// restart of the retrosync process. Everyone is logged out on deploy. For a
+// single-household self-hosted tool that is an acceptable tradeoff (and avoids
+// a server-side session table this slice). A persistent store can replace this
+// behind the same interface later.
+type sessionManager struct {
+	mu       sync.Mutex
+	sessions map[string]session
+	now      func() time.Time
+}
+
+func newSessionManager(now func() time.Time) *sessionManager {
+	if now == nil {
+		now = time.Now
+	}
+	return &sessionManager{
+		sessions: make(map[string]session),
+		now:      now,
+	}
+}
+
+// newToken returns a 256-bit cryptographically random, URL-safe token. 32
+// bytes from crypto/rand is well beyond brute-force reach.
+func newToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// create mints a new session for userID and returns its token. A fresh token
+// is generated on every call, so logging in always rotates the identifier
+// (defeating session fixation).
+func (m *sessionManager) create(userID string) (string, error) {
+	tok, err := newToken()
+	if err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[tok] = session{userID: userID, expires: m.now().Add(sessionTTL)}
+	return tok, nil
+}
+
+// lookup returns the userID for a valid, unexpired token. ok is false for an
+// unknown or expired token; an expired token is also evicted.
+func (m *sessionManager) lookup(tok string) (userID string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, found := m.sessions[tok]
+	if !found {
+		return "", false
+	}
+	if !m.now().Before(s.expires) {
+		delete(m.sessions, tok)
+		return "", false
+	}
+	return s.userID, true
+}
+
+// destroy removes a session token if present (idempotent).
+func (m *sessionManager) destroy(tok string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, tok)
+}
+
+// setCookie writes the session cookie with the security flags required by
+// docs/auth.md: HttpOnly (no JS access), Secure (HTTPS only), SameSite=Lax
+// (sent on top-level navigations — needed so the post-login redirect carries
+// the cookie — but not on cross-site sub-requests, a baseline CSRF mitigation).
+func (m *sessionManager) setCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  m.now().Add(sessionTTL),
+		MaxAge:   int(sessionTTL / time.Second),
+	})
+}
+
+// clearCookie expires the session cookie in the client.
+func clearCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}

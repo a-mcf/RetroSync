@@ -1,0 +1,22 @@
+{{define "login"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — sign in</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="login">
+    <h1>RetroSync</h1>
+    <form method="post" action="/login">
+      <label for="username">User</label>
+      <input id="username" name="username" autocomplete="username" autofocus required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button class="btn" type="submit">Sign in</button>
+      {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    </form>
+  </main>
+</body>
+</html>{{end}}
