@@ -1,8 +1,17 @@
 # Auth
 
+> **Implemented.** Login (argon2id), server-side sessions, a per-session CSRF
+> token on every state-changing POST, and admin-gating of the registry are all
+> built (`internal/web`, `internal/auth`). The `user set` CLI bootstraps the first
+> admin. Reaching nodes is implemented for `syncthing-share` (localfs) only; the
+> ssh path and the smoke-test for ssh nodes are deferred (open-questions.md).
+
 ## Identities
 
-- **Users** log into the web UI with username + password (argon2). Sessions in a server-side cookie store.
+- **Users** log into the web UI with username + password (**argon2id**, OWASP
+  baseline params, constant-time verify). Sessions are server-side, keyed by an
+  `HttpOnly`/`Secure`/`SameSite=Lax` cookie; the session token and a paired CSRF
+  token rotate on every login (session-fixation defense).
 - **Nodes** are not authenticated peers — retrosync reaches into them. For a Deck it reads the Syncthing share locally on the server. For a MiSTer it SSHs in. For an Anbernic running KNULLI/Batocera, similar SSH/SFTP.
 
 There's no per-node API token because nodes don't call retrosync; retrosync calls nodes (or reads files local to itself).
@@ -13,6 +22,13 @@ There's no per-node API token because nodes don't call retrosync; retrosync call
 - `admin` — can edit the registry, force-takeovers across users, add nodes, delete games.
 
 Single-tenant household — keep this minimal, two roles is enough.
+
+**Implemented gating.** Registry mutations (`/nodes`, `/games`, path mappings,
+smoke-test) are admin-only — a non-admin gets a `403` before the Store is touched.
+The play-sync actions (activate / deactivate / resolve-conflict) require the caller
+to **own the relevant node** *or* be an admin; viewing another user's session and
+the conflict modal is allowed (read-only). See api.md for the per-route status
+codes.
 
 ## Reaching nodes
 
@@ -28,7 +44,9 @@ The MiSTer-specific note: root fs is read-only there; SSH key auth requires rebu
 Power-user flow (admin, via `/decks` or `/nodes`):
 
 1. Add the node entry: id, kind, display, reach-config.
-2. retrosync runs a smoke test (stat a known path; SSH echo).
+2. retrosync runs a smoke test (stat the node's save root). **Implemented for
+   `syncthing-share`** (a localfs stat); for `ssh` nodes the smoke-test reports
+   "not supported yet (ssh adapter pending)" until the ssh adapter lands.
 3. Smoke pass → node appears as available; users can map game paths to it.
 
 No QR-code pairing dance. Family-scale; the admin can set a few up by hand.

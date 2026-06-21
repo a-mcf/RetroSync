@@ -146,6 +146,11 @@
         {{end}}
       {{end}}
 
+      <!-- Progressive enhancement: the htmx:configRequest handler above rewrites
+           this request path to splice in the selected node_id at submit time. It
+           is convenience only — the authoritative server route is
+           POST /api/games/{id}/paths/{node_id} (handleSetGamePath), which is
+           directly exercised by the handler tests, not via this client rewrite. -->
       <form class="path-add" hx-post="/api/games/{{.ID}}/paths/"
             data-path-base="/api/games/{{.ID}}/paths"
             hx-target="#games-list" hx-swap="outerHTML">

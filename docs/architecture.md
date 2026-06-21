@@ -29,6 +29,10 @@ retrosync the service knows how to reach each node by its **kind** + reach-confi
 
 Adding a new device kind is "register a new reach-config strategy," not "fork the codebase." A v2 could add agents that push direct.
 
+> **Implemented:** the **syncthing-share → localfs** reach adapter (read *and*
+> write, atomic temp-then-rename). The **ssh** strategy is registered but not yet
+> wired (resolves to "not supported yet"); see open-questions.md.
+
 ## Roles
 
 ### `retrosync` server
@@ -37,9 +41,17 @@ Single Go (or Python) service. Owns:
 
 - The registry (games, nodes, per-node game paths).
 - The active-bindings table.
-- A poll loop that, for each active binding, compares mtime+hash across all nodes with a path for the game and pushes the newer copy.
-- A web UI (HTMX, no SPA framework) for browsing, binding, unbinding.
-- A small REST surface that the UI is built on; agents (if any future) can also call it.
+- A poll loop that, for each active binding, compares mtime/size against the
+  manifest across all in-scope nodes and fans the changed copy out (or flags a
+  conflict). **Implemented** as `internal/daemon` driving `internal/engine`: a
+  background ticker sweeps the active bindings every `RETROSYNC_POLL_INTERVAL`
+  (default 15s), one engine pass per game, per-game error isolation, idempotent.
+- A web UI (HTMX, no SPA framework) for browsing, binding, unbinding. **Implemented**
+  (`internal/web`), server-rendered fragments, no SPA.
+- The HTTP surface the UI is built on. **Implemented as HTMX/POST routes** (HTML
+  forms can't issue PATCH/PUT/DELETE); a small read-only JSON surface
+  (`GET /api/{status,games,nodes}`) is the seed of a future agent-facing API. See
+  api.md.
 
 Runs on the same host as the Syncthing server so it has local read access to per-device backup snapshots.
 

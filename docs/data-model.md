@@ -1,6 +1,13 @@
 # Data model
 
-Two stores: a **registry** (slow-changing, human-edited) and a **runtime state** (fast-changing, machine-edited). They can live in the same SQLite DB; the conceptual split matters more than the physical.
+> **Implemented.** All tables below exist as embedded migrations applied at
+> startup, behind the storage-agnostic `internal/store.Store` (Postgres + in-memory
+> fake, one conformance suite). The registry (users, nodes, games, game_paths) is
+> edited through the admin UI; game/node ids are slugs, auto-generated from the
+> display when omitted (manual id overrides). `active_bindings`, `manifest`, and
+> `sync_log` are written by the engine/daemon. See the "Storage choice" note below.
+
+Two stores: a **registry** (slow-changing, human-edited) and a **runtime state** (fast-changing, machine-edited). They live in the same Postgres database (see "Storage choice"); the conceptual split matters more than the physical.
 
 ## Registry
 

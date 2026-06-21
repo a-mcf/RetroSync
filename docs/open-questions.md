@@ -2,6 +2,16 @@
 
 Decisions intentionally deferred. Resolve before building, or pick a default and learn.
 
+Items below are tagged **RESOLVED** (decided and, where noted, built) or left open.
+
+## Storage: Postgres over SQLite — RESOLVED (built)
+
+The store is **Postgres** (CNPG in production), behind the storage-agnostic
+`internal/store.Store` interface. SQLite was the original single-file default but
+Postgres fits the k8s sidecar deployment and gives us the unique constraint on
+`active_bindings`, JSONB `reach_config`, and `ON DELETE CASCADE`. Both an in-memory
+fake and the pgx v5 implementation run one conformance suite. See data-model.md.
+
 ## Activation default direction
 
 State-machine.md says default to "use the node you're binding from" when multiple nodes have a save. That's right when the binding node really is the freshest source. But when you bind from inside the UI on the couch, it's possible another node is more recent. Maybe the default should be "the node with the newer mtime, but require explicit confirmation if they're within an hour of each other"?
@@ -30,7 +40,7 @@ The model assumes the bound primary mirrors to *all* nodes that have a path mapp
 
 Decision: default to `all-configured`. Expose scope override in an "advanced" disclosure on the activation modal. Skip the override entirely in v1 if it adds clutter.
 
-## Syncthing as the local-side transport
+## Syncthing as the local-side transport — RESOLVED (read path built)
 
 For `syncthing-share` nodes, we're reading from the local Syncthing share, which means the device must have run Syncthing recently for retrosync to see updates. If the device is offline, the local share is stale, and retrosync will read stale data.
 
@@ -42,22 +52,66 @@ Mitigations:
 
 Decision: ship RetroSync as a **sidecar to Syncthing** in the same Kubernetes pod, reading the Syncthing shares off a **shared pod volume** as a local filesystem (see architecture.md). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently," so we keep the mitigations above (prominent last-seen, activation refusal past a threshold) rather than removing the transport. The optional node-side push agent remains the v2 escape hatch.
 
-## Writeback for syncthing-share nodes
+**Built:** the read *and* write path for `syncthing-share` nodes goes through the
+**localfs** reach adapter (atomic temp-file-then-rename), rooted at
+`reach_config.path`. The engine writes the winning save back into the same local
+share path it read from — Syncthing then replicates it out. (Writeback *into a
+locked-down device over SSH* is the separate deferred item below; the localfs
+write path itself is implemented.)
 
-Today's plan: read via local Syncthing share, write back via SSH/SFTP into the device. That requires the device to also be SSH-reachable. For locked-down devices (a stock SteamOS Deck *can* be SSH'd to; a household Anbernic running KNULLI can; some can't), we'd need a fallback.
+## Writeback for syncthing-share nodes — partially RESOLVED (ssh deferred)
 
-Open: do we accept "writeable nodes need SSH" as a hard requirement, or do we eventually need a node-side agent that listens for push?
+Today's plan: read/write via the local Syncthing share for `syncthing-share`
+nodes (built, via localfs). The remaining open piece is writing back into devices
+that must be reached **over SSH/SFTP** (MiSTer's RO root, locked-down handhelds).
+That requires the device to be SSH-reachable, and for some devices it isn't.
 
-## Conflict resolution UX
+**Status:** the **ssh adapter is not built** — `ssh` nodes resolve to
+"not supported yet" (`reach.ErrUnsupportedReach`) and the registry smoke-test
+surfaces that. So today only `syncthing-share` (localfs) nodes are fully
+operational. Open: accept "writeable SSH nodes need SSH" as a hard requirement, or
+eventually ship a node-side agent that listens for push.
+
+## Conflict resolution UX — RESOLVED (built)
 
 Right now: pick a winner. Should we offer "save both, let me sort it" — copy the loser to a `.conflict-<ts>` file before overwriting? Cheap insurance.
 
-Decision: yes, do that. Default behavior, no toggle. Update state-machine.md.
+Decision: yes, do that. Default behavior, no toggle.
 
-## Identity & name slugs
+**Built:** `ResolveConflict` backs up every other in-scope node's current file to a
+sibling `<path>.retrosync-conflict-<ts>` on that same node *before* any overwrite,
+then fans the winner out. The `<ts>` is a UTC, filesystem-safe,
+**nanosecond-precision** stamp (`20060102T150405.000000000Z`, no colons), so two
+resolves in the same wall-clock second cannot collide. No toggle. See
+state-machine.md "Conflict handling".
+
+## Identity & name slugs — RESOLVED (built)
 
 `super-metroid` works. `super-mario-bros-3` works. Do we need a manual ID at all, or auto-generate from display? Auto with manual override is probably right.
+
+**Built:** game create auto-generates the id as a slug from the display when no id
+is given; a manually-supplied id overrides. The final id is validated against the
+shared slug shape (lowercase letters, digits, hyphens). Node ids use the same slug
+validation.
 
 ## TGFX16 and other systems SGM-Helper drops
 
 retrosync doesn't classify by content — it syncs paths the user mapped. So TGFX16 is fine here as long as the user maps the path. Worth noting in README.
+
+## Node reachability / backup-health are not yet wired to Syncthing — OPEN
+
+`reachable` and backup-health fields exist in the status surface but are **not yet
+populated from Syncthing's API** — there is no status poller. They are cosmetic
+until a future Syncthing-status poller reads each node's last-seen / sync state and
+makes them real. (The registry smoke-test *does* probe localfs reachability live;
+this open item is specifically about the always-on Syncthing-derived status, not
+the on-demand smoke-test.)
+
+## SSH adapter pending — OPEN
+
+The `ssh` reach strategy has no adapter yet: `ssh` nodes resolve to
+`reach.ErrUnsupportedReach` ("not supported yet"). Until it lands, only
+`syncthing-share` (localfs) nodes are operational, and SSH writeback into
+locked-down devices (see "Writeback for syncthing-share nodes" above) is blocked on
+it. Building it means an ssh/sftp adapter with secret-store credential resolution
+(`reach_config.host/user/secret_ref`).
