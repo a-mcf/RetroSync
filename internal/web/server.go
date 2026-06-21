@@ -62,6 +62,15 @@ type Actioner interface {
 	// in-scope node, read-only, for the conflict modal to render so the human can
 	// pick a winner with full disclosure.
 	NodeStates(ctx context.Context, gameID string) ([]engine.NodeState, error)
+	// SmokeTest verifies that a node is reachable for the /nodes registry "Test"
+	// button and the pairing smoke-test flow (docs/auth.md). It is the engine
+	// method that lets the web layer probe reachability WITHOUT importing
+	// internal/reach or any persistence driver: the engine owns the resolver and
+	// the Stat. A nil return means reachable; a non-nil error is surfaced to the
+	// admin (for an ssh node it is reach.ErrUnsupportedReach — "not supported
+	// yet"). Read-only: it never mutates the node (the handler updates
+	// last_seen_at via the Store on success).
+	SmokeTest(ctx context.Context, nodeID string) error
 }
 
 // Server holds the web service's dependencies. Construct with New; build the
@@ -105,7 +114,7 @@ func New(st store.Store, opts Options) (*Server, error) {
 		logger = slog.New(discardHandler{})
 	}
 
-	tmpl, err := template.ParseFS(templateFS, "templates/*.tmpl.html")
+	tmpl, err := template.New("retrosync").Funcs(templateFuncs).ParseFS(templateFS, "templates/*.tmpl.html")
 	if err != nil {
 		return nil, err
 	}
@@ -177,8 +186,20 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /games/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
 	mux.Handle("POST /api/games/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
 
-	// TODO(slice-registry): GET/POST /games, /nodes registry editing + node
-	// smoke-test.
+	// Nodes registry (slice-10). Admin-only per docs/auth.md: every page and every
+	// mutation is wrapped in requireAdmin, so a non-admin never reaches the Store.
+	// requireAdmin sits inside requireAuth (so an unauthenticated request 303s to
+	// /login / 401s on /api) and, for mutations, alongside requireCSRF. Ordering of
+	// the admin and CSRF wrappers does not affect safety — each independently
+	// blocks the request — but admin is checked first so a non-admin gets a clean
+	// 403 "admins only" rather than a CSRF error.
+	mux.Handle("GET /nodes", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleNodesPage))))
+	mux.Handle("POST /api/nodes", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateNode)))))
+	mux.Handle("POST /api/nodes/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditNode)))))
+	mux.Handle("POST /api/nodes/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteNode)))))
+	mux.Handle("POST /api/nodes/{id}/smoke-test", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSmokeTest)))))
+
+	// TODO(slice-games-registry): GET/POST /games registry editing + path mappings.
 
 	return mux
 }

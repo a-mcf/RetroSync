@@ -67,6 +67,12 @@ var (
 	// conflict (conflict_at == nil): there is nothing to resolve, and forcing a
 	// fan-out would silently overwrite peers the human never reviewed.
 	ErrNotConflicted = errors.New("engine: binding is not in conflict")
+	// ErrSmokeTestUnsupported is returned by SmokeTest when the node's reach
+	// strategy has no adapter wired yet (today: ssh). It is the engine's own
+	// sentinel so the web layer can map "not supported yet" WITHOUT importing
+	// internal/reach (it wraps reach.ErrUnsupportedReach for engine-side callers
+	// that still want the underlying cause).
+	ErrSmokeTestUnsupported = errors.New("engine: smoke-test not supported for this reach")
 )
 
 // scopedNode pairs an in-scope node with its game_paths.path and resolved Reach.
@@ -318,6 +324,53 @@ func (e *Engine) NodeStates(ctx context.Context, gameID string) ([]NodeState, er
 	}
 	// inScopeNodes already sorts by node id; NodeStates inherits that order.
 	return out, nil
+}
+
+// smokeTestRoot is the path SmokeTest stats to probe reachability: the node's
+// save root itself. Per reach.Reach path semantics every path is relative to
+// the node's save root, so "." names that root. For a syncthing-share node
+// resolve roots the localfs adapter at reach_config.path, so Stat(".") stats
+// that directory.
+const smokeTestRoot = "."
+
+// SmokeTest verifies that a node is reachable, for the registry "Test" button
+// and the pairing smoke-test flow (docs/auth.md "Pairing a new device": "stat a
+// known path"). It resolves the node's reach adapter and stats the node's save
+// root (".").
+//
+//   - syncthing-share: a nil return means the share directory exists and is
+//     readable (the node is reachable). A non-nil return is the underlying
+//     reach error, surfaced to the operator (e.g. the share path is missing).
+//   - ssh: resolve has no adapter yet, so this returns ErrSmokeTestUnsupported
+//     (which wraps reach.ErrUnsupportedReach). The web layer matches the engine
+//     sentinel and renders "smoke-test not supported yet (ssh adapter pending)",
+//     so it never needs to import internal/reach.
+//     TODO(slice-ssh): a real ssh adapter makes this an actual reachability probe.
+//
+// SmokeTest is read-only: it never mutates the store or the node. It does NOT
+// touch last_seen_at; updating that on success is the web handler's choice (it
+// owns the store) so the engine stays a pure logic-over-ports component.
+// A missing node returns store.ErrNotFound.
+func (e *Engine) SmokeTest(ctx context.Context, nodeID string) error {
+	node, err := e.store.GetNode(ctx, nodeID)
+	if err != nil {
+		return fmt.Errorf("engine: smoke-test get node %q: %w", nodeID, err)
+	}
+	r, err := e.resolve(node)
+	if err != nil {
+		// A resolve with no adapter wired (ssh today) surfaces as the engine's own
+		// ErrSmokeTestUnsupported so the web layer can map "not supported yet"
+		// without importing internal/reach. The underlying reach.ErrUnsupportedReach
+		// is preserved in the chain for engine-side callers.
+		if errors.Is(err, reach.ErrUnsupportedReach) {
+			return fmt.Errorf("engine: smoke-test %q: %w: %w", nodeID, ErrSmokeTestUnsupported, err)
+		}
+		return fmt.Errorf("engine: smoke-test resolve %q: %w", nodeID, err)
+	}
+	if _, err := r.Stat(ctx, smokeTestRoot); err != nil {
+		return fmt.Errorf("engine: smoke-test stat %q: %w", nodeID, err)
+	}
+	return nil
 }
 
 // ResolveConflict resolves a flagged conflict by making winnerNodeID's current

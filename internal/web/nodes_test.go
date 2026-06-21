@@ -1,0 +1,438 @@
+package web
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/a-mcf/retrosync/internal/engine"
+	"github.com/a-mcf/retrosync/internal/store"
+)
+
+// errExample is a generic non-sentinel error used to exercise the smoke-test
+// error-surfacing path (e.g. "the share path is missing").
+var errExample = errors.New("boom: share path missing")
+
+// nodeIDs returns the sorted-ish set of node ids currently in the fixture store.
+func nodeIDs(t *testing.T, f *actionFixture) map[string]bool {
+	t.Helper()
+	nodes, err := f.store.ListNodes(context.Background())
+	if err != nil {
+		t.Fatalf("list nodes: %v", err)
+	}
+	out := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		out[n.ID] = true
+	}
+	return out
+}
+
+// --- GET /nodes (admin) --------------------------------------------------
+
+func TestNodesPage_AdminSeesRegistry(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "bob") // bob is admin
+
+	req := httptest.NewRequest(http.MethodGet, "/nodes", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"bob-deck", "carol-deck", "mister", "Add a node", "csrf_token"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("nodes page missing %q", want)
+		}
+	}
+}
+
+func TestNodesPage_NonAdminForbidden(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "carol") // carol is a regular user
+
+	req := httptest.NewRequest(http.MethodGet, "/nodes", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin GET /nodes = %d, want 403", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Admins only") {
+		t.Errorf("expected an 'Admins only' page, got: %s", rec.Body.String())
+	}
+}
+
+// --- POST /api/nodes (create) --------------------------------------------
+
+func TestCreateNode_HappyPath(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"new-deck"}, "display": {"New Deck"},
+		"owner_user_id": {"bob"}, "kind": {"deck"},
+		"reach": {"syncthing-share"}, "path": {"/srv/new"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	n, err := f.store.GetNode(context.Background(), "new-deck")
+	if err != nil {
+		t.Fatalf("node not created: %v", err)
+	}
+	if n.ReachConfig.Path != "/srv/new" || n.OwnerUserID == nil || *n.OwnerUserID != "bob" {
+		t.Errorf("created node wrong: %+v", n)
+	}
+}
+
+func TestCreateNode_DuplicateID_409(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"bob-deck"}, "display": {"Dupe"}, "kind": {"deck"},
+		"reach": {"syncthing-share"}, "path": {"/srv/x"},
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate id status = %d, want 409", rec.Code)
+	}
+}
+
+func TestCreateNode_BadKind_422(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"x"}, "display": {"X"}, "kind": {"toaster"},
+		"reach": {"syncthing-share"}, "path": {"/srv/x"},
+	})
+	// A bad kind fails the local enum check first -> 400. (Store's ErrInvalidValue
+	// would 422, but we validate before reaching the Store.)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad kind status = %d, want 400", rec.Code)
+	}
+	if nodeIDs(t, f)["x"] {
+		t.Error("node was created despite bad kind")
+	}
+}
+
+func TestCreateNode_BadReach_400(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"x"}, "display": {"X"}, "kind": {"deck"},
+		"reach": {"carrier-pigeon"}, "path": {"/srv/x"},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad reach status = %d, want 400", rec.Code)
+	}
+}
+
+func TestCreateNode_SyncthingMissingPath_400(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"x"}, "display": {"X"}, "kind": {"deck"},
+		"reach": {"syncthing-share"}, // no path
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing path status = %d, want 400", rec.Code)
+	}
+	if nodeIDs(t, f)["x"] {
+		t.Error("node created despite missing path")
+	}
+}
+
+func TestCreateNode_SSHRequiresHostUserSecretRef(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	// Missing secret_ref -> 400.
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"mister-2"}, "display": {"MiSTer 2"}, "kind": {"mister"},
+		"reach": {"ssh"}, "host": {"10.0.0.9"}, "user": {"root"},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ssh missing secret_ref = %d, want 400", rec.Code)
+	}
+
+	// Full ssh node -> created, secret_ref stored (a NAME, not a secret).
+	rec = postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"mister-2"}, "display": {"MiSTer 2"}, "kind": {"mister"},
+		"reach": {"ssh"}, "host": {"10.0.0.9"}, "user": {"root"}, "secret_ref": {"mister-2-key"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ssh create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	n, err := f.store.GetNode(context.Background(), "mister-2")
+	if err != nil {
+		t.Fatalf("ssh node not created: %v", err)
+	}
+	if n.ReachConfig.SecretRef != "mister-2-key" || n.ReachConfig.Host != "10.0.0.9" {
+		t.Errorf("ssh reach_config wrong: %+v", n.ReachConfig)
+	}
+}
+
+func TestCreateNode_BadOwnerFK_422(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"x"}, "display": {"X"}, "owner_user_id": {"ghost"},
+		"kind": {"deck"}, "reach": {"syncthing-share"}, "path": {"/srv/x"},
+	})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("bad owner FK status = %d, want 422", rec.Code)
+	}
+}
+
+// --- POST /api/nodes/{id} (edit) -----------------------------------------
+
+func TestEditNode_HappyPath(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck", url.Values{
+		"display": {"Bob's NEW Deck"}, "owner_user_id": {"bob"},
+		"kind": {"deck"}, "reach": {"syncthing-share"}, "path": {"/srv/renamed"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	n, err := f.store.GetNode(context.Background(), "bob-deck")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if n.Display != "Bob's NEW Deck" || n.ReachConfig.Path != "/srv/renamed" {
+		t.Errorf("edit did not apply: %+v", n)
+	}
+}
+
+// --- POST /api/nodes/{id}/delete -----------------------------------------
+
+func TestDeleteNode_HappyPath(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/mister/delete", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	if nodeIDs(t, f)["mister"] {
+		t.Error("node not deleted")
+	}
+}
+
+func TestDeleteNode_InUse_Friendly409(t *testing.T) {
+	f := newActionFixture(t)
+	ctx := context.Background()
+	// Bind super-metroid to bob-deck so the node is an active binding's primary.
+	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}); err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck/delete", nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("in-use delete status = %d, want 409 (not 500)", rec.Code)
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "in use") {
+		t.Errorf("expected a friendly 'in use' message, got: %s", rec.Body.String())
+	}
+	if !nodeIDs(t, f)["bob-deck"] {
+		t.Error("node was deleted despite being in use")
+	}
+}
+
+// --- POST /api/nodes/{id}/smoke-test -------------------------------------
+
+func TestSmokeTest_Reachable_BumpsLastSeen(t *testing.T) {
+	f := newActionFixture(t)
+	f.act.smokeErr = nil // reachable
+	c, csrf := loginAs(t, f, "bob")
+
+	// Pre-condition: bob-deck has no last_seen (fixture creates it without one).
+	before, _ := f.store.GetNode(context.Background(), "bob-deck")
+	if before.LastSeenAt != nil {
+		t.Fatalf("precondition: bob-deck already has last_seen")
+	}
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck/smoke-test", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("smoke-test status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "reachable") {
+		t.Errorf("expected 'reachable', got: %s", rec.Body.String())
+	}
+	if got := f.act.smokeTestedNodes(); len(got) != 1 || got[0] != "bob-deck" {
+		t.Errorf("SmokeTest called for %v, want [bob-deck]", got)
+	}
+	after, _ := f.store.GetNode(context.Background(), "bob-deck")
+	if after.LastSeenAt == nil {
+		t.Error("last_seen_at not bumped after a successful smoke-test")
+	}
+}
+
+func TestSmokeTest_ErrorSurfaced(t *testing.T) {
+	f := newActionFixture(t)
+	f.act.smokeErr = errExample
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck/smoke-test", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("smoke-test status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "not reachable") || !strings.Contains(body, "boom") {
+		t.Errorf("expected surfaced error, got: %s", body)
+	}
+}
+
+func TestSmokeTest_SSHUnsupportedMessage(t *testing.T) {
+	f := newActionFixture(t)
+	f.act.smokeErr = engine.ErrSmokeTestUnsupported
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/nodes/mister/smoke-test", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("smoke-test status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "not supported yet") {
+		t.Errorf("expected ssh 'not supported yet' message, got: %s", rec.Body.String())
+	}
+}
+
+// --- admin-gating across every mutation ----------------------------------
+
+func TestNodesMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
+	mutations := []struct {
+		name, path string
+		fields     url.Values
+	}{
+		{"create", "/api/nodes", url.Values{"id": {"hax"}, "display": {"Hax"}, "kind": {"deck"}, "reach": {"syncthing-share"}, "path": {"/srv/x"}}},
+		{"edit", "/api/nodes/bob-deck", url.Values{"display": {"Hijacked"}, "kind": {"deck"}, "reach": {"syncthing-share"}, "path": {"/srv/x"}}},
+		{"delete", "/api/nodes/mister/delete", nil},
+		{"smoke-test", "/api/nodes/bob-deck/smoke-test", nil},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			f := newActionFixture(t)
+			c, csrf := loginAs(t, f, "carol") // regular user, with a valid CSRF token
+
+			rec := postForm(t, f, c, csrf, m.path, m.fields)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s as non-admin = %d, want 403", m.name, rec.Code)
+			}
+			// Store untouched: the new node never appears; bob-deck keeps its name;
+			// mister still exists; SmokeTest never called.
+			ids := nodeIDs(t, f)
+			if ids["hax"] {
+				t.Error("non-admin created a node")
+			}
+			if !ids["mister"] {
+				t.Error("non-admin deleted a node")
+			}
+			n, _ := f.store.GetNode(context.Background(), "bob-deck")
+			if n.Display == "Hijacked" {
+				t.Error("non-admin edited a node")
+			}
+			if len(f.act.smokeTestedNodes()) != 0 {
+				t.Error("non-admin reached SmokeTest")
+			}
+		})
+	}
+}
+
+// --- CSRF across every mutation ------------------------------------------
+
+func TestNodesMutations_CSRF(t *testing.T) {
+	mutations := []struct{ name, path string }{
+		{"create", "/api/nodes"},
+		{"edit", "/api/nodes/bob-deck"},
+		{"delete", "/api/nodes/mister/delete"},
+		{"smoke-test", "/api/nodes/bob-deck/smoke-test"},
+	}
+	for _, m := range mutations {
+		for _, tc := range []struct{ label, token string }{
+			{"no-token", ""},
+			{"wrong-token", "not-the-real-token"},
+		} {
+			t.Run(m.name+"/"+tc.label, func(t *testing.T) {
+				f := newActionFixture(t)
+				c, _ := loginAs(t, f, "bob") // admin, but bad/no CSRF token
+
+				fields := url.Values{"id": {"csrfnode"}, "display": {"X"}, "kind": {"deck"}, "reach": {"syncthing-share"}, "path": {"/srv/x"}}
+				rec := postForm(t, f, c, tc.token, m.path, fields)
+				if rec.Code != http.StatusForbidden {
+					t.Fatalf("%s %s = %d, want 403", m.name, tc.label, rec.Code)
+				}
+				// Store untouched.
+				ids := nodeIDs(t, f)
+				if ids["csrfnode"] {
+					t.Error("CSRF-less create mutated the store")
+				}
+				if !ids["mister"] {
+					t.Error("CSRF-less delete mutated the store")
+				}
+				if len(f.act.smokeTestedNodes()) != 0 {
+					t.Error("CSRF-less request reached SmokeTest")
+				}
+			})
+		}
+	}
+}
+
+// --- secrets discipline --------------------------------------------------
+
+// TestSecretNeverEchoedOrStored confirms a stray cleartext "password"/"secret"
+// field submitted alongside an ssh node is NOT stored and NOT echoed back. Only
+// secret_ref (a name) is retained.
+func TestSecretNeverEchoedOrStored(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	const leaked = "hunter2-SUPER-SECRET-PASSWORD"
+	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"mister-x"}, "display": {"MiSTer X"}, "kind": {"mister"},
+		"reach": {"ssh"}, "host": {"10.0.0.5"}, "user": {"root"},
+		"secret_ref": {"mister-x-ref"},
+		// Attacker/operator mistakenly pastes a real secret into extra fields.
+		"password": {leaked}, "secret": {leaked}, "key": {leaked},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	// The cleartext must not be echoed in the response fragment.
+	if strings.Contains(rec.Body.String(), leaked) {
+		t.Error("response echoed a cleartext secret")
+	}
+	// The cleartext must not be stored anywhere in reach_config.
+	n, err := f.store.GetNode(context.Background(), "mister-x")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	if n.ReachConfig.SecretRef != "mister-x-ref" {
+		t.Errorf("secret_ref = %q, want the ref name", n.ReachConfig.SecretRef)
+	}
+	if strings.Contains(n.ReachConfig.Path+n.ReachConfig.Host+n.ReachConfig.User+n.ReachConfig.SecretRef, leaked) {
+		t.Error("a cleartext secret was stored in reach_config")
+	}
+	// And it must not appear when the node is rendered on the registry page.
+	page := httptest.NewRequest(http.MethodGet, "/nodes", nil)
+	page.AddCookie(c)
+	prec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(prec, page)
+	if strings.Contains(prec.Body.String(), leaked) {
+		t.Error("nodes page rendered a cleartext secret")
+	}
+}

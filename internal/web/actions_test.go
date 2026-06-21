@@ -30,6 +30,10 @@ type stubActioner struct {
 	resolved   []resolveCall
 	// nodeStates is the canned slice returned by NodeStates.
 	nodeStates []engine.NodeState
+
+	// smokeErr is returned by SmokeTest; smokeTested records each probed node id.
+	smokeErr    error
+	smokeTested []string
 }
 
 type activateCall struct {
@@ -66,6 +70,19 @@ func (s *stubActioner) NodeStates(_ context.Context, _ string) ([]engine.NodeSta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]engine.NodeState(nil), s.nodeStates...), nil
+}
+
+func (s *stubActioner) SmokeTest(_ context.Context, nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.smokeTested = append(s.smokeTested, nodeID)
+	return s.smokeErr
+}
+
+func (s *stubActioner) smokeTestedNodes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.smokeTested...)
 }
 
 func (s *stubActioner) resolveCalls() []resolveCall {
