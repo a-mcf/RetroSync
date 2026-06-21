@@ -38,6 +38,19 @@ func Run(t *testing.T, newStore Factory) {
 		{"CascadeDeleteNode", testCascadeDeleteNode},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
+		{"Bindings", testBindings},
+		{"BindingInvalidReference", testBindingInvalidReference},
+		{"BindingInvalidValue", testBindingInvalidValue},
+		{"BindingDeleteIdempotent", testBindingDeleteIdempotent},
+		{"BindingConflictFlag", testBindingConflictFlag},
+		{"SyncLog", testSyncLog},
+		{"SyncLogOrderByTS", testSyncLogOrderByTS},
+		{"SyncLogInvalidValue", testSyncLogInvalidValue},
+		{"SyncLogInvalidReference", testSyncLogInvalidReference},
+		{"Manifest", testManifest},
+		{"DeleteBlockedByActiveBinding", testDeleteBlockedByActiveBinding},
+		{"CascadeRuntimeOnGameDelete", testCascadeRuntimeOnGameDelete},
+		{"CascadeManifestOnNodeDelete", testCascadeManifestOnNodeDelete},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -475,6 +488,493 @@ func testInvalidValue(t *testing.T, s store.Store) {
 	})
 	if !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("CreateNode(bad reach): want ErrInvalidValue, got %v", err)
+	}
+}
+
+// ---- runtime: active_bindings ----
+
+func testBindings(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "mister", nil)
+
+	b := store.ActiveBinding{
+		GameID:      "super-metroid",
+		PrimaryNode: "bob-deck",
+		Direction:   "from-primary",
+	}
+	if err := s.CreateBinding(c, b); err != nil {
+		t.Fatalf("CreateBinding: %v", err)
+	}
+	// Duplicate game_id -> conflict (one active session per game invariant).
+	if err := s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "mister", Direction: "from-primary",
+	}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("duplicate CreateBinding: want ErrConflict, got %v", err)
+	}
+
+	got, err := s.GetBinding(c, "super-metroid")
+	if err != nil {
+		t.Fatalf("GetBinding: %v", err)
+	}
+	if got.GameID != "super-metroid" || got.PrimaryNode != "bob-deck" ||
+		got.Direction != "from-primary" {
+		t.Fatalf("GetBinding mismatch: %+v", got)
+	}
+	// peer_scope defaults to all-configured.
+	if got.PeerScope != "all-configured" {
+		t.Fatalf("PeerScope default = %q, want all-configured", got.PeerScope)
+	}
+	// started_at defaulted to a real time.
+	if got.StartedAt.IsZero() {
+		t.Fatalf("StartedAt is zero, want a default now()")
+	}
+	if got.ConflictAt != nil || got.LastSynced != nil {
+		t.Fatalf("new binding should have nil conflict_at/last_synced: %+v", got)
+	}
+
+	if _, err := s.GetBinding(c, "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetBinding(missing): want ErrNotFound, got %v", err)
+	}
+
+	// A peer-direction binding for a second game (and explicit peer_scope).
+	mustGame(t, s, "zelda")
+	if err := s.CreateBinding(c, store.ActiveBinding{
+		GameID: "zelda", PrimaryNode: "mister", Direction: "from-peer-bob-deck",
+		PeerScope: "bob-deck,mister",
+	}); err != nil {
+		t.Fatalf("CreateBinding(peer direction): %v", err)
+	}
+	list, err := s.ListBindings(c)
+	if err != nil {
+		t.Fatalf("ListBindings: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListBindings len = %d, want 2", len(list))
+	}
+	if list[0].GameID != "super-metroid" || list[1].GameID != "zelda" {
+		t.Fatalf("ListBindings not ordered by game_id: %+v", list)
+	}
+
+	// Update mutable fields.
+	synced := time.Date(2026, 6, 21, 14, 0, 0, 0, time.UTC)
+	got.PrimaryNode = "mister"
+	got.Direction = "from-peer-mister"
+	got.LastSynced = &synced
+	if err := s.UpdateBinding(c, got); err != nil {
+		t.Fatalf("UpdateBinding: %v", err)
+	}
+	reread, _ := s.GetBinding(c, "super-metroid")
+	if reread.PrimaryNode != "mister" || reread.Direction != "from-peer-mister" {
+		t.Fatalf("UpdateBinding not applied: %+v", reread)
+	}
+	if reread.LastSynced == nil || !reread.LastSynced.Equal(synced) {
+		t.Fatalf("UpdateBinding last_synced = %v, want %v", reread.LastSynced, synced)
+	}
+
+	// Update missing -> not found.
+	if err := s.UpdateBinding(c, store.ActiveBinding{
+		GameID: "ghost", PrimaryNode: "mister", Direction: "from-primary",
+	}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("UpdateBinding(missing): want ErrNotFound, got %v", err)
+	}
+
+	// Delete returns the game to idle.
+	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+		t.Fatalf("DeleteBinding: %v", err)
+	}
+	if _, err := s.GetBinding(c, "super-metroid"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("after DeleteBinding: want ErrNotFound, got %v", err)
+	}
+}
+
+func testBindingInvalidReference(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+
+	// Missing game.
+	if err := s.CreateBinding(c, store.ActiveBinding{
+		GameID: "ghost-game", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("CreateBinding(missing game): want ErrInvalidReference, got %v", err)
+	}
+	// Missing node.
+	if err := s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "ghost-node", Direction: "from-primary",
+	}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("CreateBinding(missing node): want ErrInvalidReference, got %v", err)
+	}
+}
+
+func testBindingInvalidValue(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+
+	// Bad direction (neither from-primary nor from-peer-*).
+	if err := s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "newer-wins",
+	}); !errors.Is(err, store.ErrInvalidValue) {
+		t.Fatalf("CreateBinding(bad direction): want ErrInvalidValue, got %v", err)
+	}
+
+	// A valid binding, then an update to a bad direction.
+	must(t, s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}))
+	if err := s.UpdateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "garbage",
+	}); !errors.Is(err, store.ErrInvalidValue) {
+		t.Fatalf("UpdateBinding(bad direction): want ErrInvalidValue, got %v", err)
+	}
+}
+
+func testBindingDeleteIdempotent(t *testing.T, s store.Store) {
+	c := ctx()
+	// Deleting an absent binding is a no-op (api.md: deactivate is idempotent).
+	if err := s.DeleteBinding(c, "never-bound"); err != nil {
+		t.Fatalf("DeleteBinding(absent): want nil, got %v", err)
+	}
+
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}))
+	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+		t.Fatalf("DeleteBinding: %v", err)
+	}
+	// Second delete is still a no-op, not ErrNotFound.
+	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+		t.Fatalf("DeleteBinding(repeat): want nil, got %v", err)
+	}
+}
+
+func testBindingConflictFlag(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}))
+
+	b, _ := s.GetBinding(c, "super-metroid")
+	if b.ConflictAt != nil {
+		t.Fatalf("new binding conflict_at = %v, want nil", b.ConflictAt)
+	}
+
+	// Set conflict_at.
+	conflictTS := time.Date(2026, 6, 21, 15, 30, 0, 0, time.UTC)
+	b.ConflictAt = &conflictTS
+	if err := s.UpdateBinding(c, b); err != nil {
+		t.Fatalf("UpdateBinding(set conflict): %v", err)
+	}
+	got, _ := s.GetBinding(c, "super-metroid")
+	if got.ConflictAt == nil || !got.ConflictAt.Equal(conflictTS) {
+		t.Fatalf("conflict_at = %v, want %v", got.ConflictAt, conflictTS)
+	}
+
+	// Clear conflict_at (resolution).
+	got.ConflictAt = nil
+	if err := s.UpdateBinding(c, got); err != nil {
+		t.Fatalf("UpdateBinding(clear conflict): %v", err)
+	}
+	cleared, _ := s.GetBinding(c, "super-metroid")
+	if cleared.ConflictAt != nil {
+		t.Fatalf("conflict_at after clear = %v, want nil", cleared.ConflictAt)
+	}
+}
+
+// ---- runtime: sync_log ----
+
+func testSyncLog(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustGame(t, s, "zelda")
+
+	bytes := int64(2048)
+	src := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+	dst := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+
+	// Three entries for super-metroid, appended oldest-first.
+	must(t, s.AppendLog(c, store.LogEntry{
+		GameID: "super-metroid", FromNode: "bob-deck", ToNode: "mister",
+		Bytes: &bytes, SrcMtime: &src, DstMtime: &dst,
+		Outcome: store.OutcomeOK, Message: "",
+	}))
+	must(t, s.AppendLog(c, store.LogEntry{
+		GameID: "super-metroid", FromNode: "bob-deck", ToNode: "alice-deck",
+		Outcome: store.OutcomeNoop,
+	}))
+	must(t, s.AppendLog(c, store.LogEntry{
+		GameID: "super-metroid", Outcome: store.OutcomeError, Message: "boom",
+	}))
+	// An entry for a different game must not leak into the listing.
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", Outcome: store.OutcomeOK}))
+
+	// Most-recent-first: the error entry (appended last) comes first.
+	all, err := s.ListLogByGame(c, "super-metroid", 0)
+	if err != nil {
+		t.Fatalf("ListLogByGame: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("ListLogByGame len = %d, want 3", len(all))
+	}
+	if all[0].Outcome != store.OutcomeError || all[0].Message != "boom" {
+		t.Fatalf("newest entry = %+v, want the error entry", all[0])
+	}
+	if all[2].Outcome != store.OutcomeOK || all[2].ToNode != "mister" {
+		t.Fatalf("oldest entry = %+v, want the first ok entry", all[2])
+	}
+	// Round-trip of detail fields on the oldest entry.
+	if all[2].Bytes == nil || *all[2].Bytes != bytes {
+		t.Fatalf("Bytes = %v, want %d", all[2].Bytes, bytes)
+	}
+	if all[2].SrcMtime == nil || !all[2].SrcMtime.Equal(src) {
+		t.Fatalf("SrcMtime = %v, want %v", all[2].SrcMtime, src)
+	}
+	if all[2].DstMtime == nil || !all[2].DstMtime.Equal(dst) {
+		t.Fatalf("DstMtime = %v, want %v", all[2].DstMtime, dst)
+	}
+	// ids are assigned and distinct.
+	if all[0].ID == 0 || all[0].ID == all[1].ID {
+		t.Fatalf("ids not assigned/distinct: %+v", all)
+	}
+
+	// Limit caps the result, keeping most-recent-first.
+	limited, err := s.ListLogByGame(c, "super-metroid", 2)
+	if err != nil {
+		t.Fatalf("ListLogByGame(limit): %v", err)
+	}
+	if len(limited) != 2 {
+		t.Fatalf("ListLogByGame(limit=2) len = %d, want 2", len(limited))
+	}
+	if limited[0].Outcome != store.OutcomeError {
+		t.Fatalf("limited newest = %+v, want error entry", limited[0])
+	}
+}
+
+// testSyncLogOrderByTS asserts ListLogByGame orders by ts DESC (ties broken by
+// id DESC), independent of insertion order. Clock skew is a core concern in
+// this project (RTC-less MiSTer, drifting Anbernics), so a caller may supply a
+// ts that does not rise monotonically with append order. We insert entries
+// whose ts order deliberately disagrees with their id order and check both
+// impls return the same ts-then-id ordering.
+func testSyncLogOrderByTS(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+
+	t1 := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC) // earliest
+	t2 := time.Date(2026, 6, 21, 13, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 6, 21, 14, 0, 0, 0, time.UTC) // latest
+
+	// Append in an order where insertion (id) order != ts order:
+	//   id=1 -> t3 (latest), id=2 -> t1 (earliest), id=3 -> t2 (middle).
+	// Relying on append order would yield id=3,2,1; the ts contract yields
+	// id=1 (t3), id=3 (t2), id=2 (t1).
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t3, Message: "id1-t3", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t1, Message: "id2-t1", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t2, Message: "id3-t2", Outcome: store.OutcomeOK}))
+
+	got, err := s.ListLogByGame(c, "super-metroid", 0)
+	if err != nil {
+		t.Fatalf("ListLogByGame: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ListLogByGame len = %d, want 3", len(got))
+	}
+
+	wantTS := []time.Time{t3, t2, t1}
+	for i, w := range wantTS {
+		if !got[i].TS.Equal(w) {
+			t.Fatalf("entry %d ts = %v, want %v (order: %q,%q,%q)",
+				i, got[i].TS, w, got[0].Message, got[1].Message, got[2].Message)
+		}
+	}
+
+	// Tie-break by id DESC: two entries sharing one ts must come back
+	// highest-id-first.
+	mustGame(t, s, "zelda")
+	tie := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", TS: tie, Message: "first", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", TS: tie, Message: "second", Outcome: store.OutcomeOK}))
+
+	ties, err := s.ListLogByGame(c, "zelda", 0)
+	if err != nil {
+		t.Fatalf("ListLogByGame(zelda): %v", err)
+	}
+	if len(ties) != 2 {
+		t.Fatalf("ListLogByGame(zelda) len = %d, want 2", len(ties))
+	}
+	if ties[0].ID <= ties[1].ID {
+		t.Fatalf("tie-break not id DESC: got ids %d then %d", ties[0].ID, ties[1].ID)
+	}
+	if ties[0].Message != "second" || ties[1].Message != "first" {
+		t.Fatalf("tie-break order = %q,%q, want second,first", ties[0].Message, ties[1].Message)
+	}
+}
+
+func testSyncLogInvalidValue(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	if err := s.AppendLog(c, store.LogEntry{
+		GameID: "super-metroid", Outcome: store.Outcome("exploded"),
+	}); !errors.Is(err, store.ErrInvalidValue) {
+		t.Fatalf("AppendLog(bad outcome): want ErrInvalidValue, got %v", err)
+	}
+}
+
+func testSyncLogInvalidReference(t *testing.T, s store.Store) {
+	c := ctx()
+	if err := s.AppendLog(c, store.LogEntry{
+		GameID: "ghost-game", Outcome: store.OutcomeOK,
+	}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("AppendLog(missing game): want ErrInvalidReference, got %v", err)
+	}
+}
+
+// ---- runtime: manifest ----
+
+func testManifest(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "mister", nil)
+
+	mtime := time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)
+	size := int64(512)
+	checked := time.Date(2026, 6, 21, 9, 0, 30, 0, time.UTC)
+	m := store.ManifestEntry{
+		GameID: "super-metroid", NodeID: "bob-deck",
+		Mtime: &mtime, Size: &size, LastChecked: &checked,
+	}
+	if err := s.SetManifest(c, m); err != nil {
+		t.Fatalf("SetManifest: %v", err)
+	}
+	got, err := s.GetManifest(c, "super-metroid", "bob-deck")
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if got.Mtime == nil || !got.Mtime.Equal(mtime) || got.Size == nil || *got.Size != size {
+		t.Fatalf("GetManifest mismatch: %+v", got)
+	}
+	if got.SHA256 != nil {
+		t.Fatalf("SHA256 = %v, want nil (lazy)", got.SHA256)
+	}
+
+	if _, err := s.GetManifest(c, "super-metroid", "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetManifest(missing): want ErrNotFound, got %v", err)
+	}
+
+	// Upsert: same PK, new mtime/size and a now-computed sha256.
+	mtime2 := mtime.Add(time.Hour)
+	size2 := int64(1024)
+	sha := "abc123"
+	m.Mtime, m.Size, m.SHA256 = &mtime2, &size2, &sha
+	if err := s.SetManifest(c, m); err != nil {
+		t.Fatalf("SetManifest(upsert): %v", err)
+	}
+	got, _ = s.GetManifest(c, "super-metroid", "bob-deck")
+	if got.Mtime == nil || !got.Mtime.Equal(mtime2) || got.Size == nil || *got.Size != size2 {
+		t.Fatalf("upsert not applied: %+v", got)
+	}
+	if got.SHA256 == nil || *got.SHA256 != sha {
+		t.Fatalf("upsert sha256 = %v, want %q", got.SHA256, sha)
+	}
+
+	// Second node, then list by game.
+	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "mister"}))
+	list, err := s.ListManifestByGame(c, "super-metroid")
+	if err != nil {
+		t.Fatalf("ListManifestByGame: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListManifestByGame len = %d, want 2", len(list))
+	}
+	if list[0].NodeID != "bob-deck" || list[1].NodeID != "mister" {
+		t.Fatalf("ListManifestByGame not ordered by node_id: %+v", list)
+	}
+
+	// Missing game/node -> invalid reference.
+	if err := s.SetManifest(c, store.ManifestEntry{GameID: "ghost", NodeID: "bob-deck"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetManifest(missing game): want ErrInvalidReference, got %v", err)
+	}
+	if err := s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "ghost"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetManifest(missing node): want ErrInvalidReference, got %v", err)
+	}
+}
+
+// ---- runtime: cross-cutting delete behavior ----
+
+// testDeleteBlockedByActiveBinding asserts both impls refuse to delete a game
+// or node that is referenced by an active binding (api.md "delete forbidden if
+// active"; the active_bindings NO-ACTION FKs in Postgres, an explicit check in
+// memory).
+func testDeleteBlockedByActiveBinding(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateBinding(c, store.ActiveBinding{
+		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}))
+
+	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("DeleteGame(active): want ErrInvalidReference, got %v", err)
+	}
+	if err := s.DeleteNode(c, "bob-deck"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("DeleteNode(active primary): want ErrInvalidReference, got %v", err)
+	}
+
+	// After deactivation, both deletes succeed.
+	must(t, s.DeleteBinding(c, "super-metroid"))
+	if err := s.DeleteNode(c, "bob-deck"); err != nil {
+		t.Fatalf("DeleteNode after unbind: %v", err)
+	}
+	if err := s.DeleteGame(c, "super-metroid"); err != nil {
+		t.Fatalf("DeleteGame after unbind: %v", err)
+	}
+}
+
+// testCascadeRuntimeOnGameDelete asserts manifest and sync_log rows cascade
+// when a game with no active binding is deleted.
+func testCascadeRuntimeOnGameDelete(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "bob-deck"}))
+	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", Outcome: store.OutcomeOK}))
+
+	// No active binding -> delete succeeds and cascades runtime rows.
+	if err := s.DeleteGame(c, "super-metroid"); err != nil {
+		t.Fatalf("DeleteGame: %v", err)
+	}
+	man, _ := s.ListManifestByGame(c, "super-metroid")
+	if len(man) != 0 {
+		t.Fatalf("manifest after game delete = %d, want 0 (cascade)", len(man))
+	}
+	logs, _ := s.ListLogByGame(c, "super-metroid", 0)
+	if len(logs) != 0 {
+		t.Fatalf("sync_log after game delete = %d, want 0 (cascade)", len(logs))
+	}
+}
+
+// testCascadeManifestOnNodeDelete asserts manifest rows cascade when a node is
+// deleted (sync_log from/to_node are unconstrained text, so they do not block
+// or cascade).
+func testCascadeManifestOnNodeDelete(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "bob-deck"}))
+
+	if err := s.DeleteNode(c, "bob-deck"); err != nil {
+		t.Fatalf("DeleteNode: %v", err)
+	}
+	man, _ := s.ListManifestByGame(c, "super-metroid")
+	if len(man) != 0 {
+		t.Fatalf("manifest after node delete = %d, want 0 (cascade)", len(man))
 	}
 }
 

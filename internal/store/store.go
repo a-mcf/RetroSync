@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -131,6 +132,91 @@ type GamePath struct {
 	Path   string
 }
 
+// Outcome is the result of a single directional sync copy, recorded in
+// sync_log. Mirrors the CHECK constraint in the runtime migration.
+type Outcome string
+
+const (
+	OutcomeOK       Outcome = "ok"
+	OutcomeNoop     Outcome = "noop"
+	OutcomeConflict Outcome = "conflict"
+	OutcomeError    Outcome = "error"
+)
+
+var validOutcomes = map[Outcome]bool{
+	OutcomeOK: true, OutcomeNoop: true, OutcomeConflict: true, OutcomeError: true,
+}
+
+// ValidOutcome reports whether o is an allowed sync_log outcome value.
+func ValidOutcome(o Outcome) bool { return validOutcomes[o] }
+
+// ValidDirection reports whether d is an allowed active_bindings direction:
+// either "from-primary" or "from-peer-<node_id>". Mirrors the CHECK constraint
+// in the runtime migration.
+func ValidDirection(d string) bool {
+	return d == "from-primary" || strings.HasPrefix(d, "from-peer-")
+}
+
+// ActiveBinding is the runtime row that makes a game "active" (in a play
+// session). A game with no ActiveBinding is idle (backup-only). The GameID is
+// the primary key: at most one active binding may exist per game.
+type ActiveBinding struct {
+	// GameID is the bound game; the PK enforces one active session per game.
+	GameID string
+	// PrimaryNode is the node currently holding play authority.
+	PrimaryNode string
+	StartedAt   time.Time
+	// Direction is "from-primary" (primary wins the first sync) or
+	// "from-peer-<node_id>".
+	Direction string
+	// PeerScope is "all-configured" (default) or a csv of node ids.
+	PeerScope string
+	// ConflictAt is non-nil when a non-primary peer mutated mid-session; it
+	// flags the conflict (paused) state. Nil otherwise.
+	ConflictAt *time.Time
+	// LastSynced is the time of the last successful sync pass; nil if none yet.
+	LastSynced *time.Time
+}
+
+// LogEntry is one append-only sync_log row: a single directional copy. A sync
+// pass that fans out from primary to N peers writes N entries.
+type LogEntry struct {
+	// ID is assigned by the store on append (bigserial). Zero on input.
+	ID int64
+	// TS is the time of the copy; the store defaults it to now() when zero.
+	TS time.Time
+	// GameID is the game this entry concerns (FK; cascades on game delete).
+	GameID string
+	// FromNode/ToNode are historical node ids, unconstrained text (NOT FKs) so
+	// a later node removal neither erases nor blocks log history. May be empty.
+	FromNode string
+	ToNode   string
+	// Bytes copied; nil when not applicable (e.g. a noop).
+	Bytes *int64
+	// SrcMtime / DstMtime: source mtime and the destination's mtime *before*
+	// overwrite. Nil when not applicable.
+	SrcMtime *time.Time
+	DstMtime *time.Time
+	Outcome  Outcome
+	// Message carries error/diagnostic detail; empty by default.
+	Message string
+}
+
+// ManifestEntry is the last-known file state for a (game, node) pair, updated
+// by the poll loop. PK is (GameID, NodeID); cascades on game/node delete.
+type ManifestEntry struct {
+	GameID string
+	NodeID string
+	// Mtime / Size are the fast-path identity of the file; nil when unknown.
+	Mtime *time.Time
+	Size  *int64
+	// SHA256 is computed lazily (size+mtime is the fast path); nil/"" when not
+	// yet computed.
+	SHA256 *string
+	// LastChecked is when the poll loop last stat'd this file; nil if never.
+	LastChecked *time.Time
+}
+
 // GameFilter narrows Games.List. The zero value matches everything.
 type GameFilter struct {
 	// Q is an optional case-insensitive substring matched against id and
@@ -170,7 +256,42 @@ type Store interface {
 	ListGamePathsByGame(ctx context.Context, gameID string) ([]GamePath, error)
 	ListGamePathsByNode(ctx context.Context, nodeID string) ([]GamePath, error)
 	DeleteGamePath(ctx context.Context, gameID, nodeID string) error
-}
 
-// TODO(slice-runtime): add ActiveBinding, SyncLog, and Manifest types plus
-// their Store methods (active_bindings, sync_log, manifest tables).
+	// ActiveBindings. The game_id PK enforces one active session per game.
+	// CreateBinding: duplicate game_id -> ErrConflict; missing game/node ->
+	// ErrInvalidReference; bad direction -> ErrInvalidValue.
+	//
+	// Typed-error precedence: inputs are expected to violate at most one
+	// constraint. When an input violates several at once (e.g. duplicate game_id
+	// AND bad direction), which typed error is returned is unspecified and may
+	// differ between backends. (Applies to UpdateBinding too.)
+	CreateBinding(ctx context.Context, b ActiveBinding) error
+	GetBinding(ctx context.Context, gameID string) (ActiveBinding, error)
+	ListBindings(ctx context.Context) ([]ActiveBinding, error)
+	// UpdateBinding rewrites the mutable fields (primary_node, direction,
+	// peer_scope, conflict_at, last_synced) of an existing binding. Missing ->
+	// ErrNotFound; bad direction -> ErrInvalidValue.
+	UpdateBinding(ctx context.Context, b ActiveBinding) error
+	// DeleteBinding is idempotent: deleting an absent binding returns nil (per
+	// api.md "deactivate is idempotent").
+	DeleteBinding(ctx context.Context, gameID string) error
+
+	// SyncLog (append-only).
+	// AppendLog: bad outcome -> ErrInvalidValue; missing game ->
+	// ErrInvalidReference. A non-zero LogEntry.TS is honored as-is; a zero TS
+	// defaults to now() (UTC). The store assigns the entry's id (bigserial);
+	// AppendLog does not write it back into the passed entry, so callers that
+	// need the id re-read via ListLogByGame.
+	AppendLog(ctx context.Context, e LogEntry) error
+	// ListLogByGame returns a game's entries most-recent-first, ordered by ts
+	// descending, with ties broken by id descending. Capped at limit
+	// (limit <= 0 means no cap). Because ts may be caller-supplied or skewed
+	// (RTC-less / drifting clocks), this ts-then-id ordering — not insertion
+	// order — is the contract both implementations honor.
+	ListLogByGame(ctx context.Context, gameID string, limit int) ([]LogEntry, error)
+
+	// Manifest (per-side last-known file state).
+	SetManifest(ctx context.Context, m ManifestEntry) error // upsert on (game_id, node_id)
+	GetManifest(ctx context.Context, gameID, nodeID string) (ManifestEntry, error)
+	ListManifestByGame(ctx context.Context, gameID string) ([]ManifestEntry, error)
+}

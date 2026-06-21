@@ -96,8 +96,19 @@ func TestPostgresMigrationRoundTrip(t *testing.T) {
 	if err := migrate.Up(ctx, conn); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	if err := migrate.Down(ctx, conn); err != nil {
-		t.Fatalf("down: %v", err)
+	// Down reverts one migration at a time (the most recent). Roll all the way
+	// down so the first migration's tables (e.g. users) are gone.
+	for {
+		var applied int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
+			t.Fatalf("count applied: %v", err)
+		}
+		if applied == 0 {
+			break
+		}
+		if err := migrate.Down(ctx, conn); err != nil {
+			t.Fatalf("down: %v", err)
+		}
 	}
 	var exists bool
 	if err := conn.QueryRow(ctx,
