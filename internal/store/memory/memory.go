@@ -31,6 +31,10 @@ type Store struct {
 	// bigserial-equivalent id.
 	log       []store.LogEntry
 	nextLogID int64
+	// syncs keyed by sync id.
+	syncs map[string]store.Sync
+	// syncMembers keyed by (sync_id, node_id) — the PK.
+	syncMembers map[smKey]store.SyncMember
 }
 
 type gpKey struct {
@@ -38,16 +42,23 @@ type gpKey struct {
 	nodeID string
 }
 
+type smKey struct {
+	syncID string
+	nodeID string
+}
+
 // New returns an empty, ready-to-use in-memory Store.
 func New() *Store {
 	return &Store{
-		users:     make(map[string]store.User),
-		nodes:     make(map[string]store.Node),
-		games:     make(map[string]store.Game),
-		paths:     make(map[gpKey]store.GamePath),
-		bindings:  make(map[string]store.ActiveBinding),
-		manifest:  make(map[gpKey]store.ManifestEntry),
-		nextLogID: 1,
+		users:       make(map[string]store.User),
+		nodes:       make(map[string]store.Node),
+		games:       make(map[string]store.Game),
+		paths:       make(map[gpKey]store.GamePath),
+		bindings:    make(map[string]store.ActiveBinding),
+		manifest:    make(map[gpKey]store.ManifestEntry),
+		nextLogID:   1,
+		syncs:       make(map[string]store.Sync),
+		syncMembers: make(map[smKey]store.SyncMember),
 	}
 }
 
@@ -208,6 +219,12 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 			delete(s.manifest, k)
 		}
 	}
+	// Cascade: sync_members.node_id REFERENCES nodes ON DELETE CASCADE.
+	for k := range s.syncMembers {
+		if k.nodeID == id {
+			delete(s.syncMembers, k)
+		}
+	}
 	// sync_log.from_node/to_node are unconstrained text by design, so node
 	// deletion neither cascades nor blocks on the log.
 	return nil
@@ -296,6 +313,20 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 		}
 	}
 	s.log = kept
+	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE, and
+	// sync_members.sync_id cascades from syncs. Delete the game's syncs and
+	// their members.
+	for syncID, sy := range s.syncs {
+		if sy.GameID != id {
+			continue
+		}
+		delete(s.syncs, syncID)
+		for k := range s.syncMembers {
+			if k.syncID == syncID {
+				delete(s.syncMembers, k)
+			}
+		}
+	}
 	return nil
 }
 
@@ -520,6 +551,146 @@ func (s *Store) ListManifestByGame(_ context.Context, gameID string) ([]store.Ma
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out, nil
+}
+
+// ---- Syncs ----
+
+func (s *Store) CreateSync(_ context.Context, sy store.Sync) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.games[sy.GameID]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.syncs[sy.ID]; ok {
+		return store.ErrConflict
+	}
+	s.syncs[sy.ID] = sy
+	return nil
+}
+
+func (s *Store) GetSync(_ context.Context, id string) (store.Sync, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sy, ok := s.syncs[id]
+	if !ok {
+		return store.Sync{}, store.ErrNotFound
+	}
+	return sy, nil
+}
+
+func (s *Store) ListSyncsByGame(_ context.Context, gameID string) ([]store.Sync, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.Sync, 0)
+	for _, sy := range s.syncs {
+		if sy.GameID == gameID {
+			out = append(out, sy)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (s *Store) UpdateSync(_ context.Context, sy store.Sync) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Match Postgres: a no-match UPDATE reports ErrNotFound before the FK can
+	// fire, so the existence check comes first.
+	if _, ok := s.syncs[sy.ID]; !ok {
+		return store.ErrNotFound
+	}
+	if _, ok := s.games[sy.GameID]; !ok {
+		return store.ErrInvalidReference
+	}
+	s.syncs[sy.ID] = sy
+	return nil
+}
+
+func (s *Store) DeleteSync(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.syncs[id]; !ok {
+		return store.ErrNotFound
+	}
+	delete(s.syncs, id)
+	// Cascade: sync_members.sync_id REFERENCES syncs ON DELETE CASCADE.
+	for k := range s.syncMembers {
+		if k.syncID == id {
+			delete(s.syncMembers, k)
+		}
+	}
+	return nil
+}
+
+// ---- SyncMembers ----
+
+func (s *Store) SetSyncMember(_ context.Context, m store.SyncMember) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.syncs[m.SyncID]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.nodes[m.NodeID]; !ok {
+		return store.ErrInvalidReference
+	}
+	// Enforce the global UNIQUE (node_id, path): a given (device, file) lives in
+	// at most one sync. Reject if that (node, path) is already a member of a
+	// DIFFERENT sync. The same (node, path) within THIS sync (i.e. the row we are
+	// about to upsert in place) is fine.
+	for k, existing := range s.syncMembers {
+		if existing.NodeID == m.NodeID && existing.Path == m.Path && k.syncID != m.SyncID {
+			return store.ErrConflict
+		}
+	}
+	s.syncMembers[smKey{m.SyncID, m.NodeID}] = m
+	return nil
+}
+
+func (s *Store) GetSyncMember(_ context.Context, syncID, nodeID string) (store.SyncMember, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.syncMembers[smKey{syncID, nodeID}]
+	if !ok {
+		return store.SyncMember{}, store.ErrNotFound
+	}
+	return m, nil
+}
+
+func (s *Store) ListSyncMembers(_ context.Context, syncID string) ([]store.SyncMember, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.SyncMember, 0)
+	for k, m := range s.syncMembers {
+		if k.syncID == syncID {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out, nil
+}
+
+func (s *Store) ListSyncMembersByNode(_ context.Context, nodeID string) ([]store.SyncMember, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.SyncMember, 0)
+	for k, m := range s.syncMembers {
+		if k.nodeID == nodeID {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SyncID < out[j].SyncID })
+	return out, nil
+}
+
+func (s *Store) DeleteSyncMember(_ context.Context, syncID, nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := smKey{syncID, nodeID}
+	if _, ok := s.syncMembers[k]; !ok {
+		return store.ErrNotFound
+	}
+	delete(s.syncMembers, k)
+	return nil
 }
 
 // cloneBinding deep-copies pointer fields so callers can't mutate stored state.
