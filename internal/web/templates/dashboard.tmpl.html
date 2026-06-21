@@ -25,7 +25,7 @@
     <header class="top">
       <h1>RetroSync</h1>
       <span class="who">
-        {{if eq .User.Role "admin"}}<a href="/nodes">Nodes</a> &nbsp;{{end}}
+        {{if eq .User.Role "admin"}}<a href="/games">Games</a> &nbsp;<a href="/nodes">Nodes</a> &nbsp;{{end}}
         {{.User.Display}} ({{.User.Role}})
         &nbsp;
         <form class="logout" method="post" action="/logout">

@@ -18,6 +18,7 @@ import (
 // pre-selected <option>s without each row re-deriving them.
 var templateFuncs = template.FuncMap{
 	"nodeRowCtx": nodeRowCtx,
+	"gameRowCtx": gameRowCtx,
 }
 
 // nodeRowContext is the per-row template context: one node plus the shared
@@ -226,10 +227,11 @@ func (s *Server) handleEditNode(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/nodes/{id}/delete -----------------------------------------
 
-// handleDeleteNode handles POST /api/nodes/{id}/delete. A delete blocked by a
-// foreign key (the node is an active binding's primary, or has game_paths) comes
-// back from the Store as ErrInvalidReference; we surface a friendly "node is in
-// use" message with 409 rather than a 500.
+// handleDeleteNode handles POST /api/nodes/{id}/delete. game_paths referencing
+// the node cascade on delete, so only an active binding whose primary is this
+// node blocks it: that comes back from the Store as ErrInvalidReference (the
+// active_bindings.primary_node FK), which we surface as a friendly "node is in
+// use" 409 rather than a 500.
 func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -244,9 +246,10 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "no such node", http.StatusNotFound)
 	case errors.Is(err, store.ErrInvalidReference) || errors.Is(err, store.ErrConflict):
-		// The node is referenced by an active binding (primary) or a game_path.
-		// Friendly, non-500 message so the admin knows to stop the session first.
-		http.Error(w, "node is in use by an active session or game mapping — stop it first", http.StatusConflict)
+		// The node is the primary of an active binding (game_paths cascade, so
+		// only an active session blocks). Friendly, non-500 message so the admin
+		// knows to stop the session first.
+		http.Error(w, "node is in use by an active session — stop it first", http.StatusConflict)
 	default:
 		s.logger.ErrorContext(r.Context(), "delete node failed", "node", id, "err", err.Error())
 		http.Error(w, "could not delete node", http.StatusInternalServerError)
@@ -269,18 +272,6 @@ func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	// Confirm the node exists first so a typo'd id is a clean 404 rather than a
-	// generic engine error.
-	if _, err := s.store.GetNode(r.Context(), id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "no such node", http.StatusNotFound)
-			return
-		}
-		s.logger.ErrorContext(r.Context(), "smoke-test: get node failed", "node", id, "err", err.Error())
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	result := smokeResult{NodeID: id}
 	err := s.actioner.SmokeTest(r.Context(), id)
 	switch {
@@ -293,6 +284,11 @@ func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
 		if uerr := s.touchLastSeen(r.Context(), id); uerr != nil {
 			s.logger.ErrorContext(r.Context(), "smoke-test: last_seen update failed", "node", id, "err", uerr.Error())
 		}
+	case errors.Is(err, store.ErrNotFound):
+		// engine.SmokeTest resolves the node and returns ErrNotFound for a typo'd
+		// id, so we surface a clean 404 without a redundant pre-check GetNode.
+		http.Error(w, "no such node", http.StatusNotFound)
+		return
 	case errors.Is(err, engine.ErrSmokeTestUnsupported):
 		result.Message = "smoke-test not supported yet (ssh adapter pending)"
 	default:
@@ -351,6 +347,12 @@ func (s *Server) parseNodeForm(r *http.Request, idOverride string) (store.Node, 
 	}
 	if id == "" {
 		return store.Node{}, "id is required"
+	}
+	// A node id is a registry slug, same shape as a game id (see slug.go). This
+	// retrofit (slice-11 carry-forward) rejects an uppercase/spaced/empty-after-
+	// trim id before it reaches the Store.
+	if !validSlug(id) {
+		return store.Node{}, "id must be a slug: lowercase letters, digits, and hyphens (e.g. bob-deck)"
 	}
 	display := strings.TrimSpace(r.PostFormValue("display"))
 	if display == "" {
@@ -428,10 +430,3 @@ func (s *Server) refreshNodesList(w http.ResponseWriter, r *http.Request, u stor
 		s.logger.ErrorContext(r.Context(), "refresh nodes render failed", "err", err.Error())
 	}
 }
-
-// compile-time assertion: *engine.Engine satisfies the smoke-test surface used
-// here. (The full Actioner assertion lives wherever the engine is wired; this
-// documents the SmokeTest dependency locally.)
-var _ interface {
-	SmokeTest(context.Context, string) error
-} = (*engine.Engine)(nil)

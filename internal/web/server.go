@@ -199,7 +199,17 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/nodes/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteNode)))))
 	mux.Handle("POST /api/nodes/{id}/smoke-test", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSmokeTest)))))
 
-	// TODO(slice-games-registry): GET/POST /games registry editing + path mappings.
+	// Games registry (slice-11). Admin-only per docs/auth.md, same wrapping as
+	// /nodes: every page and mutation behind requireAuth+requireAdmin (mutations
+	// also behind requireCSRF), so a non-admin never reaches the Store. Path
+	// mappings are managed per (game, node) via POST (not PUT/DELETE) to stay
+	// consistent with the existing form/HTMX style.
+	mux.Handle("GET /games", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleGamesPage))))
+	mux.Handle("POST /api/games", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateGame)))))
+	mux.Handle("POST /api/games/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditGame)))))
+	mux.Handle("POST /api/games/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGame)))))
+	mux.Handle("POST /api/games/{id}/paths/{node_id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSetGamePath)))))
+	mux.Handle("POST /api/games/{id}/paths/{node_id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGamePath)))))
 
 	return mux
 }

@@ -68,7 +68,7 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 			}
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(r.Context()))
+		next.ServeHTTP(w, r)
 	})
 }
 

@@ -1,0 +1,165 @@
+{{define "games"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Games</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // Let HTMX swap the 4xx bodies so inline error text (409/422/400) shows.
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      var s = e.detail.xhr.status;
+      if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+    // The "add a path mapping" form targets POST /api/games/{id}/paths/{node_id},
+    // but node_id is chosen from a <select> at submit time. Rewrite the request
+    // path to include the selected node id just before HTMX fires the request.
+    document.addEventListener('htmx:configRequest', function (e) {
+      var el = e.detail.elt;
+      var base = el.getAttribute && el.getAttribute('data-path-base');
+      if (base) {
+        var node = el.querySelector('[name=node_id]');
+        if (node && node.value) {
+          e.detail.path = base + '/' + encodeURIComponent(node.value);
+        }
+        // node_id travels in the URL path, not the body.
+        delete e.detail.parameters['node_id'];
+      }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync — Games</h1>
+      <span class="who">
+        <a href="/">&larr; Dashboard</a> &nbsp;
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <section>
+      <h2>Game registry</h2>
+      <p class="sub">Admin-only. Add a game, edit it, manage its per-node save
+         path mappings, or remove it.</p>
+
+      <form class="search-form" hx-get="/games" hx-target="#games-list"
+            hx-swap="outerHTML" hx-trigger="submit, input delay:300ms from:[name=q]">
+        <label>search <input type="search" name="q" value="{{.Q}}" placeholder="title or id"></label>
+        <label>system <input type="text" name="system" value="{{.System}}" placeholder="snes"></label>
+        <button class="btn" type="submit">Search</button>
+      </form>
+
+      {{template "games-list" .}}
+    </section>
+
+    <section>
+      <h2>Add a game</h2>
+      <form class="game-form card" hx-post="/api/games"
+            hx-target="#games-list" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label>id <input type="text" name="id" placeholder="super-metroid"></label>
+        <p class="sub">Optional — leave blank to auto-generate a slug from the display.</p>
+        <label>display <input type="text" name="display" required placeholder="Super Metroid"></label>
+        <label>system <input type="text" name="system" required placeholder="snes"></label>
+        <label>notes <input type="text" name="notes" placeholder="(free-form)"></label>
+        <p><button class="btn" type="submit">Add game</button></p>
+        <div class="form-error"></div>
+      </form>
+    </section>
+  </div>
+</body>
+</html>{{end}}
+
+{{define "games-list"}}
+<div id="games-list">
+  {{if not .Games}}
+    <p class="empty">No games match.</p>
+  {{else}}
+    {{$root := .}}
+    {{range .Games}}
+      {{template "game-row" (gameRowCtx $root .)}}
+    {{end}}
+  {{end}}
+</div>
+{{end}}
+
+{{define "game-row"}}
+{{$csrf := .CSRF}}{{$nodes := .Nodes}}{{with .Game}}
+<div class="card game-card" id="game-{{.ID}}">
+  <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
+  <div class="sub">
+    system: {{.System}}
+    {{if .Active}}&nbsp;|&nbsp; <span class="badge ok">playing on {{.Active}}</span>{{end}}
+  </div>
+  {{if .Notes}}<div class="sub">{{.Notes}}</div>{{end}}
+
+  <div class="game-actions">
+    <form hx-post="/api/games/{{.ID}}/delete"
+          hx-target="#games-list" hx-swap="outerHTML"
+          hx-confirm="Delete game {{.ID}}?">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <button class="btn danger" type="submit">Delete</button>
+    </form>
+  </div>
+
+  <details>
+    <summary>Edit</summary>
+    <form class="game-form" hx-post="/api/games/{{.ID}}"
+          hx-target="#games-list" hx-swap="outerHTML">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <label>display <input type="text" name="display" value="{{.Display}}" required></label>
+      <label>system <input type="text" name="system" value="{{.System}}" required></label>
+      <label>notes <input type="text" name="notes" value="{{.Notes}}"></label>
+      <p><button class="btn" type="submit">Save changes</button></p>
+    </form>
+  </details>
+
+  <details>
+    <summary>Path mappings</summary>
+    <div class="paths">
+      {{if not .Paths}}
+        <p class="empty">No path mappings yet.</p>
+      {{else}}
+        {{$gid := .ID}}
+        {{range .Paths}}
+          <div class="path-row">
+            <span class="path-node">{{.NodeID}}{{if .IsPrimary}} <span class="badge ok">primary</span>{{end}}</span>
+            <form class="path-set" hx-post="/api/games/{{$gid}}/paths/{{.NodeID}}"
+                  hx-target="#games-list" hx-swap="outerHTML">
+              <input type="hidden" name="csrf_token" value="{{$csrf}}">
+              <input type="text" name="path" value="{{.Path}}" required>
+              <button class="btn" type="submit">Save</button>
+            </form>
+            <form class="path-del" hx-post="/api/games/{{$gid}}/paths/{{.NodeID}}/delete"
+                  hx-target="#games-list" hx-swap="outerHTML"
+                  hx-confirm="Remove the {{.NodeID}} mapping?">
+              <input type="hidden" name="csrf_token" value="{{$csrf}}">
+              <button class="btn danger" type="submit">Remove</button>
+            </form>
+          </div>
+        {{end}}
+      {{end}}
+
+      <form class="path-add" hx-post="/api/games/{{.ID}}/paths/"
+            data-path-base="/api/games/{{.ID}}/paths"
+            hx-target="#games-list" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{$csrf}}">
+        <label>node
+          <select name="node_id">
+            {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </label>
+        <label>path <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm" required></label>
+        <button class="btn" type="submit">Add mapping</button>
+      </form>
+    </div>
+    <div class="form-error"></div>
+  </details>
+</div>
+{{end}}{{end}}
