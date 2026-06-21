@@ -151,10 +151,18 @@ var validOutcomes = map[Outcome]bool{
 func ValidOutcome(o Outcome) bool { return validOutcomes[o] }
 
 // ValidDirection reports whether d is an allowed active_bindings direction:
-// either "from-primary" or "from-peer-<node_id>". Mirrors the CHECK constraint
-// in the runtime migration.
+// either "from-primary" or "from-peer-<node_id>" with a non-empty node id.
+//
+// The runtime migration's CHECK uses LIKE 'from-peer-%', which (since % matches
+// zero chars) would also admit the bare "from-peer-". We tighten here to require
+// a non-empty suffix so the validity boundary matches engine.sourceNodeID, which
+// rejects an empty source id. The DB CHECK remains a coarser backstop.
 func ValidDirection(d string) bool {
-	return d == "from-primary" || strings.HasPrefix(d, "from-peer-")
+	if d == "from-primary" {
+		return true
+	}
+	id := strings.TrimPrefix(d, "from-peer-")
+	return id != d && id != ""
 }
 
 // ActiveBinding is the runtime row that makes a game "active" (in a play
