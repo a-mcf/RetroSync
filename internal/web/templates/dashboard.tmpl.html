@@ -1,0 +1,90 @@
+{{define "dashboard"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync</h1>
+      <span class="who">
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <!-- ACTIVE BINDINGS ------------------------------------------------ -->
+    <section>
+      <h2>Active</h2>
+      {{if not .Active}}
+        <p class="empty">Nothing is being played right now.</p>
+      {{else}}
+        {{range .Active}}
+        <div class="card">
+          <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
+          <div class="sub">Bound on <strong>{{.PrimaryNode}}</strong> since {{.Since}}</div>
+          {{if .Conflict}}
+            <div class="conflict">Sync paused — more than one node changed. (Resolve in a later release.)</div>
+            <!-- TODO(slice-actions): per-node "Use &lt;node&gt;" winner buttons -->
+          {{end}}
+          {{if .Peers}}
+          <ul class="peers">
+            {{range .Peers}}<li>{{.NodeID}} — {{.Mtime}}</li>{{end}}
+          </ul>
+          {{end}}
+          <div class="sub">Last sync: {{.LastSync}}</div>
+          <!-- TODO(slice-actions): "Sync now" / "Done playing" buttons -->
+          <p><button class="btn" disabled>Done playing</button></p>
+        </div>
+        {{end}}
+      {{end}}
+    </section>
+
+    <!-- MY GAMES ------------------------------------------------------- -->
+    <section>
+      <h2>My games</h2>
+      <!-- TODO(slice-actions): wire search box (non-functional this slice). -->
+      <input class="search" type="search" placeholder="Search my games…" disabled>
+      {{if not .MyGames}}
+        <p class="empty">No games map to your nodes yet.</p>
+      {{else}}
+        {{range .MyGames}}
+        <div class="card">
+          <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
+          <ul class="node-lines">
+            {{range .Nodes}}<li>{{.NodeID}}: {{.Mtime}}</li>{{end}}
+          </ul>
+          <!-- TODO(slice-actions): "Play on &lt;node&gt;" buttons (largest tap target). -->
+          <p><button class="btn big" disabled>Play</button></p>
+        </div>
+        {{end}}
+      {{end}}
+    </section>
+
+    <!-- STATUS --------------------------------------------------------- -->
+    <section>
+      <h2>Nodes</h2>
+      {{if not .Nodes}}
+        <p class="empty">No nodes registered.</p>
+      {{else}}
+        {{range .Nodes}}
+        <div class="card">
+          <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
+          <div class="sub">
+            {{if .Reachable}}<span class="badge ok">reachable</span>{{else}}<span class="badge bad">not seen</span>{{end}}
+            &nbsp; last seen: {{.LastSeen}}
+          </div>
+        </div>
+        {{end}}
+      {{end}}
+    </section>
+  </div>
+</body>
+</html>{{end}}
