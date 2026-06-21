@@ -1,0 +1,194 @@
+{{define "nodes"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Nodes</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // Reveal the reach_config fields that apply to the selected reach. Pure
+    // progressive-enhancement: the server validates the shape regardless.
+    function syncReachFields(form) {
+      var reach = form.querySelector('[name=reach]').value;
+      form.querySelectorAll('[data-reach]').forEach(function (el) {
+        el.style.display = (el.getAttribute('data-reach') === reach) ? '' : 'none';
+      });
+    }
+    document.addEventListener('DOMContentLoaded', function () {
+      document.querySelectorAll('form.node-form').forEach(function (f) {
+        syncReachFields(f);
+        var sel = f.querySelector('[name=reach]');
+        if (sel) sel.addEventListener('change', function () { syncReachFields(f); });
+      });
+    });
+    // Let HTMX swap the 409/422/4xx bodies so the inline error text shows.
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      var s = e.detail.xhr.status;
+      if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync — Nodes</h1>
+      <span class="who">
+        <a href="/">&larr; Dashboard</a> &nbsp;
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <section>
+      <h2>Registered nodes</h2>
+      <p class="sub">Admin-only. Add a device, edit its reach config, run a
+         reachability smoke-test, or remove it.</p>
+      {{template "nodes-list" .}}
+    </section>
+
+    <section>
+      <h2>Add a node</h2>
+      <form class="node-form card" hx-post="/api/nodes"
+            hx-target="#nodes-list" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label>id <input type="text" name="id" required placeholder="bob-deck"></label>
+        <label>display <input type="text" name="display" required placeholder="Bob's Deck"></label>
+        <label>owner
+          <select name="owner_user_id">
+            <option value="">(shared / none)</option>
+            {{range .Owners}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </label>
+        <label>kind
+          <select name="kind">
+            {{range .Kinds}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </label>
+        <label>reach
+          <select name="reach">
+            {{range .Reaches}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </label>
+        <div data-reach="syncthing-share">
+          <label>path <input type="text" name="path" placeholder="/srv/syncthing/bob-deck-saves"></label>
+        </div>
+        <div data-reach="ssh">
+          <label>host <input type="text" name="host" placeholder="172.16.7.12"></label>
+          <label>user <input type="text" name="user" placeholder="root"></label>
+          <!-- secret_ref is a NAME into the host secret store, never a password. -->
+          <label>secret_ref <input type="text" name="secret_ref" placeholder="mister-1"></label>
+          <p class="sub">secret_ref names a credential in the host secret store.
+             Never paste a password or key here.</p>
+        </div>
+        <p><button class="btn" type="submit">Add node</button></p>
+        <div class="form-error"></div>
+      </form>
+    </section>
+  </div>
+</body>
+</html>{{end}}
+
+{{define "nodes-list"}}
+<div id="nodes-list">
+  {{if not .Nodes}}
+    <p class="empty">No nodes registered yet.</p>
+  {{else}}
+    {{$root := .}}
+    {{range .Nodes}}
+      {{template "node-row" (nodeRowCtx $root .)}}
+    {{end}}
+  {{end}}
+</div>
+{{end}}
+
+{{define "node-row"}}
+{{$csrf := .CSRF}}{{$owners := .Owners}}{{$kinds := .Kinds}}{{$reaches := .Reaches}}{{with .Node}}
+<div class="card node-card" id="node-{{.ID}}">
+  <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
+  <div class="sub">
+    kind: {{.Kind}} &nbsp;|&nbsp; reach: {{.Reach}}
+    &nbsp;|&nbsp; owner: {{if .OwnerUserID}}{{.OwnerUserID}}{{else}}(shared){{end}}
+  </div>
+  <div class="sub">
+    {{if .Reachable}}<span class="badge ok">reachable</span>{{else}}<span class="badge bad">not seen</span>{{end}}
+    &nbsp; last seen: {{.LastSeen}}
+  </div>
+
+  <div class="node-actions">
+    <button class="btn" type="button"
+            hx-post="/api/nodes/{{.ID}}/smoke-test"
+            hx-target="#smoke-{{.ID}}" hx-swap="innerHTML">Test</button>
+    <span id="smoke-{{.ID}}" class="smoke-result"></span>
+    <form hx-post="/api/nodes/{{.ID}}/delete"
+          hx-target="#nodes-list" hx-swap="outerHTML"
+          hx-confirm="Delete node {{.ID}}?">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <button class="btn danger" type="submit">Delete</button>
+    </form>
+  </div>
+
+  <details>
+    <summary>Edit</summary>
+    <form class="node-form" hx-post="/api/nodes/{{.ID}}"
+          hx-target="#nodes-list" hx-swap="outerHTML">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <label>display <input type="text" name="display" value="{{.Display}}" required></label>
+      <label>owner
+        <select name="owner_user_id">
+          <option value="" {{if not .OwnerUserID}}selected{{end}}>(shared / none)</option>
+          {{$owner := .OwnerUserID}}
+          {{range $owners}}<option value="{{.}}" {{if eq . $owner}}selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      <label>kind
+        <select name="kind">
+          {{$kind := .Kind}}
+          {{range $kinds}}<option value="{{.}}" {{if eq . $kind}}selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      <label>reach
+        <select name="reach">
+          {{$reach := .Reach}}
+          {{range $reaches}}<option value="{{.}}" {{if eq . $reach}}selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      <div data-reach="syncthing-share">
+        <label>path <input type="text" name="path" value="{{.Path}}"></label>
+      </div>
+      <div data-reach="ssh">
+        <label>host <input type="text" name="host" value="{{.Host}}"></label>
+        <label>user <input type="text" name="user" value="{{.SSHUser}}"></label>
+        <label>secret_ref <input type="text" name="secret_ref" value="{{.SecretRef}}"></label>
+      </div>
+      <p><button class="btn" type="submit">Save changes</button></p>
+    </form>
+  </details>
+</div>
+{{end}}{{end}}
+
+{{define "smoke-result"}}
+<span class="badge {{if .OK}}ok{{else}}bad{{end}}">{{.Message}}</span>
+{{end}}
+
+{{define "forbidden"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Forbidden</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top"><h1>Admins only</h1></header>
+    <section>
+      <p class="empty">This page is restricted to administrators.</p>
+      <p><a href="/">&larr; Back to the dashboard</a></p>
+    </section>
+  </div>
+</body>
+</html>{{end}}

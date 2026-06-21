@@ -42,6 +42,36 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	})
 }
 
+// requireAdmin wraps a handler so only an admin user reaches it (docs/auth.md:
+// "edit the registry ... add nodes" is admin-only). It MUST be mounted inside
+// requireAuth — it reads the authenticated user from the request context. A
+// non-admin is rejected BEFORE the wrapped handler runs, so a regular user never
+// reaches the Store via any /nodes page or /api/nodes* mutation:
+//
+//   - /api/* routes get a 403 JSON error.
+//   - HTML routes get a 403 "admins only" page.
+//
+// If no user is in context (requireAdmin somehow mounted without requireAuth) it
+// fails closed with a 403 rather than panicking.
+func (s *Server) requireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, ok := userFromContext(r.Context())
+		if !ok || u.Role != store.RoleAdmin {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				writeJSONError(w, http.StatusForbidden, "admins only")
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			if err := s.templates.ExecuteTemplate(w, "forbidden", nil); err != nil {
+				s.logger.ErrorContext(r.Context(), "forbidden render failed", "err", err.Error())
+			}
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(r.Context()))
+	})
+}
+
 // currentUser resolves the session cookie to a User, or (zero, false) when
 // there is no valid session or the user has since been deleted.
 func (s *Server) currentUser(r *http.Request) (store.User, bool) {
