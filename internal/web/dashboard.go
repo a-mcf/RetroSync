@@ -233,6 +233,20 @@ func fmtMtime(t *time.Time) string {
 	return t.Format("2006-01-02 15:04")
 }
 
+// fmtSize renders a byte count as a compact human-readable size (B / KB / MB),
+// for the conflict modal's per-node disclosure. Save files are small; KB
+// precision is plenty.
+func fmtSize(n int64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%d KB", n/1024)
+	default:
+		return fmt.Sprintf("%d MB", n/(1024*1024))
+	}
+}
+
 // fmtTime renders an absolute time; "—" for nil/zero.
 func fmtTime(t *time.Time) string {
 	if t == nil || t.IsZero() {

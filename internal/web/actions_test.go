@@ -11,22 +11,34 @@ import (
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/auth"
+	"github.com/a-mcf/retrosync/internal/engine"
 	"github.com/a-mcf/retrosync/internal/store"
 	"github.com/a-mcf/retrosync/internal/store/memory"
 )
 
-// stubActioner records Activate/Deactivate calls and returns a programmable
-// error, so handler tests assert on the call (or its absence) without an engine.
+// stubActioner records Activate/Deactivate/ResolveConflict calls and returns
+// programmable errors / canned NodeStates, so handler tests assert on the call
+// (or its absence) without an engine.
 type stubActioner struct {
 	mu          sync.Mutex
 	activateErr error
 	calls       []activateCall
 	deactivated []string
+
+	// resolveErr is returned by ResolveConflict; resolved records each call.
+	resolveErr error
+	resolved   []resolveCall
+	// nodeStates is the canned slice returned by NodeStates.
+	nodeStates []engine.NodeState
 }
 
 type activateCall struct {
 	gameID, primaryNode, direction, peerScope string
 	force                                     bool
+}
+
+type resolveCall struct {
+	gameID, winnerNodeID string
 }
 
 func (s *stubActioner) Activate(_ context.Context, gameID, primaryNode, direction, peerScope string, force bool) error {
@@ -41,6 +53,25 @@ func (s *stubActioner) Deactivate(_ context.Context, gameID string) error {
 	defer s.mu.Unlock()
 	s.deactivated = append(s.deactivated, gameID)
 	return nil
+}
+
+func (s *stubActioner) ResolveConflict(_ context.Context, gameID, winnerNodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resolved = append(s.resolved, resolveCall{gameID, winnerNodeID})
+	return s.resolveErr
+}
+
+func (s *stubActioner) NodeStates(_ context.Context, _ string) ([]engine.NodeState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]engine.NodeState(nil), s.nodeStates...), nil
+}
+
+func (s *stubActioner) resolveCalls() []resolveCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]resolveCall(nil), s.resolved...)
 }
 
 func (s *stubActioner) activateCalls() []activateCall {

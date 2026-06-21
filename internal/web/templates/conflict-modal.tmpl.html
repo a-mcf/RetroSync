@@ -1,0 +1,41 @@
+{{define "conflict-modal"}}
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Resolve conflict for {{.GameDisplay}}">
+    <div class="modal-head">
+      <h3>{{.GameDisplay}} — sync paused <span class="sub">{{.System}}</span></h3>
+      <button class="modal-close" type="button"
+              aria-label="Close"
+              onclick="document.getElementById('modal').innerHTML='';">&times;</button>
+    </div>
+    <p>More than one node changed since the last sync.
+       <strong>retrosync won't choose for you.</strong> Pick a winner:</p>
+    <p class="sub">The winner's save is copied to every other node. Each other
+       node's current save is backed up alongside it first.</p>
+    <ul class="source-list">
+      {{range .Nodes}}
+      <li>
+        <div class="source-opt">
+          <span class="source-id">{{.NodeID}}</span>
+          <span class="source-mtime">
+            {{if .Present}}{{.Mtime}}, {{.Size}}{{else}}no save{{end}}
+          </span>
+          {{if .Present}}
+          <form hx-post="/api/games/{{$.GameID}}/resolve-conflict"
+                hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
+            <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+            <input type="hidden" name="winner_node_id" value="{{.NodeID}}">
+            <button class="btn" type="submit">Use {{.NodeID}}</button>
+          </form>
+          {{end}}
+        </div>
+      </li>
+      {{end}}
+    </ul>
+    <div class="modal-actions">
+      <button class="linkbtn" type="button"
+              onclick="document.getElementById('modal').innerHTML='';">Cancel</button>
+    </div>
+  </div>
+</div>
+{{end}}
