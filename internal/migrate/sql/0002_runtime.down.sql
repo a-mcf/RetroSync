@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS manifest;
+DROP TABLE IF EXISTS sync_log;
+DROP TABLE IF EXISTS active_bindings;

@@ -89,21 +89,26 @@ games:
 
 Unique on `game_id` enforces "only one active session per game at a time."
 
+The `from-peer-<node_id>` form of `direction` embeds a node id as plain text (not an FK), so it is an initial-sync hint only and may dangle if that peer node is later deleted.
+
 ### `sync_log` (append-only)
 
-| field     | type | notes                                  |
-|-----------|------|----------------------------------------|
-| ts        | ts   |                                        |
-| game_id   | text |                                        |
-| from_node | text |                                        |
-| to_node   | text |                                        |
-| bytes     | int  |                                        |
-| src_mtime | ts   |                                        |
-| dst_mtime | ts   | mtime *before* overwrite               |
-| outcome   | text | `ok`, `noop`, `conflict`, `error`      |
-| message   | text | error detail                           |
+| field     | type      | notes                                  |
+|-----------|-----------|----------------------------------------|
+| id        | bigserial | PK; surrogate key, also the tiebreaker for "most recent" ordering |
+| ts        | ts        |                                        |
+| game_id   | text      | FK → games, `ON DELETE CASCADE`        |
+| from_node | text      | unconstrained text by design (see below) |
+| to_node   | text      | unconstrained text by design (see below) |
+| bytes     | int       |                                        |
+| src_mtime | ts        |                                        |
+| dst_mtime | ts        | mtime *before* overwrite               |
+| outcome   | text      | `ok`, `noop`, `conflict`, `error`      |
+| message   | text      | error detail                           |
 
 Used for the UI history panel and conflict diagnostics. One row per directional copy; a single sync pass can produce N rows when fanning out from primary to multiple peers.
+
+`from_node`/`to_node` are **plain text, not foreign keys**, on purpose: the log is historical and a node may be removed later. We never want a node deletion to erase or block log history, so those columns are left unconstrained. (`game_id`, by contrast, *is* an FK and cascades, so deleting a game cleans up its history.)
 
 ### `manifest` (per side)
 

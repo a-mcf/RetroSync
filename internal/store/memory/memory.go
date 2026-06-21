@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/a-mcf/retrosync/internal/store"
 )
@@ -22,6 +23,14 @@ type Store struct {
 	games map[string]store.Game
 	// paths keyed by game_id then node_id.
 	paths map[gpKey]store.GamePath
+	// bindings keyed by game_id (the PK / one-active-session invariant).
+	bindings map[string]store.ActiveBinding
+	// manifest keyed by (game_id, node_id).
+	manifest map[gpKey]store.ManifestEntry
+	// log is the append-only sync_log, ordered by append; nextLogID assigns the
+	// bigserial-equivalent id.
+	log       []store.LogEntry
+	nextLogID int64
 }
 
 type gpKey struct {
@@ -32,10 +41,13 @@ type gpKey struct {
 // New returns an empty, ready-to-use in-memory Store.
 func New() *Store {
 	return &Store{
-		users: make(map[string]store.User),
-		nodes: make(map[string]store.Node),
-		games: make(map[string]store.Game),
-		paths: make(map[gpKey]store.GamePath),
+		users:     make(map[string]store.User),
+		nodes:     make(map[string]store.Node),
+		games:     make(map[string]store.Game),
+		paths:     make(map[gpKey]store.GamePath),
+		bindings:  make(map[string]store.ActiveBinding),
+		manifest:  make(map[gpKey]store.ManifestEntry),
+		nextLogID: 1,
 	}
 }
 
@@ -176,13 +188,28 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 	if _, ok := s.nodes[id]; !ok {
 		return store.ErrNotFound
 	}
+	// An active binding holds play authority on this node. The Postgres
+	// NO-ACTION FK (active_bindings.primary_node) refuses the delete with a
+	// 23503 -> ErrInvalidReference; mirror that here so both impls agree.
+	for _, b := range s.bindings {
+		if b.PrimaryNode == id {
+			return store.ErrInvalidReference
+		}
+	}
 	delete(s.nodes, id)
-	// Cascade: delete game_paths referencing this node.
+	// Cascade: delete game_paths and manifest rows referencing this node.
 	for k := range s.paths {
 		if k.nodeID == id {
 			delete(s.paths, k)
 		}
 	}
+	for k := range s.manifest {
+		if k.nodeID == id {
+			delete(s.manifest, k)
+		}
+	}
+	// sync_log.from_node/to_node are unconstrained text by design, so node
+	// deletion neither cascades nor blocks on the log.
 	return nil
 }
 
@@ -244,13 +271,31 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 	if _, ok := s.games[id]; !ok {
 		return store.ErrNotFound
 	}
+	// An active binding makes this game active. The Postgres NO-ACTION FK
+	// (active_bindings.game_id) refuses the delete with a 23503 ->
+	// ErrInvalidReference; mirror that here so both impls agree.
+	if _, ok := s.bindings[id]; ok {
+		return store.ErrInvalidReference
+	}
 	delete(s.games, id)
-	// Cascade: delete game_paths referencing this game.
+	// Cascade: delete game_paths, manifest, and sync_log referencing this game.
 	for k := range s.paths {
 		if k.gameID == id {
 			delete(s.paths, k)
 		}
 	}
+	for k := range s.manifest {
+		if k.gameID == id {
+			delete(s.manifest, k)
+		}
+	}
+	kept := s.log[:0]
+	for _, e := range s.log {
+		if e.GameID != id {
+			kept = append(kept, e)
+		}
+	}
+	s.log = kept
 	return nil
 }
 
@@ -316,6 +361,204 @@ func (s *Store) DeleteGamePath(_ context.Context, gameID, nodeID string) error {
 	return nil
 }
 
+// ---- ActiveBindings ----
+
+func (s *Store) CreateBinding(_ context.Context, b store.ActiveBinding) error {
+	if !store.ValidDirection(b.Direction) {
+		return store.ErrInvalidValue
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.games[b.GameID]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.nodes[b.PrimaryNode]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.bindings[b.GameID]; ok {
+		return store.ErrConflict
+	}
+	if b.PeerScope == "" {
+		b.PeerScope = "all-configured"
+	}
+	if b.StartedAt.IsZero() {
+		b.StartedAt = time.Now().UTC()
+	}
+	s.bindings[b.GameID] = cloneBinding(b)
+	return nil
+}
+
+func (s *Store) GetBinding(_ context.Context, gameID string) (store.ActiveBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.bindings[gameID]
+	if !ok {
+		return store.ActiveBinding{}, store.ErrNotFound
+	}
+	return cloneBinding(b), nil
+}
+
+func (s *Store) ListBindings(_ context.Context) ([]store.ActiveBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.ActiveBinding, 0, len(s.bindings))
+	for _, b := range s.bindings {
+		out = append(out, cloneBinding(b))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].GameID < out[j].GameID })
+	return out, nil
+}
+
+func (s *Store) UpdateBinding(_ context.Context, b store.ActiveBinding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Match Postgres: a no-match UPDATE reports ErrNotFound before the CHECK
+	// constraint can fire, so the existence check comes first.
+	if _, ok := s.bindings[b.GameID]; !ok {
+		return store.ErrNotFound
+	}
+	if !store.ValidDirection(b.Direction) {
+		return store.ErrInvalidValue
+	}
+	if _, ok := s.nodes[b.PrimaryNode]; !ok {
+		return store.ErrInvalidReference
+	}
+	if b.PeerScope == "" {
+		b.PeerScope = "all-configured"
+	}
+	s.bindings[b.GameID] = cloneBinding(b)
+	return nil
+}
+
+func (s *Store) DeleteBinding(_ context.Context, gameID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Idempotent: deleting an absent binding is a no-op (api.md "deactivate is
+	// idempotent"). No ErrNotFound here, unlike the other Delete* methods.
+	delete(s.bindings, gameID)
+	return nil
+}
+
+// ---- SyncLog ----
+
+func (s *Store) AppendLog(_ context.Context, e store.LogEntry) error {
+	if !store.ValidOutcome(e.Outcome) {
+		return store.ErrInvalidValue
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.games[e.GameID]; !ok {
+		return store.ErrInvalidReference
+	}
+	e.ID = s.nextLogID
+	s.nextLogID++
+	if e.TS.IsZero() {
+		e.TS = time.Now().UTC()
+	}
+	s.log = append(s.log, cloneLog(e))
+	return nil
+}
+
+func (s *Store) ListLogByGame(_ context.Context, gameID string, limit int) ([]store.LogEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// Most-recent-first by ts, ties broken by id descending — matching the
+	// Postgres ORDER BY ts DESC, id DESC. We cannot rely on append order: a
+	// caller-supplied or clock-skewed ts (RTC-less MiSTer, drifting Anbernics)
+	// can make insertion order diverge from ts order, so sort explicitly.
+	out := make([]store.LogEntry, 0)
+	for _, e := range s.log {
+		if e.GameID == gameID {
+			out = append(out, cloneLog(e))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].TS.Equal(out[j].TS) {
+			return out[i].TS.After(out[j].TS)
+		}
+		return out[i].ID > out[j].ID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ---- Manifest ----
+
+func (s *Store) SetManifest(_ context.Context, m store.ManifestEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.games[m.GameID]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.nodes[m.NodeID]; !ok {
+		return store.ErrInvalidReference
+	}
+	s.manifest[gpKey{m.GameID, m.NodeID}] = cloneManifest(m)
+	return nil
+}
+
+func (s *Store) GetManifest(_ context.Context, gameID, nodeID string) (store.ManifestEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.manifest[gpKey{gameID, nodeID}]
+	if !ok {
+		return store.ManifestEntry{}, store.ErrNotFound
+	}
+	return cloneManifest(m), nil
+}
+
+func (s *Store) ListManifestByGame(_ context.Context, gameID string) ([]store.ManifestEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.ManifestEntry, 0)
+	for k, m := range s.manifest {
+		if k.gameID == gameID {
+			out = append(out, cloneManifest(m))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out, nil
+}
+
+// cloneBinding deep-copies pointer fields so callers can't mutate stored state.
+func cloneBinding(b store.ActiveBinding) store.ActiveBinding {
+	out := b
+	out.ConflictAt = clonePtr(b.ConflictAt)
+	out.LastSynced = clonePtr(b.LastSynced)
+	return out
+}
+
+// cloneLog deep-copies pointer fields so callers can't mutate stored state.
+func cloneLog(e store.LogEntry) store.LogEntry {
+	out := e
+	out.Bytes = clonePtr(e.Bytes)
+	out.SrcMtime = clonePtr(e.SrcMtime)
+	out.DstMtime = clonePtr(e.DstMtime)
+	return out
+}
+
+// cloneManifest deep-copies pointer fields so callers can't mutate stored state.
+func cloneManifest(m store.ManifestEntry) store.ManifestEntry {
+	out := m
+	out.Mtime = clonePtr(m.Mtime)
+	out.Size = clonePtr(m.Size)
+	out.SHA256 = clonePtr(m.SHA256)
+	out.LastChecked = clonePtr(m.LastChecked)
+	return out
+}
+
+// clonePtr returns a copy of *p (or nil), so stored pointer fields can't be
+// mutated through a returned value.
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
 // cloneNode deep-copies pointer fields so callers can't mutate stored state.
 func cloneNode(n store.Node) store.Node {
 	out := n
@@ -329,6 +572,3 @@ func cloneNode(n store.Node) store.Node {
 	}
 	return out
 }
-
-// TODO(slice-runtime): implement ActiveBinding/SyncLog/Manifest methods here
-// once they are added to store.Store.

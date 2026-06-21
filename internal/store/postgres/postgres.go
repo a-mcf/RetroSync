@@ -359,5 +359,208 @@ func (s *Store) DeleteGamePath(ctx context.Context, gameID, nodeID string) error
 	return nil
 }
 
-// TODO(slice-runtime): implement ActiveBinding/SyncLog/Manifest methods here
-// once they are added to store.Store.
+// ---- ActiveBindings ----
+//
+// The active_bindings.game_id PRIMARY KEY enforces one active session per game
+// (duplicate insert -> 23505 -> ErrConflict). Its game_id/primary_node FKs are
+// NO ACTION, so DeleteGame/DeleteNode of a referenced row fail with 23503 ->
+// ErrInvalidReference without any extra check here.
+
+func (s *Store) CreateBinding(ctx context.Context, b store.ActiveBinding) error {
+	// Let the DB default started_at/peer_scope when the caller leaves them zero.
+	var startedAt any
+	if !b.StartedAt.IsZero() {
+		startedAt = b.StartedAt
+	}
+	peerScope := b.PeerScope
+	if peerScope == "" {
+		peerScope = "all-configured"
+	}
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO active_bindings
+		   (game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced)
+		 VALUES ($1, $2, COALESCE($3, now()), $4, $5, $6, $7)`,
+		b.GameID, b.PrimaryNode, startedAt, b.Direction, peerScope, b.ConflictAt, b.LastSynced)
+	return mapErr(err)
+}
+
+func (s *Store) GetBinding(ctx context.Context, gameID string) (store.ActiveBinding, error) {
+	row := s.db.QueryRow(ctx,
+		`SELECT game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced
+		 FROM active_bindings WHERE game_id = $1`, gameID)
+	b, err := scanBinding(row)
+	if err != nil {
+		return store.ActiveBinding{}, mapErr(err)
+	}
+	return b, nil
+}
+
+func (s *Store) ListBindings(ctx context.Context) ([]store.ActiveBinding, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced
+		 FROM active_bindings ORDER BY game_id`)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.ActiveBinding, 0)
+	for rows.Next() {
+		b, err := scanBinding(rows)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, b)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func (s *Store) UpdateBinding(ctx context.Context, b store.ActiveBinding) error {
+	peerScope := b.PeerScope
+	if peerScope == "" {
+		peerScope = "all-configured"
+	}
+	tag, err := s.db.Exec(ctx,
+		`UPDATE active_bindings
+		 SET primary_node = $2, direction = $3, peer_scope = $4,
+		     conflict_at = $5, last_synced = $6
+		 WHERE game_id = $1`,
+		b.GameID, b.PrimaryNode, b.Direction, peerScope, b.ConflictAt, b.LastSynced)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteBinding(ctx context.Context, gameID string) error {
+	// Idempotent: an absent binding is not an error (api.md "deactivate is
+	// idempotent"), so we ignore RowsAffected.
+	_, err := s.db.Exec(ctx, `DELETE FROM active_bindings WHERE game_id = $1`, gameID)
+	return mapErr(err)
+}
+
+func scanBinding(r rowScanner) (store.ActiveBinding, error) {
+	var b store.ActiveBinding
+	if err := r.Scan(&b.GameID, &b.PrimaryNode, &b.StartedAt, &b.Direction,
+		&b.PeerScope, &b.ConflictAt, &b.LastSynced); err != nil {
+		return store.ActiveBinding{}, err
+	}
+	return b, nil
+}
+
+// ---- SyncLog ----
+
+func (s *Store) AppendLog(ctx context.Context, e store.LogEntry) error {
+	var ts any
+	if !e.TS.IsZero() {
+		ts = e.TS
+	}
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO sync_log
+		   (ts, game_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message)
+		 VALUES (COALESCE($1, now()), $2, $3, $4, $5, $6, $7, $8, $9)`,
+		ts, e.GameID, nullIfEmpty(e.FromNode), nullIfEmpty(e.ToNode),
+		e.Bytes, e.SrcMtime, e.DstMtime, string(e.Outcome), e.Message)
+	return mapErr(err)
+}
+
+func (s *Store) ListLogByGame(ctx context.Context, gameID string, limit int) ([]store.LogEntry, error) {
+	// Most-recent-first. id (bigserial) breaks ts ties deterministically.
+	// limit <= 0 means no cap; NULL disables the LIMIT clause.
+	var lim any
+	if limit > 0 {
+		lim = limit
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT id, ts, game_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message
+		 FROM sync_log WHERE game_id = $1
+		 ORDER BY ts DESC, id DESC
+		 LIMIT $2`, gameID, lim)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.LogEntry, 0)
+	for rows.Next() {
+		var (
+			e        store.LogEntry
+			from, to *string
+			outcome  string
+		)
+		if err := rows.Scan(&e.ID, &e.TS, &e.GameID, &from, &to, &e.Bytes,
+			&e.SrcMtime, &e.DstMtime, &outcome, &e.Message); err != nil {
+			return nil, mapErr(err)
+		}
+		if from != nil {
+			e.FromNode = *from
+		}
+		if to != nil {
+			e.ToNode = *to
+		}
+		e.Outcome = store.Outcome(outcome)
+		out = append(out, e)
+	}
+	return out, mapErr(rows.Err())
+}
+
+// nullIfEmpty maps "" to a SQL NULL so empty node ids store as NULL rather than
+// an empty string (matching the historical-text semantics of from/to_node).
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// ---- Manifest ----
+
+func (s *Store) SetManifest(ctx context.Context, m store.ManifestEntry) error {
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO manifest (game_id, node_id, mtime, size, sha256, last_checked)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (game_id, node_id) DO UPDATE SET
+		   mtime = EXCLUDED.mtime, size = EXCLUDED.size,
+		   sha256 = EXCLUDED.sha256, last_checked = EXCLUDED.last_checked`,
+		m.GameID, m.NodeID, m.Mtime, m.Size, m.SHA256, m.LastChecked)
+	return mapErr(err)
+}
+
+func (s *Store) GetManifest(ctx context.Context, gameID, nodeID string) (store.ManifestEntry, error) {
+	row := s.db.QueryRow(ctx,
+		`SELECT game_id, node_id, mtime, size, sha256, last_checked
+		 FROM manifest WHERE game_id = $1 AND node_id = $2`, gameID, nodeID)
+	m, err := scanManifest(row)
+	if err != nil {
+		return store.ManifestEntry{}, mapErr(err)
+	}
+	return m, nil
+}
+
+func (s *Store) ListManifestByGame(ctx context.Context, gameID string) ([]store.ManifestEntry, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT game_id, node_id, mtime, size, sha256, last_checked
+		 FROM manifest WHERE game_id = $1 ORDER BY node_id`, gameID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.ManifestEntry, 0)
+	for rows.Next() {
+		m, err := scanManifest(rows)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, m)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func scanManifest(r rowScanner) (store.ManifestEntry, error) {
+	var m store.ManifestEntry
+	if err := r.Scan(&m.GameID, &m.NodeID, &m.Mtime, &m.Size, &m.SHA256, &m.LastChecked); err != nil {
+		return store.ManifestEntry{}, err
+	}
+	return m, nil
+}
