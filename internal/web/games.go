@@ -293,6 +293,11 @@ func (s *Server) handleDeleteGamePath(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.PathValue("node_id")
 
 	// Guard: refuse removing the path of the node that is the active primary.
+	// NOTE: GetBinding-then-DeleteGamePath is a benign TOCTOU — a binding could
+	// in principle appear between the read and the delete. Harmless here: this
+	// route is admin-only and not driven concurrently, so the window cannot be
+	// raced in practice. A transaction-scoped guard would only be warranted if
+	// this ever ran under concurrent mutation.
 	if b, err := s.store.GetBinding(r.Context(), gameID); err == nil {
 		if b.PrimaryNode == nodeID {
 			http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)

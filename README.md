@@ -50,17 +50,105 @@ Bob, Alice, and the kid each have a Deck. The MiSTer lives in the living room. T
 
 ## Status
 
-Spec only. No code yet.
+Implemented and working end-to-end. Built across 11 vertical slices, all merged.
+
+retrosync is a **Go** service backed by **Postgres**. Everything — build, unit
+tests, integration tests against a real Postgres, and the production image — runs
+in **podman**; the host stays clean (no Go or Postgres installed locally). The
+single verification command is `make ci` (fmt, vet, unit, integration, image
+build); `make build` builds the production image, `make test-integration` runs the
+Postgres-backed integration suite.
+
+### What works
+
+- **Registry** — admin-gated CRUD over games, nodes, and per-(game, node) path
+  mappings (`/games`, `/nodes` pages and their `POST /api/...` mutations).
+- **Auth** — username + password login with **argon2id** hashing and per-session
+  cookie sessions; a per-session CSRF token guards every state-changing POST.
+- **Dashboard** — the read-only home view plus the play-sync actions:
+  **Play on \<node\>** / **Done playing**, the activation "use my save" modal, and
+  **force-takeover** of a game another node holds.
+- **Conflict detection + resolution** — the poll loop flags a conflict when a
+  non-primary peer mutates (or primary+peer diverge) and pauses that game; the
+  conflict modal shows every node's live state and a per-node "use this one"
+  button. Resolution backs up each loser's current file to a sibling
+  `<path>.retrosync-conflict-<ts>` (nanosecond, filesystem-safe timestamp) before
+  fanning the winner out.
+- **Poll daemon** — a background ticker that sweeps the active bindings every
+  `RETROSYNC_POLL_INTERVAL` and runs one engine pass per bound game; errors are
+  isolated per game and the sweep is idempotent (crash-safe).
+- **localfs reach adapter** — `syncthing-share` nodes are read/written as ordinary
+  local filesystem paths (rooted at `reach_config.path`), via atomic
+  temp-file-then-rename writes.
+
+### Running it
+
+The binary is `retrosync`; with no subcommand (or `serve`) it connects to
+Postgres, runs migrations, then runs the web UI and the poll daemon together under
+one signal context.
+
+```sh
+# 1. Build the production image (distroless, static binary) in podman.
+make build                       # -> retrosync:dev
+
+# 2. Run Postgres (any Postgres 16 works; here, podman).
+podman run -d --name retrosync-pg \
+  -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=retrosync \
+  -p 5432:5432 docker.io/library/postgres:16
+
+# 3. Run the server.
+podman run --rm --network host \
+  -e DATABASE_URL='postgres://postgres:secret@127.0.0.1:5432/retrosync?sslmode=disable' \
+  retrosync:dev serve            # listens on :8080 by default
+
+# 4. Bootstrap the first admin. The password comes from RETROSYNC_PASSWORD
+#    (NOT argv — argv leaks via `ps`); it can also be piped on stdin.
+podman run --rm --network host \
+  -e DATABASE_URL='postgres://postgres:secret@127.0.0.1:5432/retrosync?sslmode=disable' \
+  -e RETROSYNC_PASSWORD='choose-a-strong-password' \
+  retrosync:dev user set alice --role admin
+```
+
+**Environment variables** (`cmd/retrosync/config.go`):
+
+| var                       | required | default | meaning                                    |
+|---------------------------|----------|---------|--------------------------------------------|
+| `DATABASE_URL`            | yes      | —       | Postgres DSN (pgx)                         |
+| `RETROSYNC_HTTP_ADDR`     | no       | `:8080` | HTTP listen address                        |
+| `RETROSYNC_POLL_INTERVAL` | no       | `15s`   | active-binding sweep cadence               |
+| `RETROSYNC_POLL_TIMEOUT`  | no       | `60s`   | per-game poll timeout                      |
+| `RETROSYNC_PASSWORD`      | `user set` only | — | password for `retrosync user set <id>` |
+
+**SELinux note:** on an enforcing host (Fedora/RHEL), a save directory
+bind-mounted into the container needs the `:Z` (or `:z`) volume suffix so the
+container can read/write it — e.g. `-v /srv/syncthing/bob-deck:/saves/bob-deck:Z`.
+Without it, the container's reads/writes are denied. (The `Makefile` already uses
+`:Z` on its bind mounts for the same reason.)
+
+### Implemented vs deferred
+
+Deferred (registered as `TODO(slice-...)` hook points in the code, not yet built):
+
+- **ssh/sftp reach adapter** — `ssh` nodes resolve to "not supported yet"; only
+  `syncthing-share` (localfs) is wired. This also means writeback into a
+  Syncthing-share device (which the design routes over SSH) is not yet possible.
+- **Syncthing-status poller** — node `reachable` / backup-health are not yet read
+  from Syncthing, so those fields are cosmetic until a status poller lands.
+- **Pushover notifier** — no outbound notifications yet.
+- **Containerized browser e2e** — handlers are tested directly; no headless-browser
+  end-to-end suite.
+- **Deploy / k8s manifests** — the CNPG + Syncthing-sidecar layout is documented
+  (architecture.md) but no manifests ship in this repo.
 
 Specs live in [`docs/`](docs/):
 
 - [`docs/architecture.md`](docs/architecture.md) — components, channels, deployment shape
 - [`docs/data-model.md`](docs/data-model.md) — registry schema, active bindings, manifest
 - [`docs/state-machine.md`](docs/state-machine.md) — activation, conflicts, deactivation
-- [`docs/api.md`](docs/api.md) — REST/HTMX endpoints
+- [`docs/api.md`](docs/api.md) — the HTTP surface (HTMX/POST-driven)
 - [`docs/ui.md`](docs/ui.md) — screens and flows
 - [`docs/auth.md`](docs/auth.md) — per-user identity, node reachability
-- [`docs/open-questions.md`](docs/open-questions.md) — undecided design points
+- [`docs/open-questions.md`](docs/open-questions.md) — design points (resolved + still-open)
 
 ## Non-goals
 

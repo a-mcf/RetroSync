@@ -176,9 +176,14 @@ func (s *Server) buildNodesPage(ctx context.Context, u store.User) (nodesPageDat
 // syncthing-share; host/user/secret_ref for ssh). On success it returns the
 // refreshed node-list fragment. Error mapping:
 //   - duplicate id (ErrConflict)         -> 409
-//   - bad kind/reach (ErrInvalidValue)   -> 422
+//   - bad kind/reach (caught locally in parseNodeForm) -> 400
 //   - missing owner FK (ErrInvalidReference) -> 422
 //   - bad reach_config shape (local)     -> 400
+//
+// Note: bad kind/reach is rejected by parseNodeForm before the Store is touched,
+// so it surfaces as a 400 here. The ErrInvalidValue -> 422 branch in
+// handleNodeWriteErr is a defense-in-depth backstop that form validation already
+// prevents from firing.
 func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {

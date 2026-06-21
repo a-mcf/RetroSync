@@ -38,6 +38,10 @@ The "use my save" default is the most important decision in this flow. SGM-Helpe
 
 ## Active poll loop
 
+> **Implemented.** The engine's `Poll` (the case table below) is driven by the
+> `internal/daemon` ticker, which sweeps every active binding every N seconds and
+> isolates per-game errors. A conflicted binding is skipped (paused) until resolved.
+
 For each active binding, every N seconds (default 15s):
 
 1. Stat every node in scope (primary + peers). Compare against `manifest`.
@@ -65,6 +69,13 @@ When a non-primary peer mutates during an active session, or both primary and pe
 - Before any overwrite, write the loser's existing file to `<path>.retrosync-conflict-<ts>` on the same node (cheap insurance — see open-questions.md).
 
 There is intentionally no auto-merge. Save files don't merge.
+
+> **Implemented** (`engine.ResolveConflict`, owner/admin-gated + CSRF-protected
+> `POST /api/games/{id}/resolve-conflict`). The `<ts>` is a UTC, filesystem-safe,
+> **nanosecond-precision** stamp (`20060102T150405.000000000Z`), so two resolves in
+> the same second can't collide. Every loser-with-a-file is backed up *before* any
+> overwrite; the conflict flag clears only after the full fan-out succeeds, so a
+> partial failure leaves the game re-resolvable.
 
 ## Deactivation
 
