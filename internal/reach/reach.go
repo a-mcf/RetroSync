@@ -23,6 +23,14 @@ import (
 // matches on this sentinel rather than on any OS-specific error.
 var ErrNotExist = errors.New("reach: file does not exist")
 
+// ErrUnsupportedReach is returned by a Resolver when a node's reach strategy has
+// no adapter wired yet. Callers compare with errors.Is. Today the ssh/sftp
+// adapter is unimplemented, so a Resolver returns this for ssh nodes.
+//
+// TODO(slice-ssh): remove the ssh case from this sentinel once the ssh/sftp
+// adapter (with secret-store credential handling) lands.
+var ErrUnsupportedReach = errors.New("reach: unsupported reach strategy")
+
 // FileMeta is the fast-path identity of a file: modification time and size.
 // It deliberately omits content hashing; size+mtime is the cheap comparison
 // the poll loop relies on (see docs/data-model.md, docs/state-machine.md).
