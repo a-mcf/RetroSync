@@ -10,12 +10,15 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// dashboardData is the full view-model for GET / (read-only this slice).
+// dashboardData is the full view-model for GET / and the action refresh
+// fragment. CSRF is the per-session token embedded so every action POST
+// (Play / Done / takeover) can echo it back.
 type dashboardData struct {
 	User    userView
 	Active  []activeRow
 	MyGames []myGameRow
 	Nodes   []nodeRow
+	CSRF    string
 }
 
 // userView is a hash-free projection of store.User for the template. It
@@ -47,17 +50,33 @@ type peerLine struct {
 }
 
 // myGameRow is one "my games" card: a game with a path on a node I own, with a
-// per-node last-known mtime line.
+// per-node last-known mtime line and a "Play on <node>" (or "Take over")
+// action per owned node.
 type myGameRow struct {
 	GameID      string
 	GameDisplay string
 	System      string
 	Nodes       []nodeMtimeLine
+	// ActivePrimary is the node currently bound as primary for this game, or ""
+	// if the game is idle. When set and != an owned node, the Play button reads
+	// "Take over from <ActivePrimary>" and posts force=true.
+	ActivePrimary string
+	// MultiSource is true when more than one node has a path for this game, so
+	// the Play button opens the "use my save" modal (hx-get) instead of posting
+	// directly (docs/ui.md: modal only appears with multiple saves/sources).
+	MultiSource bool
 }
 
 type nodeMtimeLine struct {
 	NodeID string
 	Mtime  string
+	// Owned marks a line that maps to a node the current user owns: only these
+	// get an action button (docs/ui.md "Play on <node>" per owned node).
+	Owned bool
+	// Takeover is true when this owned node would take over a session currently
+	// primaried on a different node (button reads "Take over from <other>" and
+	// posts force=true).
+	Takeover bool
 }
 
 // nodeRow is one node-status card.
@@ -95,6 +114,12 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list bindings: %w", err)
 	}
+	// primaryByGame: game_id -> the node currently bound as primary. Used in the
+	// "my games" section to decide Play vs "Take over from <other>".
+	primaryByGame := make(map[string]string, len(bindings))
+	for _, b := range bindings {
+		primaryByGame[b.GameID] = b.PrimaryNode
+	}
 	for _, b := range bindings {
 		row := activeRow{
 			GameID:      b.GameID,
@@ -129,12 +154,16 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 			myNodes[n.ID] = true
 		}
 	}
-	// For each game, collect path mappings that land on one of my nodes.
+	// For each game, collect path mappings that land on one of my nodes. The
+	// total path count (across all nodes, owned or not) decides whether Play
+	// opens the "use my save" modal: with more than one configured source the
+	// user must choose which save to start from (docs/ui.md).
 	for _, g := range games {
 		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
 		if err != nil {
 			return dashboardData{}, fmt.Errorf("list paths %s: %w", g.ID, err)
 		}
+		activePrimary := primaryByGame[g.ID]
 		var lines []nodeMtimeLine
 		for _, p := range paths {
 			if !myNodes[p.NodeID] {
@@ -146,17 +175,26 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 			} else if !errors.Is(err, store.ErrNotFound) {
 				return dashboardData{}, fmt.Errorf("get manifest %s/%s: %w", g.ID, p.NodeID, err)
 			}
-			lines = append(lines, nodeMtimeLine{NodeID: p.NodeID, Mtime: mtime})
+			// Takeover when the game is active on a DIFFERENT node than this one.
+			takeover := activePrimary != "" && activePrimary != p.NodeID
+			lines = append(lines, nodeMtimeLine{
+				NodeID:   p.NodeID,
+				Mtime:    mtime,
+				Owned:    true,
+				Takeover: takeover,
+			})
 		}
 		if len(lines) == 0 {
 			continue
 		}
 		sort.Slice(lines, func(i, j int) bool { return lines[i].NodeID < lines[j].NodeID })
 		data.MyGames = append(data.MyGames, myGameRow{
-			GameID:      g.ID,
-			GameDisplay: g.Display,
-			System:      g.System,
-			Nodes:       lines,
+			GameID:        g.ID,
+			GameDisplay:   g.Display,
+			System:        g.System,
+			Nodes:         lines,
+			ActivePrimary: activePrimary,
+			MultiSource:   len(paths) > 1,
 		})
 	}
 

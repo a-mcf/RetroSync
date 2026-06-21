@@ -80,12 +80,24 @@ type scopedNode struct {
 // filtered by peerScope), stats them, resolves the source per direction, creates
 // the active_bindings row, and fans the source file out to every other in-scope
 // node — updating the manifest and appending a sync_log row per directional
-// copy. Activating an already-active game is rejected (store.ErrConflict).
-func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string) error {
+// copy.
+//
+// force controls the already-active case (docs/state-machine.md step 1):
+//   - force=false: activating a game that already has a binding is rejected with
+//     store.ErrConflict ("currently bound to <other>; force takeover?").
+//   - force=true: the existing binding row is deleted (a raw replace — NOT a
+//     Deactivate-with-final-sync) and the new session proceeds with the normal
+//     activate + fan-out. The takeover's chosen source (per direction) is what
+//     gets fanned out, so the taker's "use my save" choice wins.
+func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string, force bool) error {
 	if !store.ValidDirection(direction) {
 		return fmt.Errorf("engine: invalid direction %q: %w", direction, store.ErrInvalidValue)
 	}
 
+	// All read-only validation runs FIRST, before we touch any existing binding.
+	// A force-takeover that turns out to be non-viable (no save in scope, chosen
+	// source missing, etc.) must return its error WITHOUT having displaced the
+	// existing session (the displaced row would otherwise be lost for nothing).
 	scoped, err := e.inScopeNodes(ctx, gameID, peerScope)
 	if err != nil {
 		return err
@@ -124,6 +136,23 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 	}
 	if !present[sourceID] {
 		return fmt.Errorf("engine: source %q: %w", sourceID, ErrSourceMissing)
+	}
+
+	// The new activation is now known viable. ONLY now, for a force-takeover, do
+	// we raw-delete the existing binding so CreateBinding below does not hit
+	// ErrConflict. This is intentionally NOT a Deactivate (no final sync of the
+	// displaced session's primary): the human sitting down with the taking node
+	// has just chosen the source they want, and a final sync of the old primary
+	// could overwrite that choice (docs/state-machine.md step 1: "Force = delete
+	// the existing row, create new").
+	if force {
+		if _, err := e.store.GetBinding(ctx, gameID); err == nil {
+			if err := e.store.DeleteBinding(ctx, gameID); err != nil {
+				return fmt.Errorf("engine: force-takeover delete binding: %w", err)
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("engine: force-takeover get binding: %w", err)
+		}
 	}
 
 	now := e.clock()

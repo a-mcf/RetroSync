@@ -145,7 +145,7 @@ func TestActivate_NoNodeHasFile_Errors(t *testing.T) {
 	h.addNode("primary", "p.srm", nil, t0, false)
 	h.addNode("peer", "q.srm", nil, t0, false)
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured")
+	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
 	if !errors.Is(err, engine.ErrNoSave) {
 		t.Fatalf("want ErrNoSave, got %v", err)
 	}
@@ -162,7 +162,7 @@ func TestActivate_SingleSource_AutoPickAndFanOut(t *testing.T) {
 	h.addNode("peer1", "q.srm", nil, t0, false)
 	h.addNode("peer2", "r.srm", nil, t0, false)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,7 +202,7 @@ func TestActivate_MultiSource_FromPrimary(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), pMtime, true)
 	h.addNode("peer", "q.srm", []byte("PEER"), peerMtime, true)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
 	// from-primary => primary is the source; peer is overwritten with PRIMARY.
@@ -216,7 +216,7 @@ func TestActivate_MultiSource_FromPeer(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), pMtime, true)
 	h.addNode("peer", "q.srm", []byte("PEER"), peerMtime, true)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
 	// from-peer-peer => peer is the source; primary is overwritten with PEER.
@@ -228,7 +228,7 @@ func TestActivate_FromPeer_MissingSource_Errors(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), t0, true)
 	h.addNode("peer", "q.srm", nil, t0, false) // peer has no file
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured")
+	err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured", false)
 	if !errors.Is(err, engine.ErrSourceMissing) {
 		t.Fatalf("want ErrSourceMissing, got %v", err)
 	}
@@ -239,19 +239,104 @@ func TestActivate_AlreadyActive_Rejected(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("SAVE"), t0, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured")
+	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
 	if !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("want store.ErrConflict, got %v", err)
+	}
+}
+
+func TestActivate_ForceTakeover_ReplacesBinding(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	srcMtime := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("OLD"), srcMtime, true)
+	h.addNode("other", "q.srm", []byte("MINE"), srcMtime, true)
+
+	// First session: "primary" holds the binding, sourced from itself, scoped to
+	// itself so "other" keeps its own MINE save (we take over from it next).
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary", false); err != nil {
+		t.Fatal(err)
+	}
+	if b := h.binding(); b.PrimaryNode != "primary" {
+		t.Fatalf("first binding primary = %q, want primary", b.PrimaryNode)
+	}
+
+	// Without force, taking over fails.
+	if err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", false); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("takeover without force: want ErrConflict, got %v", err)
+	}
+
+	// With force, the existing binding is replaced (raw delete + create), and
+	// the new source ("other") is fanned out — so "primary" now holds MINE.
+	if err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", true); err != nil {
+		t.Fatalf("force takeover: %v", err)
+	}
+	b := h.binding()
+	if b.PrimaryNode != "other" {
+		t.Fatalf("after force takeover primary = %q, want other", b.PrimaryNode)
+	}
+	if b.Direction != "from-peer-other" {
+		t.Fatalf("after force takeover direction = %q, want from-peer-other", b.Direction)
+	}
+	h.assertFile("primary", []byte("MINE"), srcMtime)
+}
+
+func TestActivate_Force_NonViableSource_LeavesExistingBinding(t *testing.T) {
+	// A force-takeover whose chosen source has NO file must return its error
+	// (ErrSourceMissing) WITHOUT having deleted the pre-existing binding. The
+	// displaced session must not be lost for a takeover that cannot proceed.
+	h := newHarness(t, steppingClock(t0, time.Second))
+	srcMtime := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("OLD"), srcMtime, true)
+	h.addNode("other", "q.srm", nil, srcMtime, false /* no file */)
+
+	// First session: "primary" holds the binding, scoped to itself so the
+	// fan-out does not give "other" a file (we need "other" to stay empty so the
+	// takeover below has a non-viable source).
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary", false); err != nil {
+		t.Fatal(err)
+	}
+	before := h.binding()
+	if before.PrimaryNode != "primary" {
+		t.Fatalf("setup binding primary = %q, want primary", before.PrimaryNode)
+	}
+
+	// Force takeover sourced from "other", which has no file → ErrSourceMissing.
+	err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", true)
+	if !errors.Is(err, engine.ErrSourceMissing) {
+		t.Fatalf("force takeover with missing source: want ErrSourceMissing, got %v", err)
+	}
+
+	// The pre-existing binding must be UNCHANGED (not dropped, not replaced).
+	after := h.binding()
+	if after.PrimaryNode != "primary" {
+		t.Fatalf("after failed force takeover primary = %q, want primary (binding must survive)", after.PrimaryNode)
+	}
+	if after.Direction != before.Direction || !after.StartedAt.Equal(before.StartedAt) {
+		t.Fatalf("after failed force takeover binding mutated: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestActivate_Force_OnIdleGame_Activates(t *testing.T) {
+	// force=true on a game with no existing binding behaves like a normal
+	// activate (the delete is skipped because GetBinding returns ErrNotFound).
+	h := newHarness(t, steppingClock(t0, time.Second))
+	h.addNode("primary", "p.srm", []byte("SAVE"), t0.Add(-time.Hour), true)
+	h.addNode("peer", "q.srm", nil, t0, false)
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", true); err != nil {
+		t.Fatalf("force activate on idle: %v", err)
+	}
+	if b := h.binding(); b.PrimaryNode != "primary" {
+		t.Fatalf("binding primary = %q, want primary", b.PrimaryNode)
 	}
 }
 
 func TestActivate_BadDirection_Rejected(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	h.addNode("primary", "p.srm", []byte("SAVE"), t0, true)
-	err := h.engine.Activate(ctx(), gameID, "primary", "sideways", "all-configured")
+	err := h.engine.Activate(ctx(), gameID, "primary", "sideways", "all-configured", false)
 	if !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("want ErrInvalidValue, got %v", err)
 	}
@@ -265,7 +350,7 @@ func TestActivate_PeerScope_CSV(t *testing.T) {
 	h.addNode("out", "r.srm", nil, t0, false)
 
 	// Scope excludes "out".
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary,in"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary,in", false); err != nil {
 		t.Fatal(err)
 	}
 	h.assertFile("in", []byte("SAVE"), src)
@@ -285,7 +370,7 @@ func activateClean(t *testing.T) (*harness, time.Time) {
 	srcMtime := t0.Add(-time.Hour)
 	h.addNode("primary", "p.srm", []byte("V1"), srcMtime, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
 	return h, srcMtime
@@ -480,7 +565,7 @@ func TestActivate_FanOutFails_RollsBackToIdle_AndRetrySucceeds(t *testing.T) {
 	boom := errors.New("sftp: connection reset")
 	h.fake("peer").FailWriteAtomic("q.srm", boom)
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured")
+	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
 	if !errors.Is(err, boom) {
 		t.Fatalf("want fan-out write error, got %v", err)
 	}
@@ -493,7 +578,7 @@ func TestActivate_FanOutFails_RollsBackToIdle_AndRetrySucceeds(t *testing.T) {
 	// Clear the injected failure and retry: a clean activation must now succeed
 	// (no lingering ErrConflict from the half-active row).
 	h.fake("peer").FailWriteAtomic("q.srm", nil)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatalf("retry activate should succeed after rollback, got %v", err)
 	}
 	h.assertFile("peer", []byte("SAVE"), srcMtime)
@@ -514,7 +599,7 @@ func activateCleanMulti(t *testing.T) (*harness, time.Time) {
 	h.addNode("primary", "p.srm", []byte("V1"), srcMtime, true)
 	h.addNode("peerA", "a.srm", nil, t0, false)
 	h.addNode("peerB", "b.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatal(err)
 	}
 	return h, srcMtime

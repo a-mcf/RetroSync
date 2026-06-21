@@ -21,11 +21,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // success the authed user is injected into the request context. On failure:
 // HTML routes redirect to /login (303); /api/* routes get a 401 JSON error.
 //
-// Note: there is no CSRF token check yet. GET routes behind requireAuth are
-// safe (read-only). The state-changing POST routes (/login, /logout) are
-// mounted OUTSIDE this middleware and rely on SameSite=Lax for baseline CSRF
-// protection; a token-based defense is deferred to TODO(slice-actions) when
-// mutating POSTs arrive.
+// Note: requireAuth itself does not check CSRF. GET routes behind it are safe
+// (read-only). The mutating action POSTs (/api/games/{id}/activate|deactivate)
+// are additionally wrapped in requireCSRF (synchronizer-token check). The
+// /login and /logout POSTs are mounted OUTSIDE this middleware and rely on
+// SameSite=Lax for baseline CSRF protection.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, ok := s.currentUser(r)
@@ -142,6 +142,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	data.CSRF = s.csrfFor(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.templates.ExecuteTemplate(w, "dashboard", data); err != nil {
 		// Header may already be written; just log.

@@ -142,7 +142,7 @@ func run(logger *slog.Logger) error {
 	eng := engine.New(st, resolve.ResolveReach, time.Now)
 	d := daemon.New(st, eng, cfg.PollInterval, cfg.PollTimeout, logger)
 
-	srv, err := web.New(st, web.Options{Logger: logger})
+	srv, err := web.New(st, web.Options{Logger: logger, Actioner: eng})
 	if err != nil {
 		return fmt.Errorf("web server: %w", err)
 	}
