@@ -11,9 +11,9 @@
 // TODO(slice-daemon): the poll-loop ticker that calls Poll(ctx, gameID) every
 // N seconds for each active binding.
 // TODO(slice-api): the HTTP handlers that drive Activate/Poll/Deactivate.
-// TODO(slice-conflict-resolve): resolving a flagged conflict (the "use this
-// one" fan-out) and the <path>.retrosync-conflict-<ts> backup-before-overwrite
-// copy. This slice only detects and flags conflicts.
+// TODO(slice-conflict-ui): the conflict modal and the
+// POST /api/games/{id}/resolve-conflict handler that drives ResolveConflict /
+// NodeStates, plus the dashboard wiring that surfaces a conflicted binding.
 package engine
 
 import (
@@ -63,6 +63,10 @@ var (
 	// ErrNoPath is returned when a referenced node has no game_paths row for the
 	// game (e.g. the direction names a node not configured for this game).
 	ErrNoPath = errors.New("engine: node has no path for game")
+	// ErrNotConflicted is returned by ResolveConflict when the binding is not in
+	// conflict (conflict_at == nil): there is nothing to resolve, and forcing a
+	// fan-out would silently overwrite peers the human never reviewed.
+	ErrNotConflicted = errors.New("engine: binding is not in conflict")
 )
 
 // scopedNode pairs an in-scope node with its game_paths.path and resolved Reach.
@@ -260,6 +264,212 @@ func (e *Engine) Deactivate(ctx context.Context, gameID string) error {
 		return fmt.Errorf("engine: delete binding: %w", err)
 	}
 	return nil
+}
+
+// NodeState is a single in-scope node's CURRENT live file state, as read by a
+// fresh Stat (not the manifest). It is what the conflict-resolution modal
+// renders so the human can see each node's divergent save before picking a
+// winner (docs/state-machine.md "Conflict handling": "UI shows every node's
+// current state (mtime, size)").
+type NodeState struct {
+	// NodeID is the in-scope node.
+	NodeID string
+	// Present is false when the node currently has no file (reach.ErrNotExist).
+	Present bool
+	// Mtime / Size are the live file's metadata; zero values when !Present.
+	Mtime time.Time
+	Size  int64
+}
+
+// NodeStates returns the live per-node state of every in-scope node that has a
+// game_paths row for gameID, sorted by NodeID for determinism. It is read-only:
+// no manifest, binding, or filesystem mutation. A node whose file is absent is
+// returned with Present=false; any Stat error other than reach.ErrNotExist is a
+// real error.
+//
+// The in-scope set is filtered by the binding's peer_scope when a binding
+// exists; for an idle game (no binding) every configured node is in scope so the
+// pre-bind stale-peer view (docs/state-machine.md "Stale-peer visibility") can
+// render too.
+func (e *Engine) NodeStates(ctx context.Context, gameID string) ([]NodeState, error) {
+	peerScope := "all-configured"
+	if b, err := e.store.GetBinding(ctx, gameID); err == nil {
+		peerScope = b.PeerScope
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, fmt.Errorf("engine: get binding: %w", err)
+	}
+
+	scoped, err := e.inScopeNodes(ctx, gameID, peerScope)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]NodeState, 0, len(scoped))
+	for _, sn := range scoped {
+		meta, present, err := e.statOpt(ctx, sn)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, NodeState{
+			NodeID:  sn.node.ID,
+			Present: present,
+			Mtime:   meta.Mtime,
+			Size:    meta.Size,
+		})
+	}
+	// inScopeNodes already sorts by node id; NodeStates inherits that order.
+	return out, nil
+}
+
+// ResolveConflict resolves a flagged conflict by making winnerNodeID's current
+// save the authority and fanning it out to every other in-scope node, after
+// first preserving each loser's existing file as a sibling backup. It clears the
+// conflict only on full success (docs/state-machine.md "Conflict handling").
+//
+// Preconditions:
+//   - The binding MUST be in conflict (conflict_at != nil); otherwise
+//     ErrNotConflicted (resolving a non-conflicted game is not allowed — it
+//     would overwrite peers the human never reviewed).
+//   - winnerNodeID MUST be in scope (ErrNoPath otherwise) and MUST currently
+//     hold a file (ErrSourceMissing otherwise).
+//
+// Ordering / crash-safety:
+//  1. Back up every OTHER in-scope node that currently HAS a file to a sibling
+//     <path>.retrosync-conflict-<ts> on that same node, BEFORE any overwrite.
+//     The ts is the injected Clock in a filesystem-safe, sub-second form
+//     (20060102T150405.000000000Z, UTC, no colons), so two resolves in the same
+//     wall-clock second do not collide. A node with no current file gets no
+//     backup.
+//  2. Fan the winner's bytes+mtime out to every other in-scope node, advancing
+//     the manifest only AFTER each successful write (reuses fanOut/setManifest).
+//  3. Clear conflict_at and set last_synced.
+//
+// If any backup or fan-out write fails, conflict_at is left set (the binding
+// stays conflicted and re-resolvable) and the error is returned.
+func (e *Engine) ResolveConflict(ctx context.Context, gameID, winnerNodeID string) error {
+	binding, err := e.store.GetBinding(ctx, gameID)
+	if err != nil {
+		return fmt.Errorf("engine: get binding: %w", err)
+	}
+	if binding.ConflictAt == nil {
+		return fmt.Errorf("engine: game %q: %w", gameID, ErrNotConflicted)
+	}
+
+	scoped, err := e.inScopeNodes(ctx, gameID, binding.PeerScope)
+	if err != nil {
+		return err
+	}
+	winner, ok := byID(scoped, winnerNodeID)
+	if !ok {
+		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrNoPath)
+	}
+	// TODO(slice-daemon): TOCTOU window — the winner is stat'd here, re-read in
+	// fanOut, and the losers are independently re-stat'd in backupLosers, so a
+	// file can change between these stats/reads. Harmless today (no concurrent
+	// poll loop drives this path), but when the timer loop lands a file mutated
+	// mid-resolution could be backed up or fanned out inconsistently; revisit to
+	// snapshot each node once under the concurrency model then in place.
+	winnerMeta, winnerPresent, err := e.statOpt(ctx, winner)
+	if err != nil {
+		return err
+	}
+	if !winnerPresent {
+		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrSourceMissing)
+	}
+
+	now := e.clock()
+
+	// Step 1: back up every OTHER in-scope node that currently has a file, BEFORE
+	// any overwrite. A backup failure aborts WITHOUT having touched the saves and
+	// leaves the conflict set (re-resolvable). No loser file is overwritten until
+	// every loser-with-a-file has been backed up.
+	if err := e.backupLosers(ctx, gameID, scoped, winner, now); err != nil {
+		return err
+	}
+
+	// Step 2: fan out the winner to every other in-scope node, advancing the
+	// manifest only after each successful write. A partial fan-out returns the
+	// error and (because we have NOT cleared conflict_at) leaves the game
+	// conflicted for re-resolution.
+	if err := e.fanOut(ctx, gameID, winner, scoped, winnerMeta, now); err != nil {
+		return err
+	}
+	// Record the winner's own manifest state (it is the authority for this pass).
+	if err := e.setManifest(ctx, gameID, winner.node.ID, winnerMeta, now); err != nil {
+		return err
+	}
+
+	// Step 3: only now, after every write succeeded, clear the conflict and mark
+	// the binding synced.
+	binding.ConflictAt = nil
+	binding.LastSynced = &now
+	if err := e.store.UpdateBinding(ctx, binding); err != nil {
+		return fmt.Errorf("engine: clear conflict: %w", err)
+	}
+	return nil
+}
+
+// backupLosers writes the CURRENT bytes of every in-scope node other than the
+// winner that currently holds a file to a sibling backup path
+// <path>.retrosync-conflict-<ts> on that same node, via WriteAtomic, and logs an
+// "ok" sync_log row per backup. Nodes with no current file are skipped (nothing
+// to preserve). Called before any overwrite so each loser's pre-resolution save
+// survives. A backup write or read failure is returned (and aborts resolution).
+func (e *Engine) backupLosers(ctx context.Context, gameID string, scoped []scopedNode, winner scopedNode, now time.Time) error {
+	suffix := backupSuffix(now)
+	for _, sn := range scoped {
+		if sn.node.ID == winner.node.ID {
+			continue
+		}
+		meta, present, err := e.statOpt(ctx, sn)
+		if err != nil {
+			return err
+		}
+		if !present {
+			// No current file on this node: nothing to back up. It still RECEIVES
+			// the winner's file during the fan-out below.
+			continue
+		}
+		data, err := sn.r.Read(ctx, sn.path)
+		if err != nil {
+			return fmt.Errorf("engine: read loser %s for backup: %w", sn.node.ID, err)
+		}
+		backupPath := sn.path + suffix
+		// Preserve the loser's existing mtime on its backup (faithful snapshot).
+		if err := sn.r.WriteAtomic(ctx, backupPath, data, meta.Mtime); err != nil {
+			return fmt.Errorf("engine: backup %s: %w", sn.node.ID, err)
+		}
+		bytes := meta.Size
+		if err := e.appendLog(ctx, store.LogEntry{
+			GameID:   gameID,
+			FromNode: sn.node.ID,
+			ToNode:   sn.node.ID,
+			Bytes:    &bytes,
+			SrcMtime: tptr(meta.Mtime),
+			Outcome:  store.OutcomeOK,
+			Message:  "conflict-resolve backup: " + backupPath,
+			TS:       now,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backupSuffix builds the sibling-backup suffix for a conflict resolution at t.
+// The timestamp is filesystem-safe: UTC, the Go reference layout
+// 20060102T150405.000000000Z (basic-ISO-8601 with a Z zone and nanosecond
+// fraction), which contains NO colons, slashes, or spaces — only digits, T, Z,
+// and dots — so it is a legal filename component on every target filesystem and
+// stays a sibling of <path> (no new directory separators).
+//
+// The nanosecond fraction is what makes the suffix collision-resistant: two
+// ResolveConflict calls in the SAME wall-clock second (a double-click, or a
+// quick retry after a partial fan-out) would otherwise compute the IDENTICAL
+// backup path and the second WriteAtomic would clobber the first loser's only
+// preserved snapshot. With sub-second precision, two distinct clock() values
+// yield two distinct backup paths, so the insurance survives.
+func backupSuffix(t time.Time) string {
+	return ".retrosync-conflict-" + t.UTC().Format("20060102T150405.000000000Z")
 }
 
 // syncPass implements the case table shared by Poll and Deactivate's final
