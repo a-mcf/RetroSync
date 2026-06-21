@@ -1,0 +1,27 @@
+{{define "takeover"}}
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Take over session">
+    <div class="modal-head">
+      <h3>Already in use</h3>
+      <button class="modal-close" type="button"
+              aria-label="Close"
+              onclick="document.getElementById('modal').innerHTML='';">&times;</button>
+    </div>
+    <p>This game is currently bound to <strong>{{if .Other}}{{.Other}}{{else}}another node{{end}}</strong>.</p>
+    <form hx-post="/api/games/{{.GameID}}/activate"
+          hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
+          hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <input type="hidden" name="primary_node" value="{{.PrimaryNode}}">
+      <input type="hidden" name="direction" value="{{.Direction}}">
+      <input type="hidden" name="peer_scope" value="{{.PeerScope}}">
+      <input type="hidden" name="force" value="true">
+      <div class="modal-actions">
+        <button class="linkbtn" type="button"
+                onclick="document.getElementById('modal').innerHTML='';">Cancel</button>
+        <button class="btn" type="submit">Take over from {{if .Other}}{{.Other}}{{else}}the other node{{end}}</button>
+      </div>
+    </form>
+  </div>
+</div>
+{{end}}

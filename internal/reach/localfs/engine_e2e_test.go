@@ -68,7 +68,7 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	clock := steppingClock(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), time.Second)
 	eng := engine.New(st, resolve.ResolveReach, clock)
 
-	if err := eng.Activate(ctx, gameID, "primary", "from-primary", "all-configured"); err != nil {
+	if err := eng.Activate(ctx, gameID, "primary", "from-primary", "all-configured", false); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 

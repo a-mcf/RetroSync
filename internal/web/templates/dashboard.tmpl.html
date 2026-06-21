@@ -6,9 +6,22 @@
   <title>RetroSync</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // The activate POST returns 409 with a "take over" fragment when the game is
+    // already bound to a different primary. htmx swaps only 2xx by default; allow
+    // 409 to swap (the handler sends HX-Retarget:#modal so it lands in the modal).
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      if (e.detail.xhr.status === 409) {
+        e.detail.shouldSwap = true;
+        e.detail.isError = false;
+      }
+    });
+  </script>
 </head>
-<body>
-  <div class="wrap">
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <!-- Modal mount: action fragments (activation / takeover) swap in here. -->
+  <div id="modal"></div>
+  <div class="wrap" id="dashboard">
     <header class="top">
       <h1>RetroSync</h1>
       <span class="who">
@@ -40,8 +53,15 @@
           </ul>
           {{end}}
           <div class="sub">Last sync: {{.LastSync}}</div>
-          <!-- TODO(slice-actions): "Sync now" / "Done playing" buttons -->
-          <p><button class="btn" disabled>Done playing</button></p>
+          <!-- TODO(slice-conflict-resolve): per-node "Use <node>" winner buttons
+               and a "Sync now" action; this slice wires only "Done playing". -->
+          <p>
+            <form hx-post="/api/games/{{.GameID}}/deactivate"
+                  hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <button class="btn" type="submit">Done playing</button>
+            </form>
+          </p>
         </div>
         {{end}}
       {{end}}
@@ -56,13 +76,43 @@
         <p class="empty">No games map to your nodes yet.</p>
       {{else}}
         {{range .MyGames}}
+        {{$game := .}}
         <div class="card">
           <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
           <ul class="node-lines">
             {{range .Nodes}}<li>{{.NodeID}}: {{.Mtime}}</li>{{end}}
           </ul>
-          <!-- TODO(slice-actions): "Play on &lt;node&gt;" buttons (largest tap target). -->
-          <p><button class="btn big" disabled>Play</button></p>
+          <!-- One action per OWNED node (largest tap target). A direct activate
+               POST is allowed ONLY for the non-takeover, single-source case (one
+               node has the save and the game is idle). EVERYTHING else — multiple
+               configured sources OR a takeover of a session bound elsewhere —
+               opens the "use my save" activation modal (hx-get), which lists
+               every node's mtime BEFORE binding. A takeover must NEVER be a
+               one-click force POST: the user has to see what each save holds
+               first (docs/state-machine.md "surface, don't hide"). The modal's
+               activate POST 409s when already-bound and returns the takeover
+               fragment that carries force=true, so force still happens — but only
+               after the mtimes were surfaced. -->
+          {{range .Nodes}}
+            {{if .Owned}}
+            <p>
+              {{if or $game.MultiSource .Takeover}}
+                <button class="btn big"
+                        hx-get="/games/{{$game.GameID}}/activate?node={{.NodeID}}"
+                        hx-target="#modal" hx-swap="innerHTML">
+                  {{if .Takeover}}Take over from {{$game.ActivePrimary}} ({{.NodeID}}){{else}}Play on {{.NodeID}}{{end}}
+                </button>
+              {{else}}
+                <button class="btn big"
+                        hx-post="/api/games/{{$game.GameID}}/activate"
+                        hx-vals='{"primary_node": "{{.NodeID}}", "direction": "from-primary"}'
+                        hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
+                  Play on {{.NodeID}}
+                </button>
+              {{end}}
+            </p>
+            {{end}}
+          {{end}}
         </div>
         {{end}}
       {{end}}

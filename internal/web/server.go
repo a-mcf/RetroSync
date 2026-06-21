@@ -4,10 +4,13 @@
 // embedded via embed.FS so the binary is self-contained and runs offline — no
 // runtime CDN (docs/ui.md self-hosted ethos).
 //
-// This slice (slice-6) is READ-ONLY: the dashboard displays state but wires no
-// mutations. Action endpoints (activate/deactivate/resolve-conflict) and the
-// /games and /nodes registry editing UI land in later slices; their hook
-// points are marked with TODO(slice-actions) / TODO(slice-registry).
+// Slice-7 adds the play-sync ACTIONS: the "Play on <node>" / "Done playing"
+// buttons, the activation "use my save" modal, force-takeover, and per-session
+// CSRF protection on every state-changing POST. The web layer drives play-sync
+// only through the narrow Actioner interface (no internal/reach import).
+// Conflict RESOLUTION (the "Use <node>" winner action) and the /games /nodes
+// registry editing UI remain out of scope; their hook points are marked
+// TODO(slice-conflict-resolve) / TODO(slice-registry).
 package web
 
 import (
@@ -35,10 +38,21 @@ type ctxKey int
 
 const userCtxKey ctxKey = iota
 
+// Actioner is the narrow play-sync surface the web layer drives for the action
+// endpoints (activate / deactivate). It is deliberately small and reach-free:
+// the web package must NOT import internal/reach or any persistence driver — it
+// depends only on this interface, which *engine.Engine satisfies. main.go wires
+// the real engine; tests pass a recording stub.
+type Actioner interface {
+	Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string, force bool) error
+	Deactivate(ctx context.Context, gameID string) error
+}
+
 // Server holds the web service's dependencies. Construct with New; build the
 // router with Handler.
 type Server struct {
 	store     store.Store
+	actioner  Actioner
 	sessions  *sessionManager
 	templates *template.Template
 	static    fs.FS
@@ -56,6 +70,10 @@ type Options struct {
 	Now func() time.Time
 	// Logger receives request/error logs; defaults to a discarding logger.
 	Logger *slog.Logger
+	// Actioner drives the play-sync action endpoints (activate/deactivate). May
+	// be nil when only the read-only surface is exercised; the action handlers
+	// guard against a nil Actioner with a 500 rather than panicking.
+	Actioner Actioner
 }
 
 // New builds a Server backed by st. It parses the embedded templates eagerly so
@@ -87,6 +105,7 @@ func New(st store.Store, opts Options) (*Server, error) {
 
 	return &Server{
 		store:     st,
+		actioner:  opts.Actioner,
 		sessions:  newSessionManager(now),
 		templates: tmpl,
 		static:    staticSub,
@@ -126,8 +145,17 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/games", s.requireAuth(http.HandlerFunc(s.handleAPIGames)))
 	mux.Handle("GET /api/nodes", s.requireAuth(http.HandlerFunc(s.handleAPINodes)))
 
-	// TODO(slice-actions): POST /api/games/{id}/activate, .../deactivate,
-	// .../resolve-conflict and their HTML modals.
+	// Action endpoints (slice-7). The activation modal fragment is a GET (no
+	// state change, no CSRF needed). The state-changing POSTs are wrapped in
+	// requireCSRF *inside* requireAuth so an unauthenticated request 303s to
+	// /login (friendly) while an authenticated-but-tokenless request 403s.
+	mux.Handle("GET /games/{id}/activate", s.requireAuth(http.HandlerFunc(s.handleActivateModal)))
+	mux.Handle("POST /api/games/{id}/activate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleActivate))))
+	mux.Handle("POST /api/games/{id}/deactivate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleDeactivate))))
+
+	// TODO(slice-conflict-resolve): POST /api/games/{id}/resolve-conflict and the
+	// "Use <node>" winner modal/buttons (the dashboard already DISPLAYS conflict
+	// state; the resolve action is out of scope this slice).
 	// TODO(slice-registry): GET/POST /games, /nodes registry editing + node
 	// smoke-test.
 

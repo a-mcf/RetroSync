@@ -15,10 +15,11 @@ const sessionCookieName = "retrosync_session"
 // aggressive expiry; a week keeps a Deck logged in across a play week.
 const sessionTTL = 7 * 24 * time.Hour
 
-// session is one logged-in session: which user it authenticates and when it
-// expires.
+// session is one logged-in session: which user it authenticates, its
+// per-session CSRF token, and when it expires.
 type session struct {
 	userID  string
+	csrf    string
 	expires time.Time
 }
 
@@ -55,34 +56,60 @@ func newToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// create mints a new session for userID and returns its token. A fresh token
-// is generated on every call, so logging in always rotates the identifier
-// (defeating session fixation).
+// create mints a new session for userID and returns its token. A fresh session
+// token AND a fresh per-session CSRF token are generated on every call, so
+// logging in always rotates both identifiers (defeating session fixation, and
+// scoping the CSRF token to the live session).
 func (m *sessionManager) create(userID string) (string, error) {
 	tok, err := newToken()
 	if err != nil {
 		return "", err
 	}
+	csrf, err := newToken()
+	if err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sessions[tok] = session{userID: userID, expires: m.now().Add(sessionTTL)}
+	m.sessions[tok] = session{userID: userID, csrf: csrf, expires: m.now().Add(sessionTTL)}
 	return tok, nil
 }
 
 // lookup returns the userID for a valid, unexpired token. ok is false for an
 // unknown or expired token; an expired token is also evicted.
 func (m *sessionManager) lookup(tok string) (userID string, ok bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, found := m.sessions[tok]
+	s, found, valid := m.get(tok)
+	if !valid {
+		return "", false
+	}
+	return s.userID, found
+}
+
+// csrfToken returns the per-session CSRF token for a valid, unexpired session
+// token. ok is false for an unknown or expired token.
+func (m *sessionManager) csrfToken(tok string) (token string, ok bool) {
+	s, found, _ := m.get(tok)
 	if !found {
 		return "", false
 	}
+	return s.csrf, true
+}
+
+// get returns the session for tok. found is false for an unknown/expired token
+// (an expired token is evicted). valid mirrors found and is kept for readability
+// at call sites that only care about validity.
+func (m *sessionManager) get(tok string) (s session, found, valid bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[tok]
+	if !ok {
+		return session{}, false, false
+	}
 	if !m.now().Before(s.expires) {
 		delete(m.sessions, tok)
-		return "", false
+		return session{}, false, false
 	}
-	return s.userID, true
+	return s, true, true
 }
 
 // destroy removes a session token if present (idempotent).
