@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS sync_members;
+DROP TABLE IF EXISTS syncs;

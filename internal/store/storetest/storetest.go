@@ -51,6 +51,13 @@ func Run(t *testing.T, newStore Factory) {
 		{"DeleteBlockedByActiveBinding", testDeleteBlockedByActiveBinding},
 		{"CascadeRuntimeOnGameDelete", testCascadeRuntimeOnGameDelete},
 		{"CascadeManifestOnNodeDelete", testCascadeManifestOnNodeDelete},
+		{"Syncs", testSyncs},
+		{"SyncInvalidReference", testSyncInvalidReference},
+		{"SyncMembers", testSyncMembers},
+		{"SyncMemberUniquePathInvariant", testSyncMemberUniquePathInvariant},
+		{"SyncMemberInvalidReference", testSyncMemberInvalidReference},
+		{"SyncCascades", testSyncCascades},
+		{"SyncMembersByNode", testSyncMembersByNode},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -975,6 +982,279 @@ func testCascadeManifestOnNodeDelete(t *testing.T, s store.Store) {
 	man, _ := s.ListManifestByGame(c, "super-metroid")
 	if len(man) != 0 {
 		t.Fatalf("manifest after node delete = %d, want 0 (cascade)", len(man))
+	}
+}
+
+// ---- syncs / sync_members ----
+
+func testSyncs(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+
+	sy := store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}
+	if err := s.CreateSync(c, sy); err != nil {
+		t.Fatalf("CreateSync: %v", err)
+	}
+	// Duplicate id -> conflict.
+	if err := s.CreateSync(c, sy); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("duplicate CreateSync: want ErrConflict, got %v", err)
+	}
+
+	got, err := s.GetSync(c, "sm-bob")
+	if err != nil {
+		t.Fatalf("GetSync: %v", err)
+	}
+	if got != sy {
+		t.Fatalf("GetSync = %+v, want %+v", got, sy)
+	}
+	if _, err := s.GetSync(c, "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetSync(missing): want ErrNotFound, got %v", err)
+	}
+
+	// A second, independent sync for the SAME game (the multi-sync case).
+	must(t, s.CreateSync(c, store.Sync{ID: "sm-alice", GameID: "super-metroid", Name: "Alice's stream"}))
+	// A sync for a different game must not leak into the listing.
+	mustGame(t, s, "zelda")
+	must(t, s.CreateSync(c, store.Sync{ID: "z-1", GameID: "zelda"}))
+
+	list, err := s.ListSyncsByGame(c, "super-metroid")
+	if err != nil {
+		t.Fatalf("ListSyncsByGame: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListSyncsByGame len = %d, want 2", len(list))
+	}
+	if list[0].ID != "sm-alice" || list[1].ID != "sm-bob" {
+		t.Fatalf("ListSyncsByGame not ordered by id: %+v", list)
+	}
+
+	// Update mutable fields.
+	sy.Name = "Bob renamed"
+	if err := s.UpdateSync(c, sy); err != nil {
+		t.Fatalf("UpdateSync: %v", err)
+	}
+	reread, _ := s.GetSync(c, "sm-bob")
+	if reread.Name != "Bob renamed" {
+		t.Fatalf("UpdateSync not applied: %+v", reread)
+	}
+	// Update missing -> not found.
+	if err := s.UpdateSync(c, store.Sync{ID: "ghost", GameID: "super-metroid"}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("UpdateSync(missing): want ErrNotFound, got %v", err)
+	}
+
+	// Delete; second delete -> not found (not idempotent, like other deletes).
+	if err := s.DeleteSync(c, "sm-bob"); err != nil {
+		t.Fatalf("DeleteSync: %v", err)
+	}
+	if err := s.DeleteSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("DeleteSync(missing): want ErrNotFound, got %v", err)
+	}
+}
+
+func testSyncInvalidReference(t *testing.T, s store.Store) {
+	c := ctx()
+	// CreateSync naming a missing game.
+	if err := s.CreateSync(c, store.Sync{ID: "orphan", GameID: "ghost-game"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("CreateSync(missing game): want ErrInvalidReference, got %v", err)
+	}
+	// UpdateSync re-pointing to a missing game.
+	mustGame(t, s, "super-metroid")
+	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
+	if err := s.UpdateSync(c, store.Sync{ID: "sm", GameID: "ghost-game"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("UpdateSync(missing game): want ErrInvalidReference, got %v", err)
+	}
+}
+
+func testSyncMembers(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "bob-mister", nil)
+	must(t, s.CreateSync(c, store.Sync{ID: "sm-bob", GameID: "super-metroid"}))
+
+	m := store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "retroarch/saves/Super Metroid.srm"}
+	if err := s.SetSyncMember(c, m); err != nil {
+		t.Fatalf("SetSyncMember: %v", err)
+	}
+	got, err := s.GetSyncMember(c, "sm-bob", "bob-deck")
+	if err != nil {
+		t.Fatalf("GetSyncMember: %v", err)
+	}
+	if got != m {
+		t.Fatalf("GetSyncMember = %+v, want %+v", got, m)
+	}
+	if _, err := s.GetSyncMember(c, "sm-bob", "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetSyncMember(missing): want ErrNotFound, got %v", err)
+	}
+
+	// Second member, then list by sync.
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-mister", Path: "SNES/Super Metroid.sav"}))
+	members, err := s.ListSyncMembers(c, "sm-bob")
+	if err != nil {
+		t.Fatalf("ListSyncMembers: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("ListSyncMembers len = %d, want 2", len(members))
+	}
+	if members[0].NodeID != "bob-deck" || members[1].NodeID != "bob-mister" {
+		t.Fatalf("ListSyncMembers not ordered by node_id: %+v", members)
+	}
+
+	// Upsert: re-set the same (sync, node) to a new path in place.
+	m.Path = "retroarch/saves/SM.srm"
+	if err := s.SetSyncMember(c, m); err != nil {
+		t.Fatalf("SetSyncMember(upsert): %v", err)
+	}
+	got, _ = s.GetSyncMember(c, "sm-bob", "bob-deck")
+	if got.Path != "retroarch/saves/SM.srm" {
+		t.Fatalf("upsert path = %q, want retroarch/saves/SM.srm", got.Path)
+	}
+	// Still exactly two members (upsert, not insert).
+	members, _ = s.ListSyncMembers(c, "sm-bob")
+	if len(members) != 2 {
+		t.Fatalf("after upsert len = %d, want 2", len(members))
+	}
+
+	// Delete a member.
+	if err := s.DeleteSyncMember(c, "sm-bob", "bob-deck"); err != nil {
+		t.Fatalf("DeleteSyncMember: %v", err)
+	}
+	if err := s.DeleteSyncMember(c, "sm-bob", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("DeleteSyncMember(missing): want ErrNotFound, got %v", err)
+	}
+}
+
+// testSyncMemberUniquePathInvariant is THE core invariant: a given (node, path)
+// lives in at most one sync. Adding a (node, path) already claimed by a
+// DIFFERENT sync -> ErrConflict; the same node at a DIFFERENT path may join
+// another sync (multi-slot); re-setting the same (sync, node) upserts its path.
+func testSyncMemberUniquePathInvariant(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-a", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-b", GameID: "super-metroid"}))
+
+	// bob-deck's slot-1 file joins sync-a.
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-a", NodeID: "bob-deck", Path: "saves/slot1.srm"}))
+
+	// The SAME (node, path) cannot also join sync-b.
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sync-b", NodeID: "bob-deck", Path: "saves/slot1.srm"}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("cross-sync (node,path) reuse: want ErrConflict, got %v", err)
+	}
+
+	// But the same NODE at a DIFFERENT path may join sync-b (multi-slot).
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sync-b", NodeID: "bob-deck", Path: "saves/slot2.srm"}); err != nil {
+		t.Fatalf("multi-slot (same node, different path): want nil, got %v", err)
+	}
+
+	// Re-setting sync-a's bob-deck member to a NEW path is an in-place upsert
+	// (frees slot1, which no other sync may yet claim).
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sync-a", NodeID: "bob-deck", Path: "saves/slot1b.srm"}); err != nil {
+		t.Fatalf("upsert same (sync,node) to new path: want nil, got %v", err)
+	}
+	got, _ := s.GetSyncMember(c, "sync-a", "bob-deck")
+	if got.Path != "saves/slot1b.srm" {
+		t.Fatalf("upsert path = %q, want saves/slot1b.srm", got.Path)
+	}
+
+	// sync-a still has exactly one member (the upsert did not duplicate).
+	a, _ := s.ListSyncMembers(c, "sync-a")
+	if len(a) != 1 {
+		t.Fatalf("sync-a members = %d, want 1", len(a))
+	}
+}
+
+func testSyncMemberInvalidReference(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
+
+	// Missing sync (node exists).
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "ghost-sync", NodeID: "bob-deck", Path: "p"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetSyncMember(missing sync): want ErrInvalidReference, got %v", err)
+	}
+	// Missing node (sync exists).
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sm", NodeID: "ghost-node", Path: "p"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetSyncMember(missing node): want ErrInvalidReference, got %v", err)
+	}
+}
+
+// testSyncCascades asserts: delete sync -> members gone; delete the parent game
+// -> syncs + members gone; delete a node -> its sync_member rows gone.
+func testSyncCascades(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "bob-mister", nil)
+
+	// Delete sync -> its members cascade.
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-del", GameID: "super-metroid"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-del", NodeID: "bob-deck", Path: "a"}))
+	must(t, s.DeleteSync(c, "sync-del"))
+	if mem, _ := s.ListSyncMembers(c, "sync-del"); len(mem) != 0 {
+		t.Fatalf("members after DeleteSync = %d, want 0 (cascade)", len(mem))
+	}
+	// The freed (node, path) may now be reused by a fresh sync.
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-reuse", GameID: "super-metroid"}))
+	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sync-reuse", NodeID: "bob-deck", Path: "a"}); err != nil {
+		t.Fatalf("reuse freed (node,path) after cascade: want nil, got %v", err)
+	}
+
+	// Delete the parent game -> its syncs AND members cascade.
+	mustGame(t, s, "zelda")
+	must(t, s.CreateSync(c, store.Sync{ID: "z-sync", GameID: "zelda"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "z-sync", NodeID: "bob-mister", Path: "z"}))
+	must(t, s.DeleteGame(c, "zelda"))
+	if syncs, _ := s.ListSyncsByGame(c, "zelda"); len(syncs) != 0 {
+		t.Fatalf("syncs after DeleteGame = %d, want 0 (cascade)", len(syncs))
+	}
+	if _, err := s.GetSync(c, "z-sync"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sync after DeleteGame: want ErrNotFound, got %v", err)
+	}
+	if mem, _ := s.ListSyncMembersByNode(c, "bob-mister"); len(mem) != 0 {
+		t.Fatalf("members after DeleteGame cascade = %d, want 0", len(mem))
+	}
+
+	// Delete a node -> its sync_member rows cascade (sync itself survives).
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-reuse", NodeID: "bob-deck", Path: "a"}))
+	must(t, s.DeleteNode(c, "bob-deck"))
+	if mem, _ := s.ListSyncMembersByNode(c, "bob-deck"); len(mem) != 0 {
+		t.Fatalf("members after DeleteNode = %d, want 0 (cascade)", len(mem))
+	}
+	if _, err := s.GetSync(c, "sync-reuse"); err != nil {
+		t.Fatalf("sync should survive node delete: %v", err)
+	}
+}
+
+func testSyncMembersByNode(t *testing.T, s store.Store) {
+	c := ctx()
+	mustGame(t, s, "super-metroid")
+	mustGame(t, s, "zelda")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "z", GameID: "zelda"}))
+
+	// One node, two different files, in two different syncs (multi-slot).
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm", NodeID: "bob-deck", Path: "sm.srm"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "z", NodeID: "bob-deck", Path: "z.srm"}))
+
+	byNode, err := s.ListSyncMembersByNode(c, "bob-deck")
+	if err != nil {
+		t.Fatalf("ListSyncMembersByNode: %v", err)
+	}
+	if len(byNode) != 2 {
+		t.Fatalf("ListSyncMembersByNode len = %d, want 2", len(byNode))
+	}
+	if byNode[0].SyncID != "sm" || byNode[1].SyncID != "z" {
+		t.Fatalf("ListSyncMembersByNode not ordered by sync_id: %+v", byNode)
+	}
+	// A node with no members returns empty, not error.
+	mustNode(t, s, "lonely", nil)
+	empty, _ := s.ListSyncMembersByNode(c, "lonely")
+	if len(empty) != 0 {
+		t.Fatalf("ListSyncMembersByNode(lonely) = %d, want 0", len(empty))
 	}
 }
 

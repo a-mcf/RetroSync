@@ -225,6 +225,29 @@ type ManifestEntry struct {
 	LastChecked *time.Time
 }
 
+// Sync is a mirror group: a specific set of (node, save-file) members that sync
+// together. It belongs to one game, but a game may have MANY independent syncs
+// (e.g. two unrelated streams of the same title) so long as they do not share a
+// (node, path) member — see SyncMember and docs/data-model.md.
+type Sync struct {
+	ID     string
+	GameID string
+	// Name is a free-form label; defaults to "".
+	Name string
+}
+
+// SyncMember is one (node, file) member of a Sync. The store enforces two
+// uniqueness rules: PK (SyncID, NodeID) — a node appears at most once per sync —
+// and a global UNIQUE (NodeID, Path): a given (device, file) lives in at most
+// one sync. The second is the core invariant of the sync data model; it permits
+// multi-slot (same node, different path -> different sync) while forbidding the
+// same file from being claimed by two syncs.
+type SyncMember struct {
+	SyncID string
+	NodeID string
+	Path   string
+}
+
 // GameFilter narrows Games.List. The zero value matches everything.
 type GameFilter struct {
 	// Q is an optional case-insensitive substring matched against id and
@@ -302,4 +325,33 @@ type Store interface {
 	SetManifest(ctx context.Context, m ManifestEntry) error // upsert on (game_id, node_id)
 	GetManifest(ctx context.Context, gameID, nodeID string) (ManifestEntry, error)
 	ListManifestByGame(ctx context.Context, gameID string) ([]ManifestEntry, error)
+
+	// Syncs and SyncMembers — the additive foundation of the sync data-model
+	// redesign. These tables sit ALONGSIDE the game-based tables above; nothing
+	// here re-points the engine, runtime tables, or web yet.
+	//
+	// TODO(slice-sync-cutover): the engine, runtime tables (active_bindings,
+	// manifest, sync_log), and web all key off game_id today. Later slices move
+	// them onto sync_id, using Sync/SyncMember as the unit of mirroring.
+
+	// CreateSync inserts a sync. Duplicate id -> ErrConflict; missing game ->
+	// ErrInvalidReference.
+	CreateSync(ctx context.Context, sy Sync) error
+	GetSync(ctx context.Context, id string) (Sync, error)
+	ListSyncsByGame(ctx context.Context, gameID string) ([]Sync, error)
+	// UpdateSync rewrites the mutable fields (game_id, name) of an existing sync.
+	// Missing -> ErrNotFound; missing game -> ErrInvalidReference.
+	UpdateSync(ctx context.Context, sy Sync) error
+	// DeleteSync removes a sync; missing -> ErrNotFound. Its members cascade.
+	DeleteSync(ctx context.Context, id string) error
+
+	// SetSyncMember upserts on (sync_id, node_id). Missing sync/node ->
+	// ErrInvalidReference. A (node_id, path) already claimed by a DIFFERENT sync
+	// -> ErrConflict (the global UNIQUE (node_id, path) invariant). Re-setting an
+	// existing (sync_id, node_id) to a new path is an in-place update.
+	SetSyncMember(ctx context.Context, m SyncMember) error
+	GetSyncMember(ctx context.Context, syncID, nodeID string) (SyncMember, error)
+	ListSyncMembers(ctx context.Context, syncID string) ([]SyncMember, error)
+	ListSyncMembersByNode(ctx context.Context, nodeID string) ([]SyncMember, error)
+	DeleteSyncMember(ctx context.Context, syncID, nodeID string) error
 }

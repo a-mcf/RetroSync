@@ -564,3 +564,140 @@ func scanManifest(r rowScanner) (store.ManifestEntry, error) {
 	}
 	return m, nil
 }
+
+// ---- Syncs ----
+//
+// TODO(slice-sync-cutover): syncs/sync_members are the additive foundation of
+// the data-model redesign. The engine, runtime tables, and web still key off
+// game_id; later slices move them onto sync_id.
+
+func (s *Store) CreateSync(ctx context.Context, sy store.Sync) error {
+	// A missing game (FK) -> 23503 -> ErrInvalidReference; a duplicate id (PK) ->
+	// 23505 -> ErrConflict. Both are handled by mapErr.
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO syncs (id, game_id, name) VALUES ($1, $2, $3)`,
+		sy.ID, sy.GameID, sy.Name)
+	return mapErr(err)
+}
+
+func (s *Store) GetSync(ctx context.Context, id string) (store.Sync, error) {
+	var sy store.Sync
+	err := s.db.QueryRow(ctx,
+		`SELECT id, game_id, name FROM syncs WHERE id = $1`, id,
+	).Scan(&sy.ID, &sy.GameID, &sy.Name)
+	if err != nil {
+		return store.Sync{}, mapErr(err)
+	}
+	return sy, nil
+}
+
+func (s *Store) ListSyncsByGame(ctx context.Context, gameID string) ([]store.Sync, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT id, game_id, name FROM syncs WHERE game_id = $1 ORDER BY id`, gameID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.Sync, 0)
+	for rows.Next() {
+		var sy store.Sync
+		if err := rows.Scan(&sy.ID, &sy.GameID, &sy.Name); err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, sy)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func (s *Store) UpdateSync(ctx context.Context, sy store.Sync) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE syncs SET game_id = $2, name = $3 WHERE id = $1`,
+		sy.ID, sy.GameID, sy.Name)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteSync(ctx context.Context, id string) error {
+	// sync_members.sync_id cascades, so members are removed by the DB.
+	tag, err := s.db.Exec(ctx, `DELETE FROM syncs WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+// ---- SyncMembers ----
+
+func (s *Store) SetSyncMember(ctx context.Context, m store.SyncMember) error {
+	// Upsert on the PK (sync_id, node_id). A missing sync/node (FK) -> 23503 ->
+	// ErrInvalidReference. A (node_id, path) already claimed by a DIFFERENT sync
+	// violates the UNIQUE (node_id, path) -> 23505 -> ErrConflict; the ON CONFLICT
+	// clause only resolves PK collisions, so the cross-sync unique violation
+	// surfaces as the conflict we want.
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO sync_members (sync_id, node_id, path) VALUES ($1, $2, $3)
+		 ON CONFLICT (sync_id, node_id) DO UPDATE SET path = EXCLUDED.path`,
+		m.SyncID, m.NodeID, m.Path)
+	return mapErr(err)
+}
+
+func (s *Store) GetSyncMember(ctx context.Context, syncID, nodeID string) (store.SyncMember, error) {
+	var m store.SyncMember
+	err := s.db.QueryRow(ctx,
+		`SELECT sync_id, node_id, path FROM sync_members WHERE sync_id = $1 AND node_id = $2`,
+		syncID, nodeID,
+	).Scan(&m.SyncID, &m.NodeID, &m.Path)
+	if err != nil {
+		return store.SyncMember{}, mapErr(err)
+	}
+	return m, nil
+}
+
+func (s *Store) ListSyncMembers(ctx context.Context, syncID string) ([]store.SyncMember, error) {
+	return s.listSyncMembers(ctx,
+		`SELECT sync_id, node_id, path FROM sync_members WHERE sync_id = $1 ORDER BY node_id`,
+		syncID)
+}
+
+func (s *Store) ListSyncMembersByNode(ctx context.Context, nodeID string) ([]store.SyncMember, error) {
+	return s.listSyncMembers(ctx,
+		`SELECT sync_id, node_id, path FROM sync_members WHERE node_id = $1 ORDER BY sync_id`,
+		nodeID)
+}
+
+func (s *Store) listSyncMembers(ctx context.Context, sql, arg string) ([]store.SyncMember, error) {
+	rows, err := s.db.Query(ctx, sql, arg)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.SyncMember, 0)
+	for rows.Next() {
+		var m store.SyncMember
+		if err := rows.Scan(&m.SyncID, &m.NodeID, &m.Path); err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, m)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func (s *Store) DeleteSyncMember(ctx context.Context, syncID, nodeID string) error {
+	tag, err := s.db.Exec(ctx,
+		`DELETE FROM sync_members WHERE sync_id = $1 AND node_id = $2`, syncID, nodeID)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
