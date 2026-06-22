@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/a-mcf/retrosync/internal/store"
 )
@@ -49,15 +50,14 @@ func syncIDs(t *testing.T, f *actionFixture) string {
 	return strings.Join(out, ",")
 }
 
-// seedBinding makes the sync sm-bob (of game super-metroid) active with the
-// given primary node — so the registry delete/remove guards have an active sync
-// to refuse against.
-func seedBinding(t *testing.T, f *actionFixture, primary string) {
+// seedConflict marks the sync sm-bob (of game super-metroid) as conflicted, so
+// the registry delete guards (delete-game / delete-sync) have a conflicted sync
+// to refuse against. Under auto-mirror that is the only registry guard left.
+func seedConflict(t *testing.T, f *actionFixture) {
 	t.Helper()
-	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: primary, Direction: "from-primary",
-	}); err != nil {
-		t.Fatalf("create binding: %v", err)
+	conflict := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	if err := f.store.SetSyncConflict(context.Background(), "sm-bob", &conflict); err != nil {
+		t.Fatalf("seed conflict: %v", err)
 	}
 }
 
@@ -239,20 +239,20 @@ func TestDeleteGame_HappyPath(t *testing.T) {
 	}
 }
 
-func TestDeleteGame_Active_Friendly409(t *testing.T) {
+func TestDeleteGame_Conflicted_Friendly409(t *testing.T) {
 	f := newActionFixture(t)
-	seedBinding(t, f, "bob-deck")
+	seedConflict(t, f)
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/delete", nil)
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("active delete status = %d, want 409 (not 500)", rec.Code)
+		t.Fatalf("conflicted delete status = %d, want 409 (not 500)", rec.Code)
 	}
-	if !strings.Contains(strings.ToLower(rec.Body.String()), "played right now") {
-		t.Errorf("expected a friendly 'played right now' message, got: %s", rec.Body.String())
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "conflict") {
+		t.Errorf("expected a friendly 'conflict' message, got: %s", rec.Body.String())
 	}
 	if !gameIDs(t, f)["super-metroid"] {
-		t.Error("game deleted despite being active")
+		t.Error("game deleted despite a conflicted sync")
 	}
 }
 
@@ -380,20 +380,20 @@ func TestDeleteSync_HappyPath(t *testing.T) {
 	}
 }
 
-func TestDeleteSync_Active_Friendly409(t *testing.T) {
+func TestDeleteSync_Conflicted_Friendly409(t *testing.T) {
 	f := newActionFixture(t)
-	seedBinding(t, f, "bob-deck") // sm-bob is now active
+	seedConflict(t, f) // sm-bob is now conflicted
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/delete", nil)
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("active delete status = %d, want 409 (not 500)", rec.Code)
+		t.Fatalf("conflicted delete status = %d, want 409 (not 500)", rec.Code)
 	}
-	if !strings.Contains(strings.ToLower(rec.Body.String()), "played right now") {
-		t.Errorf("expected a friendly 'played right now' message, got: %s", rec.Body.String())
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "conflict") {
+		t.Errorf("expected a friendly 'conflict' message, got: %s", rec.Body.String())
 	}
 	if _, err := f.store.GetSync(context.Background(), "sm-bob"); err != nil {
-		t.Error("active sync deleted despite guard")
+		t.Error("conflicted sync deleted despite guard")
 	}
 }
 
@@ -492,34 +492,20 @@ func TestDeleteSyncMember_HappyPath(t *testing.T) {
 	}
 }
 
-func TestDeleteSyncMember_ActivePrimary_Friendly409(t *testing.T) {
+// TestDeleteSyncMember_AnyMemberRemovable: under auto-mirror there is no "active
+// primary" to protect. Any member is removable — even from a conflicted sync —
+// and a removed member's file simply stops mirroring.
+func TestDeleteSyncMember_AnyMemberRemovable(t *testing.T) {
 	f := newActionFixture(t)
-	seedBinding(t, f, "bob-deck") // bob-deck is the active primary of sm-bob
+	seedConflict(t, f) // even conflicted, the guard no longer blocks removal
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/members/bob-deck/delete", nil)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("active-primary remove status = %d, want 409", rec.Code)
-	}
-	if !strings.Contains(strings.ToLower(rec.Body.String()), "active primary") {
-		t.Errorf("expected a friendly 'active primary' message, got: %s", rec.Body.String())
-	}
-	if _, err := f.store.GetSyncMember(context.Background(), "sm-bob", "bob-deck"); err != nil {
-		t.Errorf("active-primary member was removed despite guard: %v", err)
-	}
-}
-
-func TestDeleteSyncMember_NonPrimaryWhileActive_OK(t *testing.T) {
-	f := newActionFixture(t)
-	seedBinding(t, f, "bob-deck") // bob-deck primary; carol-deck is a peer
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/members/carol-deck/delete", nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("non-primary remove status = %d, want 200\n%s", rec.Code, rec.Body.String())
+		t.Fatalf("member remove status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
-	if _, err := f.store.GetSyncMember(context.Background(), "sm-bob", "carol-deck"); err != store.ErrNotFound {
-		t.Errorf("non-primary member not removed: %v", err)
+	if _, err := f.store.GetSyncMember(context.Background(), "sm-bob", "bob-deck"); err != store.ErrNotFound {
+		t.Errorf("member not removed: %v", err)
 	}
 }
 

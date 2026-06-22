@@ -1,103 +1,113 @@
 # State machine
 
-## Per-game states
+> **Auto-mirror (slice 18).** The explicit primary/binding/take-over model is
+> retired. Every sync **auto-mirrors**: there is no "activate", no "play session",
+> no primary node, and no "done playing". The daemon watches **every** sync and
+> propagates the lone changed member's save to the others. The only human action
+> is **resolving a conflict**.
+
+## Per-sync states
 
 ```
-   ┌──────────┐    bind(primary, direction)  ┌──────────┐
-   │ idle     │ ───────────────────────────▶ │ active   │
-   │ (backup  │                              │ (play    │
-   │  only)   │ ◀──────────────────────────── │  sync)   │
-   └──────────┘   unbind()                   └──────────┘
-                                                   │
-                                                   │ poll loop sees
-                                                   │ a non-primary
-                                                   │ node mutate
-                                                   ▼
-                                              ┌──────────┐
-                                              │ conflict │
-                                              │ (paused, │
-                                              │  await   │
-                                              │  human)  │
-                                              └──────────┘
+   ┌──────────────┐   one member changes   ┌──────────────┐
+   │  in sync     │ ─────────────────────▶ │  mirroring   │
+   │ (0 changed,  │   (the engine fans it   │  (propagate, │
+   │   noop)      │ ◀──────────────────────  │  then back   │
+   └──────────────┘   manifest updated      │  to in sync) │
+         │                                  └──────────────┘
+         │ two or more members
+         │ change between polls
+         ▼
+   ┌──────────────┐
+   │  conflict    │   resolve(winner)   ┌──────────────┐
+   │ (paused,     │ ──────────────────▶ │  in sync     │
+   │  await       │                     │  (winner     │
+   │  human)      │                     │  fanned out) │
+   └──────────────┘                     └──────────────┘
 ```
 
-A game with no row in `active_bindings` is **idle**. A row makes it **active**. Conflict is a flag on the active row, not a separate row.
+A sync with `conflict_at IS NULL` is mirroring normally; a non-null `conflict_at`
+pauses it. There is no separate "idle" state — every sync mirrors all the time.
 
-## Activation flow
+## The auto-mirror loop
 
-User opens the UI, finds *Super Metroid*, clicks "Play on my Deck."
+> **Implemented.** The engine's `Poll(syncID)` (the changed-set table below) is
+> driven by the `internal/daemon` ticker, which sweeps **every** sync every N
+> seconds (`store.ListSyncs`) and isolates per-sync errors. A conflicted sync is
+> skipped (paused) until resolved.
 
-1. Server checks `active_bindings.game_id`. If a row exists with a *different* primary → return 409, show "Currently bound to alice-deck since 14:02. Force takeover?" Force = delete the existing row, create new.
-2. Server stats every member node of the sync (each `sync_members` row).
-3. None of them have the file → bail; user needs to create one first.
-4. Only one node has the file → log it; auto-pick that as the source for the first sync pass; no prompt.
-5. Multiple nodes have the file → prompt "Which save do you want to start from?" Default: **the node you're binding from** ("Use my save"), since the human just sat down with that device and knows what's on it.
-6. Server creates `active_bindings` row, kicks off an immediate fan-out copy from the chosen source to all other peers in scope.
+For each sync, every N seconds (default 15s):
 
-The "use my save" default is the most important decision in this flow. SGM-Helper's silent "newer mtime wins" is exactly what eats people's saves when a peer's clock is wrong (MiSTer has no RTC; Anbernics often drift).
+1. If the sync's `conflict_at` is set → **skip** (paused, awaiting human).
+2. Otherwise stat every member. Compare each against the `manifest` to compute
+   the **changed set** (members whose current stat differs from their manifest,
+   via `changed()` / the microsecond `mtimeEqual` compare).
+3. Apply the changed-set table:
 
-## Active poll loop
+   | members changed | action                                                        |
+   |-----------------|---------------------------------------------------------------|
+   | 0               | noop                                                          |
+   | exactly 1       | that member is the source → fan it out to the others; update their manifest + the sync's `last_synced` |
+   | 2 or more       | genuine fork → set `conflict_at`, log a conflict, **stop** mirroring this sync until resolved |
 
-> **Implemented.** The engine's `Poll` (the case table below) is driven by the
-> `internal/daemon` ticker, which sweeps every active binding every N seconds and
-> isolates per-game errors. A conflicted binding is skipped (paused) until resolved.
+4. After a successful fan-out, update `manifest` for the source and every written
+   member to the new mtime/size. Log to `sync_log`.
 
-For each active binding, every N seconds (default 15s):
+There is **no primary**. Any single changed member is the source; everyone else
+receives it. A sync with fewer than two members can never fork — it just
+propagates (1 changed) or no-ops (0 changed).
 
-1. Stat every node in scope (primary + peers). Compare against `manifest`.
-2. Cases:
+Two edge cases inside the "exactly 1 changed" branch:
 
-   | primary changed | any peer changed | action                                            |
-   |-----------------|------------------|---------------------------------------------------|
-   | no              | no               | noop                                              |
-   | yes             | no               | fan-out: primary → all peers                      |
-   | no              | one peer         | promote? no — **conflict** (peer wrote out-of-band) |
-   | yes             | yes              | **conflict**                                      |
+- If the lone changed member is now **absent** (the manifest had a file but it
+  vanished), the engine treats it as a **conflict** rather than propagating the
+  deletion to the others. Surfacing beats destruction.
+- A write failure during the fan-out aborts the pass **without** advancing the
+  failed member's manifest (the manifest trails the write), so the next poll
+  re-detects the divergence and retries (self-heal).
 
-3. After a successful fan-out, update `manifest` for primary and all written peers to the new mtime/size. Log to `sync_log`.
-
-The "peer wrote out-of-band" case is the family-sync gotcha: while Bob is bound to the MiSTer for *Super Metroid*, Alice should not also be playing it on her Deck. If she does and her save is in the peer scope, that's a conflict and we pause rather than letting Bob's later save quietly overwrite hers.
+The "2+ changed = conflict" case is the family-sync gotcha: if Bob writes *Super
+Metroid* on the MiSTer and Alice also writes it on her Deck between two polls,
+retrosync will **not** silently let one overwrite the other — it pauses and asks.
 
 ## Conflict handling
 
-When a non-primary peer mutates during an active session, or both primary and peer mutate between polls:
+When two or more members mutate between polls:
 
-- Set `conflict_at` on the active binding.
-- Stop syncing this game until the user resolves it.
-- UI shows every node's current state (mtime, size) and a "use this one" button per node.
-- "Use this one" copies that node's file to all others in scope and clears the conflict.
-- Before any overwrite, write the loser's existing file to `<path>.retrosync-conflict-<ts>` on the same node (cheap insurance — see open-questions.md).
+- Set `conflict_at` on the **sync**.
+- Stop mirroring this sync until the user resolves it (subsequent polls skip it).
+- UI shows every member's current live state (mtime, size) and a "use this one"
+  button per member that holds a file.
+- "Use this one" copies that member's file to all others and clears the conflict.
+- Before any overwrite, write each loser's existing file to
+  `<path>.retrosync-conflict-<ts>` on the same node (cheap insurance).
 
 There is intentionally no auto-merge. Save files don't merge.
 
-> **Implemented** (`engine.ResolveConflict`, owner/admin-gated + CSRF-protected
-> `POST /api/games/{id}/resolve-conflict`). The `<ts>` is a UTC, filesystem-safe,
-> **nanosecond-precision** stamp (`20060102T150405.000000000Z`), so two resolves in
-> the same second can't collide. Every loser-with-a-file is backed up *before* any
-> overwrite; the conflict flag clears only after the full fan-out succeeds, so a
-> partial failure leaves the game re-resolvable.
-
-## Deactivation
-
-User clicks "Done playing." Server:
-
-1. Runs one final sync pass (primary → peers; cannot conflict because we just synced moments ago — but if it does, leave the binding active and surface the conflict).
-2. Deletes `active_bindings` row.
-3. Game returns to idle (backup-only).
+> **Implemented** (`engine.ResolveConflict`, owner-of-a-member-node-or-admin-gated
+> + CSRF-protected `POST /api/syncs/{id}/resolve-conflict`). The `<ts>` is a UTC,
+> filesystem-safe, **nanosecond-precision** stamp
+> (`20060102T150405.000000000Z`), so two resolves in the same second can't
+> collide. Every loser-with-a-file is backed up *before* any overwrite; the
+> sync is marked synced and the conflict flag cleared only after the full fan-out
+> succeeds, so a partial failure leaves the sync re-resolvable.
 
 ## Crash safety
 
-- Poll loop is idempotent. Restart at any time; it re-stats and resumes.
-- A crash mid-copy can leave a partial file. Always copy to `<dest>.retrosync-tmp` and rename atomically.
-- `manifest` is only updated *after* the rename. So a crash mid-copy leaves the manifest pointing at the previous good state, and the next poll will re-detect divergence and retry.
+- The poll loop is idempotent. Restart at any time; it re-stats and resumes.
+- A crash mid-copy can leave a partial file. Always copy to
+  `<dest>.retrosync-tmp` and rename atomically.
+- `manifest` is only updated *after* the rename. So a crash mid-copy leaves the
+  manifest pointing at the previous good state, and the next poll re-detects
+  divergence and retries.
+- On resolve, `last_synced` is marked **before** `conflict_at` is cleared, so a
+  crash between the two leaves the sync conflicted (re-resolvable) rather than
+  un-paused-but-unsynced.
 
-## Stale-peer visibility
+## Member-state visibility
 
-Between sessions, the saves on each node are whatever the last bound primary wrote. If Bob plays Tuesday on the MiSTer and unbinds, Wednesday Alice opens the UI to play *Super Metroid* on her Deck and sees:
-
-- Game: Super Metroid
-- living-room-mister: 18h ago (Bob's session)
-- bob-deck: 18h ago (matches MiSTer; was a peer in Bob's session)
-- alice-deck: 4d ago (not a peer in Bob's session)
-
-The UI shows every mtime *before* binding so Alice knows that activating "from my Deck" will overwrite the most recent state. This is by design — surface, don't hide.
+The dashboard "My syncs" section is a **status view**: for each sync the user has
+a member node in, it shows every member with its last-known manifest mtime, and
+the sync's state — "in sync, last synced N ago", or a red **conflict** banner
+with a **Resolve** button when `conflict_at` is set. There are no Play buttons.
+This surfaces what each device holds without hiding it.

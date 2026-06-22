@@ -37,9 +37,9 @@ type conflictNode struct {
 
 // handleConflictModal serves GET /syncs/{id}/conflict as an HTML modal
 // fragment. It is intentionally read-only and NOT owner-gated: any authenticated
-// user may VIEW a conflict (consistent with "can see others' sessions",
-// docs/ui.md / brief D). The destructive resolve POST it submits to re-checks
-// owner-or-admin AND CSRF.
+// user may VIEW a conflict (consistent with "can see others' syncs",
+// docs/ui.md). The destructive resolve POST it submits to re-checks
+// owner-of-a-member-node-or-admin AND CSRF.
 func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 	if s.actioner == nil {
 		s.logger.ErrorContext(r.Context(), "conflict modal: no actioner wired")
@@ -102,11 +102,11 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 // field: winner_node_id.
 //
 // This is the single most destructive action in the system (it overwrites every
-// peer's save with the winner's). Authorization (auditor-mandated, same rule as
-// deactivate): only the OWNER of the binding's primary node — or an admin — may
-// pick a winner. The check happens BEFORE the Actioner is called, so a
-// non-owning user never reaches the engine. CSRF is enforced by the requireCSRF
-// wrapper around this handler.
+// other member's save with the winner's). Authorization (auditor-mandated):
+// under auto-mirror there is no primary, so authority is owning at least one of
+// the sync's MEMBER nodes — or being an admin. The check happens BEFORE the
+// Actioner is called, so a non-authorized user never reaches the engine. CSRF is
+// enforced by the requireCSRF wrapper around this handler.
 //
 // Engine error mapping:
 //   - ErrNotConflicted     -> 409 + dashboard refresh (someone else already
@@ -133,31 +133,27 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
 	winner := strings.TrimSpace(r.PostFormValue("winner_node_id"))
 
 	// Authorization FIRST, before any validation that could reach the engine. The
-	// resolve action requires that the user own the binding's primary node (or be
-	// admin) — the same rule as deactivate, because this is the most destructive
-	// action and a wrong user must not pick a winner. A non-conflicted/idle sync
-	// is still owner-gated here: there is nothing to resolve, but a stranger
-	// shouldn't be probing the action either.
-	b, err := s.store.GetBinding(r.Context(), syncID)
-	if err != nil {
+	// resolve action requires that the user own at least one of the sync's member
+	// nodes (or be admin), because this is the most destructive action and a wrong
+	// user must not pick a winner. A non-existent sync is treated as
+	// already-resolved (409) rather than leaking whether it exists.
+	if _, err := s.store.GetSync(r.Context(), syncID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// No binding: nothing to resolve. Treat as already-resolved (409) and
-			// refresh, rather than leaking whether the sync exists.
-			http.Error(w, "no active session to resolve", http.StatusConflict)
+			http.Error(w, "no such sync to resolve", http.StatusConflict)
 			return
 		}
-		s.logger.ErrorContext(r.Context(), "resolve-conflict: get binding failed", "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "resolve-conflict: get sync failed", "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	owns, err := s.userOwnsNode(r.Context(), u, b.PrimaryNode)
+	owns, err := s.userOwnsAnyMember(r.Context(), u, syncID)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "resolve-conflict: ownership check failed", "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if !owns {
-		http.Error(w, "forbidden: you do not own that session's node", http.StatusForbidden)
+		http.Error(w, "forbidden: you do not own a node in this sync", http.StatusForbidden)
 		return
 	}
 

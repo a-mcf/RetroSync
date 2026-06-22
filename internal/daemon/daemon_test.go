@@ -13,18 +13,18 @@ import (
 
 // --- stubs ---------------------------------------------------------------
 
-// stubLister returns a fixed set of bindings, or an error.
+// stubLister returns a fixed set of syncs, or an error.
 type stubLister struct {
-	bindings []store.ActiveBinding
-	err      error
+	syncs []store.Sync
+	err   error
 }
 
-func (s stubLister) ListBindings(context.Context) ([]store.ActiveBinding, error) {
-	return s.bindings, s.err
+func (s stubLister) ListSyncs(context.Context) ([]store.Sync, error) {
+	return s.syncs, s.err
 }
 
-// stubPoller records which game ids were polled and can be told to fail for a
-// specific game. Safe for concurrent use, though the daemon polls serially.
+// stubPoller records which sync ids were polled and can be told to fail for a
+// specific sync. Safe for concurrent use, though the daemon polls serially.
 type stubPoller struct {
 	mu      sync.Mutex
 	polled  []string
@@ -35,11 +35,11 @@ func newStubPoller() *stubPoller {
 	return &stubPoller{failFor: map[string]error{}}
 }
 
-func (p *stubPoller) Poll(_ context.Context, gameID string) error {
+func (p *stubPoller) Poll(_ context.Context, syncID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.polled = append(p.polled, gameID)
-	return p.failFor[gameID]
+	p.polled = append(p.polled, syncID)
+	return p.failFor[syncID]
 }
 
 func (p *stubPoller) calls() []string {
@@ -50,21 +50,21 @@ func (p *stubPoller) calls() []string {
 	return out
 }
 
-// panicPoller panics for one specific game id and records every game it was
+// panicPoller panics for one specific sync id and records every sync it was
 // asked to poll. It models a Poller that blows up (nil map, slice bounds, an
-// SSH-lib panic) for one game, so we can assert the sweep survives it.
+// SSH-lib panic) for one sync, so we can assert the sweep survives it.
 type panicPoller struct {
 	mu       sync.Mutex
 	polled   []string
 	panicFor string
 }
 
-func (p *panicPoller) Poll(_ context.Context, gameID string) error {
+func (p *panicPoller) Poll(_ context.Context, syncID string) error {
 	p.mu.Lock()
-	p.polled = append(p.polled, gameID)
+	p.polled = append(p.polled, syncID)
 	p.mu.Unlock()
-	if gameID == p.panicFor {
-		panic("kaboom from " + gameID)
+	if syncID == p.panicFor {
+		panic("kaboom from " + syncID)
 	}
 	return nil
 }
@@ -77,9 +77,9 @@ func (p *panicPoller) calls() []string {
 	return out
 }
 
-// blockingPoller blocks until its ctx is cancelled for one specific game id
-// (modeling a hung node), recording the resulting ctx error for that game, and
-// polls every other game normally. Deterministic: it blocks on ctx.Done, not a
+// blockingPoller blocks until its ctx is cancelled for one specific sync id
+// (modeling a hung node), recording the resulting ctx error for that sync, and
+// polls every other sync normally. Deterministic: it blocks on ctx.Done, not a
 // fixed sleep, so the per-poll timeout is what releases it.
 type blockingPoller struct {
 	mu       sync.Mutex
@@ -88,11 +88,11 @@ type blockingPoller struct {
 	blockErr error
 }
 
-func (p *blockingPoller) Poll(ctx context.Context, gameID string) error {
+func (p *blockingPoller) Poll(ctx context.Context, syncID string) error {
 	p.mu.Lock()
-	p.polled = append(p.polled, gameID)
+	p.polled = append(p.polled, syncID)
 	p.mu.Unlock()
-	if gameID == p.blockFor {
+	if syncID == p.blockFor {
 		<-ctx.Done()
 		p.mu.Lock()
 		p.blockErr = ctx.Err()
@@ -110,18 +110,18 @@ func (p *blockingPoller) calls() []string {
 	return out
 }
 
-func bindings(ids ...string) []store.ActiveBinding {
-	out := make([]store.ActiveBinding, len(ids))
+func syncs(ids ...string) []store.Sync {
+	out := make([]store.Sync, len(ids))
 	for i, id := range ids {
-		out[i] = store.ActiveBinding{SyncID: id, PrimaryNode: "n1"}
+		out[i] = store.Sync{ID: id, GameID: "g1"}
 	}
 	return out
 }
 
 // --- RunOnce -------------------------------------------------------------
 
-func TestRunOncePollsEveryBindingOnce(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b", "c")}
+func TestRunOncePollsEverySyncOnce(t *testing.T) {
+	lister := stubLister{syncs: syncs("a", "b", "c")}
 	poller := newStubPoller()
 	d := daemon.New(lister, poller, time.Second, 0, nil)
 
@@ -144,30 +144,30 @@ func TestRunOncePollsEveryBindingOnce(t *testing.T) {
 	}
 }
 
-func TestRunOnceIsolatesPerGameError(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b", "c")}
+func TestRunOnceIsolatesPerSyncError(t *testing.T) {
+	lister := stubLister{syncs: syncs("a", "b", "c")}
 	poller := newStubPoller()
 	poller.failFor["b"] = errors.New("boom")
 	d := daemon.New(lister, poller, time.Second, 0, nil)
 
 	res, err := d.RunOnce(context.Background())
 	if err != nil {
-		t.Fatalf("RunOnce returned error %v; per-game errors must be isolated", err)
+		t.Fatalf("RunOnce returned error %v; per-sync errors must be isolated", err)
 	}
 	if res.Polled != 3 {
-		t.Fatalf("Polled = %d, want 3 (all games attempted despite b failing)", res.Polled)
+		t.Fatalf("Polled = %d, want 3 (all syncs attempted despite b failing)", res.Polled)
 	}
 	if res.Errors != 1 {
 		t.Fatalf("Errors = %d, want 1", res.Errors)
 	}
-	// Every game including the ones after the failing one were still polled.
+	// Every sync including the ones after the failing one were still polled.
 	if len(poller.calls()) != 3 {
 		t.Fatalf("polled %v, want all three despite b's error", poller.calls())
 	}
 }
 
 func TestRunOnceRecoversPanicAndContinues(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b", "c")}
+	lister := stubLister{syncs: syncs("a", "b", "c")}
 	poller := &panicPoller{panicFor: "b"}
 	d := daemon.New(lister, poller, time.Second, 0, nil)
 
@@ -175,15 +175,15 @@ func TestRunOnceRecoversPanicAndContinues(t *testing.T) {
 	// (and the whole daemon) would crash here instead of returning.
 	res, err := d.RunOnce(context.Background())
 	if err != nil {
-		t.Fatalf("RunOnce returned error %v; a per-game panic must be isolated", err)
+		t.Fatalf("RunOnce returned error %v; a per-sync panic must be isolated", err)
 	}
 	if res.Polled != 3 {
-		t.Fatalf("Polled = %d, want 3 (all games attempted despite b panicking)", res.Polled)
+		t.Fatalf("Polled = %d, want 3 (all syncs attempted despite b panicking)", res.Polled)
 	}
 	if res.Errors != 1 {
 		t.Fatalf("Errors = %d, want 1 (the panic counted as a single failure)", res.Errors)
 	}
-	// Every game including the one after the panicking one was still polled.
+	// Every sync including the one after the panicking one was still polled.
 	got := poller.calls()
 	want := []string{"a", "b", "c"}
 	if len(got) != len(want) {
@@ -197,8 +197,8 @@ func TestRunOnceRecoversPanicAndContinues(t *testing.T) {
 }
 
 func TestRunOncePerPollTimeoutDoesNotStallSweep(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b", "c")}
-	poller := &blockingPoller{blockFor: "a"} // first game hangs
+	lister := stubLister{syncs: syncs("a", "b", "c")}
+	poller := &blockingPoller{blockFor: "a"} // first sync hangs
 	// Tiny timeout so the hung poll is released deterministically by the deadline.
 	d := daemon.New(lister, poller, time.Second, 5*time.Millisecond, nil)
 
@@ -207,19 +207,19 @@ func TestRunOncePerPollTimeoutDoesNotStallSweep(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if res.Polled != 3 {
-		t.Fatalf("Polled = %d, want 3 (sweep continues past the hung game)", res.Polled)
+		t.Fatalf("Polled = %d, want 3 (sweep continues past the hung sync)", res.Polled)
 	}
 	if res.Errors != 1 {
-		t.Fatalf("Errors = %d, want 1 (the hung game records a timeout error)", res.Errors)
+		t.Fatalf("Errors = %d, want 1 (the hung sync records a timeout error)", res.Errors)
 	}
-	// The blocked game observed a deadline-exceeded cancellation.
+	// The blocked sync observed a deadline-exceeded cancellation.
 	poller.mu.Lock()
 	blockErr := poller.blockErr
 	poller.mu.Unlock()
 	if !errors.Is(blockErr, context.DeadlineExceeded) {
 		t.Fatalf("blocked game err = %v, want context.DeadlineExceeded", blockErr)
 	}
-	// The games AFTER the hung one were still polled.
+	// The syncs AFTER the hung one were still polled.
 	got := poller.calls()
 	want := []string{"a", "b", "c"}
 	if len(got) != len(want) {
@@ -232,8 +232,8 @@ func TestRunOncePerPollTimeoutDoesNotStallSweep(t *testing.T) {
 	}
 }
 
-func TestRunOnceNoBindingsIsNoop(t *testing.T) {
-	lister := stubLister{bindings: nil}
+func TestRunOnceNoSyncsIsNoop(t *testing.T) {
+	lister := stubLister{syncs: nil}
 	poller := newStubPoller()
 	d := daemon.New(lister, poller, time.Second, 0, nil)
 
@@ -264,8 +264,8 @@ func TestRunOnceListErrorReturned(t *testing.T) {
 	}
 }
 
-func TestRunOnceHonorsCancellationBetweenGames(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b", "c")}
+func TestRunOnceHonorsCancellationBetweenSyncs(t *testing.T) {
+	lister := stubLister{syncs: syncs("a", "b", "c")}
 	poller := newStubPoller()
 	d := daemon.New(lister, poller, time.Second, 0, nil)
 
@@ -276,7 +276,7 @@ func TestRunOnceHonorsCancellationBetweenGames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	// No games should be polled: the loop checks ctx before each Poll.
+	// No syncs should be polled: the loop checks ctx before each Poll.
 	if res.Polled != 0 {
 		t.Fatalf("Polled = %d, want 0 with a pre-cancelled ctx", res.Polled)
 	}
@@ -303,7 +303,7 @@ func (f *fakeTicker) Stop()               { f.once.Do(func() { close(f.stopped) 
 func (f *fakeTicker) tick() { f.ch <- time.Now() }
 
 func TestRunDoesImmediateSweepThenPerTick(t *testing.T) {
-	lister := stubLister{bindings: bindings("a")}
+	lister := stubLister{syncs: syncs("a")}
 	poller := newStubPoller()
 	d := daemon.New(lister, poller, time.Hour, 0, nil)
 
@@ -315,7 +315,7 @@ func TestRunDoesImmediateSweepThenPerTick(t *testing.T) {
 	go func() { done <- d.Run(ctx) }()
 
 	// Drive N tick-triggered sweeps. Plus the immediate startup sweep, that's
-	// N+1 sweeps and N+1 polls of game "a". We synchronize by waiting for the
+	// N+1 sweeps and N+1 polls of sync "a". We synchronize by waiting for the
 	// poll count to advance after each tick, with a deadline to avoid hangs.
 	const ticks = 3
 	waitPolls := func(n int) {
@@ -362,7 +362,7 @@ func TestRunDoesImmediateSweepThenPerTick(t *testing.T) {
 }
 
 func TestRunReturnsPromptlyOnImmediateCancel(t *testing.T) {
-	lister := stubLister{bindings: bindings("a", "b")}
+	lister := stubLister{syncs: syncs("a", "b")}
 	poller := newStubPoller()
 	d := daemon.New(lister, poller, time.Hour, 0, nil)
 

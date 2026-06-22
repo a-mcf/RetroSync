@@ -1,13 +1,18 @@
-// Package engine is the heart of RetroSync's play-sync: it activates a SYNC
-// for a play session, polls an active binding to fan-out changes from the
-// primary to its peers, detects (and flags, but does not resolve) conflicts,
-// and deactivates with a final sync pass. It implements docs/state-machine.md.
+// Package engine is the heart of RetroSync's play-sync: it AUTO-MIRRORS every
+// sync. Each Poll stats a sync's members, finds which member changed vs the
+// manifest, and — when exactly one changed — fans that member's save out to the
+// others. Zero changed is a noop; two or more changed is a genuine fork, which
+// it flags as a conflict and pauses (mirroring stays paused until a human
+// resolves it). There is no primary, no binding, no activate/deactivate/
+// take-over: the only human action is resolving a conflict. It implements
+// docs/state-machine.md.
 //
 // A *sync* is the unit of mirroring: a specific set of (node, save-file)
 // members that sync together (one game may have many independent syncs). The
 // engine operates on a sync id and that sync's SyncMembers — each member's
 // node_id + path is the in-scope (node, file) pair. There is no peer-scope: a
-// sync's members ARE its scope.
+// sync's members ARE its scope. Per-sync runtime state (conflict_at,
+// last_synced) lives on the sync row itself.
 //
 // The engine is pure logic over two ports: a store.Store for persistence and a
 // reach.Reach per node for filesystem access. It owns no goroutines, no timers,
@@ -34,7 +39,7 @@ import (
 type ResolveReach func(node store.Node) (reach.Reach, error)
 
 // Clock returns the current time. Injected so tests get deterministic
-// timestamps (started_at, last_synced, conflict_at, log ts).
+// timestamps (last_synced, conflict_at, log ts).
 type Clock func() time.Time
 
 // Engine implements the play-sync operations. Construct with New.
@@ -54,27 +59,16 @@ func New(s store.Store, resolve ResolveReach, clock Clock) *Engine {
 
 // Sentinel errors specific to the engine. Callers compare with errors.Is.
 var (
-	// ErrNoSave is returned by Activate when no in-scope node holds the file:
-	// there is nothing to start a session from (docs/state-machine.md step 3).
-	ErrNoSave = errors.New("engine: no save to start from")
-	// ErrSourceMissing is returned when the direction names a source node whose
-	// file is absent (e.g. from-peer-<id> but that peer has no save).
+	// ErrSourceMissing is returned by ResolveConflict when the chosen winner node
+	// currently holds no file (there is nothing to fan out from it).
 	ErrSourceMissing = errors.New("engine: chosen source node has no save")
 	// ErrNoPath is returned when a referenced node is not a member of the sync
-	// (e.g. the direction names a node not in the sync's members).
+	// (e.g. the resolve winner names a node not in the sync's members).
 	ErrNoPath = errors.New("engine: node is not a member of the sync")
-	// ErrPrimaryNotMember is returned by Activate when primaryNode is not a member
-	// of the sync. The web layer validates that the caller OWNS primaryNode, but
-	// ownership alone does not entitle a node to play authority over a sync it has
-	// no part in: the primary MUST also be a member. Without this check a user who
-	// owns some unrelated node could seize a sync's binding (and thereby its
-	// deactivate/resolve authority) by naming that owned non-member as primary.
-	// Returned BEFORE any write so a rejected activate mutates nothing.
-	ErrPrimaryNotMember = errors.New("engine: primary node is not a member of the sync")
-	// ErrNotConflicted is returned by ResolveConflict when the binding is not in
+	// ErrNotConflicted is returned by ResolveConflict when the sync is not in
 	// conflict (conflict_at == nil): there is nothing to resolve, and forcing a
-	// fan-out would silently overwrite peers the human never reviewed.
-	ErrNotConflicted = errors.New("engine: binding is not in conflict")
+	// fan-out would silently overwrite members the human never reviewed.
+	ErrNotConflicted = errors.New("engine: sync is not in conflict")
 	// ErrSmokeTestUnsupported is returned by SmokeTest when the node's reach
 	// strategy has no adapter wired yet (today: ssh). It is the engine's own
 	// sentinel so the web layer can map "not supported yet" WITHOUT importing
@@ -105,201 +99,90 @@ type scopedNode struct {
 	r    reach.Reach
 }
 
-// Activate starts a play session for syncID with primaryNode holding play
-// authority. direction selects the first-sync source ("from-primary" or
-// "from-peer-<nodeID>"). The in-scope nodes are the sync's members.
+// Poll runs ONE auto-mirror pass for syncID. It loads the sync; if the sync is
+// already in conflict (conflict_at != nil) it does nothing (paused, awaiting
+// human resolution). Otherwise it stats every member, computes the CHANGED SET
+// (each member's current stat vs its manifest, via changed()), and applies:
 //
-// It determines the in-scope nodes (the sync's SyncMembers, each member's
-// node_id + path), stats them, resolves the source per direction, creates the
-// active_bindings row, and fans the source file out to every other in-scope node
-// — updating the manifest and appending a sync_log row per directional copy.
+//	members changed | action
+//	0               | noop
+//	1               | fan-out that member -> the others; update manifest; mark synced
+//	2+              | conflict (set conflict_at, log, stop — paused until resolved)
 //
-// force controls the already-active case (docs/state-machine.md step 1):
-//   - force=false: activating a sync that already has a binding is rejected with
-//     store.ErrConflict ("currently bound to <other>; force takeover?").
-//   - force=true: the existing binding row is deleted (a raw replace — NOT a
-//     Deactivate-with-final-sync) and the new session proceeds with the normal
-//     activate + fan-out. The takeover's chosen source (per direction) is what
-//     gets fanned out, so the taker's "use my save" choice wins.
-func (e *Engine) Activate(ctx context.Context, syncID, primaryNode, direction string, force bool) error {
-	if !store.ValidDirection(direction) {
-		return fmt.Errorf("engine: invalid direction %q: %w", direction, store.ErrInvalidValue)
+// There is no primary: any single changed member is the source. The manifest
+// and last_synced advance only after a successful write (crash-safety: the
+// manifest trails the actual write). A sync with fewer than two members can
+// never fork, so it simply propagates (1 changed) or no-ops (0 changed).
+func (e *Engine) Poll(ctx context.Context, syncID string) error {
+	sy, err := e.store.GetSync(ctx, syncID)
+	if err != nil {
+		return fmt.Errorf("engine: get sync: %w", err)
+	}
+	if sy.ConflictAt != nil {
+		// Paused: a conflicted sync is skipped until a human resolves it.
+		return nil
 	}
 
-	// All read-only validation runs FIRST, before we touch any existing binding.
-	// A force-takeover that turns out to be non-viable (no save in scope, chosen
-	// source missing, etc.) must return its error WITHOUT having displaced the
-	// existing session (the displaced row would otherwise be lost for nothing).
 	scoped, err := e.inScopeNodes(ctx, syncID)
 	if err != nil {
 		return err
 	}
-	if len(scoped) == 0 {
-		return fmt.Errorf("engine: no members for sync %q: %w", syncID, ErrNoSave)
-	}
-
-	// Authority gate: primaryNode MUST be a member of the sync. The web layer
-	// only validates that the caller OWNS primaryNode; owning an unrelated node
-	// does not grant play authority over a sync that node has no part in. We
-	// reject here — BEFORE any stat, the force-takeover delete, or CreateBinding —
-	// so an activate naming a non-member primary mutates nothing.
-	if _, ok := byID(scoped, primaryNode); !ok {
-		return fmt.Errorf("engine: primary %q for sync %q: %w", primaryNode, syncID, ErrPrimaryNotMember)
-	}
-
-	// Stat every in-scope node. Absent files are fine (a node may not yet hold a
-	// save); any other stat error is fatal to activation.
-	metas := make(map[string]reach.FileMeta, len(scoped))
-	present := make(map[string]bool, len(scoped))
-	for _, sn := range scoped {
-		fm, err := sn.r.Stat(ctx, sn.path)
-		if err != nil {
-			if errors.Is(err, reach.ErrNotExist) {
-				continue
-			}
-			return fmt.Errorf("engine: stat %s: %w", sn.node.ID, err)
-		}
-		metas[sn.node.ID] = fm
-		present[sn.node.ID] = true
-	}
-	if len(present) == 0 {
-		return fmt.Errorf("engine: sync %q: %w", syncID, ErrNoSave)
-	}
-
-	// Resolve the source node from direction.
-	sourceID, err := sourceNodeID(direction, primaryNode)
+	manifest, err := e.manifestMap(ctx, syncID)
 	if err != nil {
 		return err
 	}
-	src, ok := byID(scoped, sourceID)
-	if !ok {
-		return fmt.Errorf("engine: source %q for sync %q: %w", sourceID, syncID, ErrNoPath)
-	}
-	if !present[sourceID] {
-		return fmt.Errorf("engine: source %q: %w", sourceID, ErrSourceMissing)
-	}
 
-	// The new activation is now known viable. ONLY now, for a force-takeover, do
-	// we raw-delete the existing binding so CreateBinding below does not hit
-	// ErrConflict. This is intentionally NOT a Deactivate (no final sync of the
-	// displaced session's primary): the human sitting down with the taking node
-	// has just chosen the source they want, and a final sync of the old primary
-	// could overwrite that choice (docs/state-machine.md step 1: "Force = delete
-	// the existing row, create new").
-	if force {
-		if _, err := e.store.GetBinding(ctx, syncID); err == nil {
-			if err := e.store.DeleteBinding(ctx, syncID); err != nil {
-				return fmt.Errorf("engine: force-takeover delete binding: %w", err)
-			}
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("engine: force-takeover get binding: %w", err)
+	// Stat every member and collect those that changed vs the manifest. Each
+	// member is stat'd once; a non-ErrNotExist Stat error aborts the pass (the
+	// next poll re-stats and resumes).
+	metas := make(map[string]reach.FileMeta, len(scoped))
+	present := make(map[string]bool, len(scoped))
+	var changedSet []scopedNode
+	for _, sn := range scoped {
+		meta, ok, err := e.statOpt(ctx, sn)
+		if err != nil {
+			return err
+		}
+		metas[sn.node.ID] = meta
+		present[sn.node.ID] = ok
+		if changed(manifest[sn.node.ID], meta, ok) {
+			changedSet = append(changedSet, sn)
 		}
 	}
 
 	now := e.clock()
-	binding := store.ActiveBinding{
-		SyncID:      syncID,
-		PrimaryNode: primaryNode,
-		StartedAt:   now,
-		Direction:   direction,
-	}
-	// CreateBinding rejects a duplicate sync_id via the PK (store.ErrConflict),
-	// which surfaces "currently bound to ... force takeover?" at the UI layer.
-	if err := e.store.CreateBinding(ctx, binding); err != nil {
-		return fmt.Errorf("engine: create binding: %w", err)
-	}
 
-	// From here on the active_bindings row exists. If the first-sync fan-out (or
-	// the manifest/last_synced bookkeeping) fails, the row would persist with a
-	// nil last_synced and partial manifests; a retry would then hit ErrConflict
-	// and the operator would be stuck on a half-active game. Unlike Poll (which
-	// self-heals on the next pass), Activate has no later pass to recover, so we
-	// best-effort roll back to idle on ANY error and let the operator retry.
-	if err := e.activateFanOut(ctx, syncID, src, scoped, metas[sourceID], binding, now); err != nil {
-		if delErr := e.store.DeleteBinding(ctx, syncID); delErr != nil {
-			// Rollback is best-effort: the original error is what the caller acts
-			// on. We do not have a logger wired into the engine yet, so wrap the
-			// rollback failure into the returned error for visibility.
-			return fmt.Errorf("%w (rollback also failed: %v)", err, delErr)
-		}
-		return err
-	}
-	return nil
-}
-
-// activateFanOut performs the first-sync fan-out plus the source-manifest and
-// last_synced bookkeeping. Split out so Activate can wrap any failure in a
-// best-effort rollback (see the call site).
-func (e *Engine) activateFanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, binding store.ActiveBinding, now time.Time) error {
-	// Initial fan-out from the chosen source to every other in-scope node.
-	if err := e.fanOut(ctx, syncID, src, scoped, srcMeta, now); err != nil {
-		return err
-	}
-	// Record the source's own manifest state (it is the authority for this pass).
-	if err := e.setManifest(ctx, syncID, src.node.ID, srcMeta, now); err != nil {
-		return err
-	}
-	return e.markSynced(ctx, binding, now)
-}
-
-// Poll runs ONE pass for the sync's active binding. If the binding is already
-// in conflict it does nothing (paused, awaiting human resolution). Otherwise it
-// stats the primary plus every in-scope peer, compares each against the
-// manifest, and applies the docs/state-machine.md case table:
-//
-//	primary changed | any peer changed | action
-//	no              | no               | noop
-//	yes             | no               | fan-out primary -> peers; update manifest
-//	no              | one+ peer        | conflict (flag, stop)
-//	yes             | yes              | conflict (flag, stop)
-//
-// The manifest and last_synced advance only after a successful write
-// (crash-safety: the manifest trails the actual write).
-func (e *Engine) Poll(ctx context.Context, syncID string) error {
-	binding, err := e.store.GetBinding(ctx, syncID)
-	if err != nil {
-		return fmt.Errorf("engine: get binding: %w", err)
-	}
-	if binding.ConflictAt != nil {
-		// Paused: a conflicted binding is skipped until a human resolves it.
+	switch len(changedSet) {
+	case 0:
+		// Nothing changed: noop.
 		return nil
-	}
-	return e.syncPass(ctx, binding, false /* finalPass */)
-}
-
-// Deactivate ends the play session: it runs one final sync pass (fan-out
-// primary -> peers if the primary changed). If that final pass WOULD be a
-// conflict, the binding is left active and the conflict is surfaced (the row is
-// NOT deleted). Otherwise the active_bindings row is deleted. Idempotent: if the
-// sync is already idle, it returns nil.
-func (e *Engine) Deactivate(ctx context.Context, syncID string) error {
-	binding, err := e.store.GetBinding(ctx, syncID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil // already idle
+	case 1:
+		// Exactly one member changed — it is the source. If it is now ABSENT but
+		// the manifest had it (a deletion), treat as a conflict rather than
+		// propagating the delete to the others: surfacing beats destruction.
+		src := changedSet[0]
+		if !present[src.node.ID] {
+			return e.flagConflict(ctx, syncID, now,
+				fmt.Sprintf("member %s vanished (manifest had a file); sync paused", src.node.ID))
 		}
-		return fmt.Errorf("engine: get binding: %w", err)
+		if err := e.fanOut(ctx, syncID, src, scoped, metas[src.node.ID], now); err != nil {
+			return err
+		}
+		// Record the source's own manifest state (it is the authority this pass).
+		if err := e.setManifest(ctx, syncID, src.node.ID, metas[src.node.ID], now); err != nil {
+			return err
+		}
+		return e.markSynced(ctx, syncID, now)
+	default:
+		// Two or more members changed — a genuine fork. Flag and pause.
+		ids := make([]string, 0, len(changedSet))
+		for _, sn := range changedSet {
+			ids = append(ids, sn.node.ID)
+		}
+		return e.flagConflict(ctx, syncID, now,
+			fmt.Sprintf("%d members changed (%s); retrosync won't choose — sync paused",
+				len(changedSet), strings.Join(ids, ", ")))
 	}
-	// If the binding is already conflicted, the final pass cannot clean it up;
-	// leave it active and flagged for human resolution.
-	if binding.ConflictAt != nil {
-		return nil
-	}
-	if err := e.syncPass(ctx, binding, true /* finalPass */); err != nil {
-		return err
-	}
-	// Re-read: syncPass may have flagged a conflict. If so, leave the binding.
-	binding, err = e.store.GetBinding(ctx, syncID)
-	if err != nil {
-		return fmt.Errorf("engine: re-read binding: %w", err)
-	}
-	if binding.ConflictAt != nil {
-		return nil // conflict on final pass: leave active + flagged
-	}
-	if err := e.store.DeleteBinding(ctx, syncID); err != nil {
-		return fmt.Errorf("engine: delete binding: %w", err)
-	}
-	return nil
 }
 
 // NodeState is a single in-scope node's CURRENT live file state, as read by a
@@ -318,13 +201,14 @@ type NodeState struct {
 }
 
 // NodeStates returns the live per-node state of every member of the sync, sorted
-// by NodeID for determinism. It is read-only: no manifest, binding, or
-// filesystem mutation. A node whose file is absent is returned with
-// Present=false; any Stat error other than reach.ErrNotExist is a real error.
+// by NodeID for determinism. It is read-only: no manifest or filesystem
+// mutation. A node whose file is absent is returned with Present=false; any Stat
+// error other than reach.ErrNotExist is a real error.
 //
 // The in-scope set is exactly the sync's members (a sync's members ARE its
-// scope), so the pre-bind stale-peer view (docs/state-machine.md "Stale-peer
-// visibility") renders the same set whether or not a binding exists.
+// scope). This is the per-member view the conflict-resolution UI renders so the
+// human can see every divergent save before picking a winner (docs/state-machine.md
+// "Conflict handling").
 func (e *Engine) NodeStates(ctx context.Context, syncID string) ([]NodeState, error) {
 	scoped, err := e.inScopeNodes(ctx, syncID)
 	if err != nil {
@@ -469,9 +353,9 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 // conflict only on full success (docs/state-machine.md "Conflict handling").
 //
 // Preconditions:
-//   - The binding MUST be in conflict (conflict_at != nil); otherwise
-//     ErrNotConflicted (resolving a non-conflicted game is not allowed — it
-//     would overwrite peers the human never reviewed).
+//   - The sync MUST be in conflict (conflict_at != nil); otherwise
+//     ErrNotConflicted (resolving a non-conflicted sync is not allowed — it
+//     would overwrite members the human never reviewed).
 //   - winnerNodeID MUST be in scope (ErrNoPath otherwise) and MUST currently
 //     hold a file (ErrSourceMissing otherwise).
 //
@@ -489,11 +373,11 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 // If any backup or fan-out write fails, conflict_at is left set (the binding
 // stays conflicted and re-resolvable) and the error is returned.
 func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error {
-	binding, err := e.store.GetBinding(ctx, syncID)
+	sy, err := e.store.GetSync(ctx, syncID)
 	if err != nil {
-		return fmt.Errorf("engine: get binding: %w", err)
+		return fmt.Errorf("engine: get sync: %w", err)
 	}
-	if binding.ConflictAt == nil {
+	if sy.ConflictAt == nil {
 		return fmt.Errorf("engine: sync %q: %w", syncID, ErrNotConflicted)
 	}
 
@@ -542,10 +426,13 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	}
 
 	// Step 3: only now, after every write succeeded, clear the conflict and mark
-	// the binding synced.
-	binding.ConflictAt = nil
-	binding.LastSynced = &now
-	if err := e.store.UpdateBinding(ctx, binding); err != nil {
+	// the sync synced. Order matters for crash-safety: mark synced first, then
+	// clear the conflict last — so a crash between the two leaves the sync
+	// conflicted (re-resolvable) rather than un-paused-but-unsynced.
+	if err := e.store.MarkSyncSynced(ctx, syncID, now); err != nil {
+		return fmt.Errorf("engine: mark synced: %w", err)
+	}
+	if err := e.store.SetSyncConflict(ctx, syncID, nil); err != nil {
 		return fmt.Errorf("engine: clear conflict: %w", err)
 	}
 	return nil
@@ -615,83 +502,6 @@ func backupSuffix(t time.Time) string {
 	return ".retrosync-conflict-" + t.UTC().Format("20060102T150405.000000000Z")
 }
 
-// syncPass implements the case table shared by Poll and Deactivate's final
-// pass. finalPass only affects logging context; the conflict/fan-out logic is
-// identical (the spec's "final sync pass ... but if it does [conflict], leave
-// the binding active and surface the conflict").
-func (e *Engine) syncPass(ctx context.Context, binding store.ActiveBinding, finalPass bool) error {
-	scoped, err := e.inScopeNodes(ctx, binding.SyncID)
-	if err != nil {
-		return err
-	}
-	primary, ok := byID(scoped, binding.PrimaryNode)
-	if !ok {
-		return fmt.Errorf("engine: primary %q: %w", binding.PrimaryNode, ErrNoPath)
-	}
-
-	manifest, err := e.manifestMap(ctx, binding.SyncID)
-	if err != nil {
-		return err
-	}
-
-	// Determine changed-ness per node.
-	primaryMeta, primaryPresent, err := e.statOpt(ctx, primary)
-	if err != nil {
-		return err
-	}
-	primaryChanged := changed(manifest[primary.node.ID], primaryMeta, primaryPresent)
-
-	peerChanged := false
-	for _, sn := range scoped {
-		if sn.node.ID == primary.node.ID {
-			continue
-		}
-		meta, present, err := e.statOpt(ctx, sn)
-		if err != nil {
-			// Known limitation: peers are scanned in node-id order, and any
-			// non-ErrNotExist Stat error aborts the whole pass. If peer A mutated
-			// out-of-band but peer B is hard-down and sorts first, B's error
-			// returns here before A's change is flagged as a conflict — delaying
-			// conflict detection until B is reachable again. For a transient fault
-			// this is fine (the next poll retries and flags it); sustained
-			// unreachability could mask the conflict for as long as B stays down.
-			// TODO(slice-daemon): when the timer loop lands, revisit so a single
-			// unreachable peer degrades to "scan the rest, surface the conflict"
-			// rather than aborting the pass.
-			return err
-		}
-		if changed(manifest[sn.node.ID], meta, present) {
-			peerChanged = true
-		}
-	}
-
-	now := e.clock()
-
-	switch {
-	case peerChanged:
-		// no/yes primary + any-peer-changed => conflict. A peer wrote
-		// out-of-band; pause rather than overwrite it.
-		return e.flagConflict(ctx, binding, now, finalPass)
-	case primaryChanged:
-		// yes/no => fan-out primary -> peers.
-		if !primaryPresent {
-			// Primary's manifest says it existed but it's now gone: treat as a
-			// conflict rather than deleting peers. Surfacing beats destruction.
-			return e.flagConflict(ctx, binding, now, finalPass)
-		}
-		if err := e.fanOut(ctx, binding.SyncID, primary, scoped, primaryMeta, now); err != nil {
-			return err
-		}
-		if err := e.setManifest(ctx, binding.SyncID, primary.node.ID, primaryMeta, now); err != nil {
-			return err
-		}
-		return e.markSynced(ctx, binding, now)
-	default:
-		// no/no => noop.
-		return nil
-	}
-}
-
 // fanOut reads the source file once and WriteAtomic's it to every other
 // in-scope node, advancing each written node's manifest and appending a
 // sync_log "ok" row per copy. The destination mtime is the source's mtime so
@@ -752,32 +562,24 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 	return nil
 }
 
-// flagConflict sets conflict_at on the binding and appends a single conflict
-// log row, then stops. Syncing is paused until a human resolves it. finalPass
-// marks the conflict as having surfaced during deactivation's final pass, so it
-// is distinguishable from a poll-time conflict in sync_log.
-func (e *Engine) flagConflict(ctx context.Context, binding store.ActiveBinding, now time.Time, finalPass bool) error {
-	binding.ConflictAt = &now
-	if err := e.store.UpdateBinding(ctx, binding); err != nil {
+// flagConflict sets conflict_at on the sync and appends a single conflict log
+// row carrying msg, then stops. Auto-mirroring is paused for that sync until a
+// human resolves it (subsequent Polls short-circuit on conflict_at != nil).
+func (e *Engine) flagConflict(ctx context.Context, syncID string, now time.Time, msg string) error {
+	if err := e.store.SetSyncConflict(ctx, syncID, &now); err != nil {
 		return fmt.Errorf("engine: flag conflict: %w", err)
 	}
-	msg := "non-primary peer mutated or primary+peer diverged; sync paused"
-	if finalPass {
-		msg = "conflict on final (deactivation) pass: " + msg + "; binding left active"
-	}
 	return e.appendLog(ctx, store.LogEntry{
-		SyncID:   binding.SyncID,
-		FromNode: binding.PrimaryNode,
-		Outcome:  store.OutcomeConflict,
-		Message:  msg,
-		TS:       now,
+		SyncID:  syncID,
+		Outcome: store.OutcomeConflict,
+		Message: msg,
+		TS:      now,
 	})
 }
 
-// markSynced advances last_synced on the binding after a successful pass.
-func (e *Engine) markSynced(ctx context.Context, binding store.ActiveBinding, now time.Time) error {
-	binding.LastSynced = &now
-	if err := e.store.UpdateBinding(ctx, binding); err != nil {
+// markSynced advances last_synced on the sync after a successful mirror pass.
+func (e *Engine) markSynced(ctx context.Context, syncID string, now time.Time) error {
+	if err := e.store.MarkSyncSynced(ctx, syncID, now); err != nil {
 		return fmt.Errorf("engine: update last_synced: %w", err)
 	}
 	return nil
@@ -909,18 +711,6 @@ func changed(me store.ManifestEntry, cur reach.FileMeta, present bool) bool {
 		return true // appeared
 	}
 	return !mtimeEqual(*me.Mtime, cur.Mtime) || *me.Size != cur.Size
-}
-
-// sourceNodeID resolves the first-sync source from a direction. "from-primary"
-// yields primaryNode; "from-peer-<id>" yields <id>.
-func sourceNodeID(direction, primaryNode string) (string, error) {
-	if direction == "from-primary" {
-		return primaryNode, nil
-	}
-	if id := strings.TrimPrefix(direction, "from-peer-"); id != direction && id != "" {
-		return id, nil
-	}
-	return "", fmt.Errorf("engine: invalid direction %q: %w", direction, store.ErrInvalidValue)
 }
 
 func byID(scoped []scopedNode, id string) (scopedNode, bool) {

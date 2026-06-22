@@ -10,12 +10,11 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// dashboardData is the full view-model for GET / and the action refresh
-// fragment. CSRF is the per-session token embedded so every action POST
-// (Play / Done / takeover) can echo it back.
+// dashboardData is the full view-model for GET / and the resolve-conflict
+// refresh fragment. CSRF is the per-session token embedded so the resolve POST
+// can echo it back.
 type dashboardData struct {
 	User    userView
-	Active  []activeRow
 	MySyncs []mySyncRow
 	Nodes   []nodeRow
 	CSRF    string
@@ -30,58 +29,31 @@ type userView struct {
 	Role    store.Role
 }
 
-// activeRow is one active-binding card, keyed by sync.
-type activeRow struct {
-	SyncID      string
-	SyncName    string
-	GameDisplay string
-	System      string
-	PrimaryNode string
-	Since       string
-	Conflict    bool
-	LastSync    string
-	Peers       []peerLine
-}
-
-// peerLine is one mirrored node under an active binding, with its last-known
-// mtime from the manifest.
-type peerLine struct {
-	NodeID string
-	Mtime  string
-}
-
-// mySyncRow is one "my syncs" card: a sync with a member on a node I own, with a
-// per-node last-known mtime line and a "Play on <node>" (or "Take over") action
-// per owned member node.
+// mySyncRow is one "My syncs" STATUS card: a sync with a member on a node I own.
+// Under auto-mirror there are no Play buttons — the card shows each member's
+// last-known mtime and the sync's state (in sync / conflict). A Resolve button
+// appears ONLY when the sync is in conflict.
 type mySyncRow struct {
 	SyncID      string
 	SyncName    string
 	GameDisplay string
 	System      string
 	Nodes       []nodeMtimeLine
-	// ActivePrimary is the node currently bound as primary for this sync, or ""
-	// if the sync is idle. When set and != an owned node, the Play button reads
-	// "Take over from <ActivePrimary>" and posts force=true.
-	ActivePrimary string
-	// Conflict is true when the sync's active binding is in conflict; the row
-	// shows a "Resolve conflict" banner.
+	// Conflict is true when the sync forked (conflict_at set); the row shows a
+	// red "sync paused" banner with a Resolve button.
 	Conflict bool
-	// MultiSource is true when more than one node is a member of this sync, so
-	// the Play button opens the "use my save" modal (hx-get) instead of posting
-	// directly (docs/ui.md: modal only appears with multiple saves/sources).
-	MultiSource bool
+	// LastSync is the coarse "all in sync N ago" relative time, or "never". Only
+	// meaningful when !Conflict.
+	LastSync string
 }
 
+// nodeMtimeLine is one member node's last-known manifest mtime on a status card.
 type nodeMtimeLine struct {
 	NodeID string
 	Mtime  string
-	// Owned marks a line that maps to a node the current user owns: only these
-	// get an action button (docs/ui.md "Play on <node>" per owned node).
+	// Owned marks a line that maps to a node the current user owns (rendered with
+	// a subtle "(yours)" marker so the user can see which devices are theirs).
 	Owned bool
-	// Takeover is true when this owned node would take over a session currently
-	// primaried on a different node (button reads "Take over from <other>" and
-	// posts force=true).
-	Takeover bool
 }
 
 // nodeRow is one node-status card.
@@ -114,50 +86,7 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 
 	data := dashboardData{User: userView{ID: u.ID, Display: u.Display, Role: u.Role}}
 
-	// --- Active bindings (keyed by sync) ---
-	bindings, err := s.store.ListBindings(ctx)
-	if err != nil {
-		return dashboardData{}, fmt.Errorf("list bindings: %w", err)
-	}
-	// bindingBySync: sync_id -> its active binding. Used in the "my syncs"
-	// section to decide Play vs "Take over from <other>" and the conflict banner.
-	bindingBySync := make(map[string]store.ActiveBinding, len(bindings))
-	for _, b := range bindings {
-		bindingBySync[b.SyncID] = b
-	}
-	for _, b := range bindings {
-		sy, gErr := s.store.GetSync(ctx, b.SyncID)
-		if gErr != nil && !errors.Is(gErr, store.ErrNotFound) {
-			return dashboardData{}, fmt.Errorf("get sync %s: %w", b.SyncID, gErr)
-		}
-		row := activeRow{
-			SyncID:      b.SyncID,
-			SyncName:    sy.Name,
-			GameDisplay: displayOf(gameByID, sy.GameID),
-			System:      systemOf(gameByID, sy.GameID),
-			PrimaryNode: b.PrimaryNode,
-			Since:       fmtTime(&b.StartedAt),
-			Conflict:    b.ConflictAt != nil,
-			LastSync:    fmtTimeAgo(b.LastSynced, now),
-		}
-		// Peers: every node (other than the primary) that has a manifest entry
-		// for this sync, with its last-known mtime.
-		manifest, err := s.store.ListManifestBySync(ctx, b.SyncID)
-		if err != nil {
-			return dashboardData{}, fmt.Errorf("list manifest %s: %w", b.SyncID, err)
-		}
-		for _, m := range manifest {
-			if m.NodeID == b.PrimaryNode {
-				continue
-			}
-			row.Peers = append(row.Peers, peerLine{NodeID: m.NodeID, Mtime: fmtMtime(m.Mtime)})
-		}
-		sort.Slice(row.Peers, func(i, j int) bool { return row.Peers[i].NodeID < row.Peers[j].NodeID })
-		data.Active = append(data.Active, row)
-	}
-	sort.Slice(data.Active, func(i, j int) bool { return data.Active[i].SyncID < data.Active[j].SyncID })
-
-	// --- My syncs ---
+	// --- My syncs (status) ---
 	// Nodes owned by this user.
 	myNodes := make(map[string]bool)
 	for _, n := range nodes {
@@ -166,7 +95,6 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		}
 	}
 	// A sync is "mine" when at least one of its members lives on a node I own.
-	// ListSyncMembersByNode for each of my nodes yields the candidate sync ids.
 	mySyncIDs := make(map[string]bool)
 	for nodeID := range myNodes {
 		members, err := s.store.ListSyncMembersByNode(ctx, nodeID)
@@ -190,13 +118,6 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		if err != nil {
 			return dashboardData{}, fmt.Errorf("list members %s: %w", syncID, err)
 		}
-		b, hasBinding := bindingBySync[syncID]
-		activePrimary := ""
-		conflict := false
-		if hasBinding {
-			activePrimary = b.PrimaryNode
-			conflict = b.ConflictAt != nil
-		}
 		var lines []nodeMtimeLine
 		for _, m := range members {
 			mtime := "no save yet"
@@ -205,26 +126,21 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 			} else if !errors.Is(err, store.ErrNotFound) {
 				return dashboardData{}, fmt.Errorf("get manifest %s/%s: %w", syncID, m.NodeID, err)
 			}
-			owned := myNodes[m.NodeID]
-			// Takeover when the sync is active on a DIFFERENT node than this one.
-			takeover := owned && activePrimary != "" && activePrimary != m.NodeID
 			lines = append(lines, nodeMtimeLine{
-				NodeID:   m.NodeID,
-				Mtime:    mtime,
-				Owned:    owned,
-				Takeover: takeover,
+				NodeID: m.NodeID,
+				Mtime:  mtime,
+				Owned:  myNodes[m.NodeID],
 			})
 		}
 		sort.Slice(lines, func(i, j int) bool { return lines[i].NodeID < lines[j].NodeID })
 		data.MySyncs = append(data.MySyncs, mySyncRow{
-			SyncID:        syncID,
-			SyncName:      sy.Name,
-			GameDisplay:   displayOf(gameByID, sy.GameID),
-			System:        systemOf(gameByID, sy.GameID),
-			Nodes:         lines,
-			ActivePrimary: activePrimary,
-			Conflict:      conflict,
-			MultiSource:   len(members) > 1,
+			SyncID:      syncID,
+			SyncName:    sy.Name,
+			GameDisplay: displayOf(gameByID, sy.GameID),
+			System:      systemOf(gameByID, sy.GameID),
+			Nodes:       lines,
+			Conflict:    sy.ConflictAt != nil,
+			LastSync:    fmtTimeAgo(sy.LastSynced, now),
 		})
 	}
 	// Deterministic order: by game display then sync id.
@@ -282,14 +198,6 @@ func fmtSize(n int64) string {
 	default:
 		return fmt.Sprintf("%d MB", n/(1024*1024))
 	}
-}
-
-// fmtTime renders an absolute time; "—" for nil/zero.
-func fmtTime(t *time.Time) string {
-	if t == nil || t.IsZero() {
-		return "—"
-	}
-	return t.Format("2006-01-02 15:04")
 }
 
 // fmtTimeAgo renders a coarse "N ago" relative time; "never" for nil/zero.

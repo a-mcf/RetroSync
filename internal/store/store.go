@@ -6,7 +6,6 @@ package store
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 )
 
@@ -22,7 +21,7 @@ var (
 	// ErrInvalidReference is returned when a write references a parent row that
 	// does not exist: e.g. a node with an owner_user_id for a missing user, a
 	// sync naming a missing game, a sync_member naming a missing sync or node, or
-	// a binding/manifest/log naming a missing sync (a foreign-key violation).
+	// a manifest/log naming a missing sync (a foreign-key violation).
 	ErrInvalidReference = errors.New("store: invalid reference")
 	// ErrInvalidValue is returned when a field fails a domain/enum constraint:
 	// e.g. a bad role, kind, or reach (a CHECK violation).
@@ -145,43 +144,6 @@ var validOutcomes = map[Outcome]bool{
 // ValidOutcome reports whether o is an allowed sync_log outcome value.
 func ValidOutcome(o Outcome) bool { return validOutcomes[o] }
 
-// ValidDirection reports whether d is an allowed active_bindings direction:
-// either "from-primary" or "from-peer-<node_id>" with a non-empty node id.
-//
-// The runtime migration's CHECK uses LIKE 'from-peer-%', which (since % matches
-// zero chars) would also admit the bare "from-peer-". We tighten here to require
-// a non-empty suffix so the validity boundary matches engine.sourceNodeID, which
-// rejects an empty source id. The DB CHECK remains a coarser backstop.
-func ValidDirection(d string) bool {
-	if d == "from-primary" {
-		return true
-	}
-	id := strings.TrimPrefix(d, "from-peer-")
-	return id != d && id != ""
-}
-
-// ActiveBinding is the runtime row that makes a sync "active" (in a play
-// session). A sync with no ActiveBinding is idle (backup-only). The SyncID is
-// the primary key: at most one active binding may exist per sync.
-//
-// There is no PeerScope: a sync's members ARE its scope. The in-scope nodes for
-// an active binding are exactly the sync's SyncMembers.
-type ActiveBinding struct {
-	// SyncID is the bound sync; the PK enforces one active session per sync.
-	SyncID string
-	// PrimaryNode is the node currently holding play authority.
-	PrimaryNode string
-	StartedAt   time.Time
-	// Direction is "from-primary" (primary wins the first sync) or
-	// "from-peer-<node_id>".
-	Direction string
-	// ConflictAt is non-nil when a non-primary peer mutated mid-session; it
-	// flags the conflict (paused) state. Nil otherwise.
-	ConflictAt *time.Time
-	// LastSynced is the time of the last successful sync pass; nil if none yet.
-	LastSynced *time.Time
-}
-
 // LogEntry is one append-only sync_log row: a single directional copy. A sync
 // pass that fans out from primary to N peers writes N entries.
 type LogEntry struct {
@@ -230,6 +192,15 @@ type Sync struct {
 	GameID string
 	// Name is a free-form label; defaults to "".
 	Name string
+	// ConflictAt is non-nil when the sync forked — two or more members changed
+	// between polls — and auto-mirroring is paused until a human resolves it.
+	// Nil means the sync is mirroring normally. This is the per-sync runtime
+	// flag that replaced active_bindings.conflict_at (slice-18 auto-mirror).
+	ConflictAt *time.Time
+	// LastSynced is the time of the last successful mirror pass (a fan-out from
+	// the single changed member to the others), or a conflict resolution; nil if
+	// the sync has never synced. Replaced active_bindings.last_synced.
+	LastSynced *time.Time
 }
 
 // SyncMember is one (node, file) member of a Sync. The store enforces two
@@ -277,25 +248,6 @@ type Store interface {
 	UpdateGame(ctx context.Context, g Game) error
 	DeleteGame(ctx context.Context, id string) error
 
-	// ActiveBindings. The sync_id PK enforces one active session per sync.
-	// CreateBinding: duplicate sync_id -> ErrConflict; missing sync/node ->
-	// ErrInvalidReference; bad direction -> ErrInvalidValue.
-	//
-	// Typed-error precedence: inputs are expected to violate at most one
-	// constraint. When an input violates several at once (e.g. duplicate sync_id
-	// AND bad direction), which typed error is returned is unspecified and may
-	// differ between backends. (Applies to UpdateBinding too.)
-	CreateBinding(ctx context.Context, b ActiveBinding) error
-	GetBinding(ctx context.Context, syncID string) (ActiveBinding, error)
-	ListBindings(ctx context.Context) ([]ActiveBinding, error)
-	// UpdateBinding rewrites the mutable fields (primary_node, direction,
-	// conflict_at, last_synced) of an existing binding. Missing -> ErrNotFound;
-	// bad direction -> ErrInvalidValue.
-	UpdateBinding(ctx context.Context, b ActiveBinding) error
-	// DeleteBinding is idempotent: deleting an absent binding returns nil (per
-	// api.md "deactivate is idempotent").
-	DeleteBinding(ctx context.Context, syncID string) error
-
 	// SyncLog (append-only).
 	// AppendLog: bad outcome -> ErrInvalidValue; missing sync ->
 	// ErrInvalidReference. A non-zero LogEntry.TS is honored as-is; a zero TS
@@ -316,14 +268,27 @@ type Store interface {
 	ListManifestBySync(ctx context.Context, syncID string) ([]ManifestEntry, error)
 
 	// Syncs and SyncMembers — the unit of mirroring. The runtime tables
-	// (active_bindings, manifest, sync_log) above key off sync_id; the engine,
-	// daemon, and web PLAY side all operate on a Sync and its SyncMembers.
+	// (manifest, sync_log) above key off sync_id; the per-sync runtime state
+	// (conflict_at, last_synced) lives on the sync row itself. The engine,
+	// daemon, and web all operate on a Sync and its SyncMembers.
 
 	// CreateSync inserts a sync. Duplicate id -> ErrConflict; missing game ->
-	// ErrInvalidReference.
+	// ErrInvalidReference. A freshly-created sync has nil ConflictAt/LastSynced.
 	CreateSync(ctx context.Context, sy Sync) error
 	GetSync(ctx context.Context, id string) (Sync, error)
 	ListSyncsByGame(ctx context.Context, gameID string) ([]Sync, error)
+	// ListSyncs returns ALL syncs, ordered by id. The daemon sweeps every sync
+	// each poll (there is no "active" subset anymore — every sync auto-mirrors),
+	// so it lists them all and polls each.
+	ListSyncs(ctx context.Context) ([]Sync, error)
+	// SetSyncConflict sets (or, with at==nil, clears) the sync's conflict_at
+	// flag. Setting it pauses auto-mirroring for that sync until a human
+	// resolves; clearing it (conflict resolution) resumes mirroring. Missing
+	// sync -> ErrNotFound. It does NOT touch last_synced.
+	SetSyncConflict(ctx context.Context, syncID string, at *time.Time) error
+	// MarkSyncSynced sets the sync's last_synced to t (a successful mirror pass).
+	// It does NOT touch conflict_at. Missing sync -> ErrNotFound.
+	MarkSyncSynced(ctx context.Context, syncID string, t time.Time) error
 	// UpdateSync rewrites the mutable fields (game_id, name) of an existing sync.
 	// Missing -> ErrNotFound; missing game -> ErrInvalidReference.
 	UpdateSync(ctx context.Context, sy Sync) error

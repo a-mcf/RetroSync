@@ -17,11 +17,12 @@ authorization are enforced by middleware before any handler runs:
   **per-session** synchronizer token (minted at login, rotated on each login,
   compared in constant time). It travels in the `X-CSRF-Token` header (HTMX) or a
   `csrf_token` form field. A missing/invalid token (or no session) → `403`.
-- **Admin-gating** — all **registry** mutations (`/nodes`, `/games`, path mappings,
-  smoke-test) are admin-only; a non-admin → `403` ("admins only").
-- **Owner/admin-gating** — `activate` / `deactivate` / `resolve-conflict` require
-  the caller to **own the relevant node** (the primary, or the session's primary)
-  *or* be an admin; otherwise `403`.
+- **Admin-gating** — all **registry** mutations (`/nodes`, `/games`, sync + member
+  edits, smoke-test) are admin-only; a non-admin → `403` ("admins only").
+- **Member-owner/admin-gating** — `resolve-conflict` (the only play-side action
+  under auto-mirror) requires the caller to **own at least one of the sync's
+  member nodes** *or* be an admin; otherwise `403`. There is no primary anymore,
+  so authority comes from owning a node that is part of the sync.
 
 ## Auth
 
@@ -44,52 +45,34 @@ Liveness, no auth.
 
 ### `GET /` (auth required)
 
-The home dashboard: active sessions, conflicts, and per-game Play/Done controls.
+The home dashboard: the "My syncs" status view (each sync's members + mtimes +
+state) and node reachability. Under auto-mirror there are no Play/Done controls —
+the only action is **Resolve conflict** (and only when a sync is conflicted).
 
 ## Play-sync actions
 
-These drive the engine via the narrow `Actioner` interface; owner/admin-gated.
+Under auto-mirror there is exactly **one** play-side action: resolving a conflict.
+There is no activate / deactivate / take-over (every sync auto-mirrors). It drives
+the engine via the narrow `Actioner` interface; member-owner/admin-gated.
 
-### `POST /api/games/{id}/activate`
+### `POST /api/syncs/{id}/resolve-conflict`
 
-Form fields: `primary_node` (required), `direction?`, `peer_scope?`, `force?`.
+Form field: `winner_node_id`. Backs up every other member's current file to a
+sibling `<path>.retrosync-conflict-<ts>` (nanosecond timestamp), then fans the
+winner out, marks the sync synced, and clears the conflict. The single most
+destructive action; auth is checked **first**:
 
-- `direction` selects the first-sync source: `from-primary` (default — "use the
-  primary's save") or `from-peer-<node_id>`.
-- `peer_scope` defaults to `all-configured` (every node with a path mapping for the
-  game); may be a csv of node ids to narrow.
-- `force` overrides an existing binding. Without it, an already-bound game →
-  **`409`**, rendered as the force-takeover modal fragment (re-POSTs with
-  `force=true`).
-- Missing `primary_node` → `400`. Node not found → `404`. Not owner → `403`.
+- Unknown sync → `409` ("no such sync to resolve" — does not leak existence).
+- Caller owns no member node (and is not admin) → `403`. Empty `winner_node_id`
+  → `400`.
+- Engine `ErrNotConflicted` → `409` (already resolved); winner not a member
+  (`ErrNoPath`) → `400`; winner has no save (`ErrSourceMissing`) → `422`.
 
-### `GET /games/{id}/activate`
+### `GET /syncs/{id}/conflict`
 
-Read-only HTML fragment: the activation "use my save" modal. No CSRF (no state
-change). Unknown game → `404`.
-
-### `POST /api/games/{id}/deactivate`
-
-No body. **Idempotent** — deactivating an idle game is a no-op (`200`), not an
-error. If a binding exists, the caller must own its primary node (else `403`).
-
-### `POST /api/games/{id}/resolve-conflict`
-
-Form field: `winner_node_id`. Backs up every other in-scope node's current file to
-a sibling `<path>.retrosync-conflict-<ts>` (nanosecond timestamp), then fans the
-winner out and clears the conflict. The single most destructive action; auth is
-checked **first**:
-
-- No active session → `409` ("no active session to resolve").
-- Not owner → `403`. Empty `winner_node_id` → `400`.
-- Engine `ErrNotConflicted` → `409`; winner not in scope (`ErrNoPath`) → `400`;
-  winner has no save (`ErrSourceMissing`) → `422`.
-
-### `GET /games/{id}/conflict`
-
-Read-only HTML fragment: the conflict modal, showing every in-scope node's live
-state (mtime, size, presence) so the human can pick a winner. Viewable by any
-authenticated user (not owner-gated — viewing is not mutating). Unknown game →
+Read-only HTML fragment: the conflict modal, showing every member's live state
+(mtime, size, presence) so the human can pick a winner. Viewable by any
+authenticated user (not owner-gated — viewing is not mutating). Unknown sync →
 `404`.
 
 ## Registry — Nodes (admin-only)
@@ -112,7 +95,9 @@ otherwise same mapping as create.
 
 ### `POST /api/nodes/{id}/delete`
 
-Delete. Unknown node → `404`; node in use by an active session (FK guard) → `409`.
+Delete. Unknown node → `404`. Under auto-mirror a node delete simply cascades its
+`sync_members` + `manifest` rows (a removed member just stops mirroring); there is
+no active-session FK to block it.
 
 ### `POST /api/nodes/{id}/smoke-test`
 
@@ -141,15 +126,16 @@ Edit (path id authoritative). Unknown game → `404`, else same mapping as creat
 ### `POST /api/games/{id}/delete`
 
 Delete. The game's `syncs` (and their `sync_members` / `manifest` / `sync_log`)
-cascade; only an active binding on any of those syncs blocks it → `409` ("being
-played right now"). Unknown game → `404`.
+cascade; a **conflicted** sync on the game blocks it → `409` ("a sync of this game
+is in conflict — resolve it first"), so an unresolved fork is never silently
+discarded. Unknown game → `404`.
 
 ## Registry — Syncs (admin-only)
 
 A *sync* is the unit of mirroring: a set of `(node, save-file path)` members that
 sync together. A game may have many independent syncs. These routes edit the
-registry (distinct from the play-side `/api/syncs/{id}/activate|deactivate|
-resolve-conflict` routes, which drive the engine and are owner/admin-gated).
+registry (distinct from the play-side `/api/syncs/{id}/resolve-conflict` route,
+which drives the engine and is member-owner/admin-gated).
 
 ### `POST /api/syncs`
 
@@ -165,9 +151,9 @@ name → `400`; unknown sync → `404`.
 
 ### `POST /api/syncs/{id}/delete`
 
-Delete. Refused with `409` if the sync has an active binding (don't tear down a
-live session; checked against the binding before delete). Otherwise deletes;
-`sync_members` / `manifest` / `sync_log` cascade. Unknown sync → `404`.
+Delete. Refused with `409` if the sync is **conflicted** (don't silently discard
+an unresolved fork; checked against `conflict_at` before delete). Otherwise
+deletes; `sync_members` / `manifest` / `sync_log` cascade. Unknown sync → `404`.
 
 ### `POST /api/syncs/{id}/members/{node_id}`
 
@@ -181,8 +167,9 @@ path is typed by hand.
 
 ### `POST /api/syncs/{id}/members/{node_id}/delete`
 
-Remove a member. Refused with `409` if that node is the active primary of this
-sync (checked against the binding before delete). Unknown member → `404`.
+Remove a member. Under auto-mirror **any** member is removable — there is no
+active primary to protect; a removed member's file simply stops mirroring.
+Unknown member → `404`.
 
 ## Read-only JSON
 
@@ -192,8 +179,9 @@ These three emit JSON today (the seed of a future agent-facing API). Auth requir
 
 ```json
 {
-  "active": [
-    { "game_id": "...", "primary_node": "...", "since": "...", "conflict": false }
+  "syncs": [
+    { "sync_id": "sm-bob", "game_id": "super-metroid", "conflict": false,
+      "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" }
   ],
   "nodes": [
     { "id": "bob-deck", "reachable": true, "last_seen": "..." }
@@ -201,13 +189,17 @@ These three emit JSON today (the seed of a future agent-facing API). Auth requir
 }
 ```
 
+Every sync is reported (there is no "active" subset under auto-mirror).
+`conflict` is `true` when `conflict_at` is set; `last_synced` is the time of the
+last successful mirror pass (or `null`).
+
 > `reachable` / backup-health are **not yet wired to Syncthing** — they are
 > cosmetic until a status poller lands (see open-questions.md).
 
 ### `GET /api/games`
 
 List games with their syncs (JSON). Each sync carries its members (node + path +
-last-known manifest mtime) and active-binding state:
+last-known manifest mtime) and its auto-mirror `state`:
 
 ```json
 [
@@ -219,7 +211,7 @@ last-known manifest mtime) and active-binding state:
       {
         "id": "sm-bob",
         "name": "Bob's stream",
-        "active": { "primary_node": "bob-deck", "since": "...", "conflict": false },
+        "state": { "conflict": false, "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" },
         "members": [
           { "node_id": "bob-deck", "path": "sm.srm", "mtime": "2026-06-21T11:30:00Z" },
           { "node_id": "carol-deck", "path": "sm.srm", "mtime": null }
@@ -230,7 +222,8 @@ last-known manifest mtime) and active-binding state:
 ]
 ```
 
-`active` is `null` for an idle sync. Each member's `mtime` is always present
+`state.conflict` is `true` when the sync is forked; `state.last_synced` is the
+last successful mirror pass (or `null`). Each member's `mtime` is always present
 (a value or `null`).
 
 ### `GET /api/nodes`

@@ -34,17 +34,16 @@ func Run(t *testing.T, newStore Factory) {
 		{"GamesFilter", testGamesFilter},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
-		{"Bindings", testBindings},
-		{"BindingInvalidReference", testBindingInvalidReference},
-		{"BindingInvalidValue", testBindingInvalidValue},
-		{"BindingDeleteIdempotent", testBindingDeleteIdempotent},
-		{"BindingConflictFlag", testBindingConflictFlag},
+		{"ListSyncs", testListSyncs},
+		{"SyncMarkSynced", testSyncMarkSynced},
+		{"SyncConflictFlag", testSyncConflictFlag},
+		{"SyncStateSurvivesRename", testSyncStateSurvivesRename},
 		{"SyncLog", testSyncLog},
 		{"SyncLogOrderByTS", testSyncLogOrderByTS},
 		{"SyncLogInvalidValue", testSyncLogInvalidValue},
 		{"SyncLogInvalidReference", testSyncLogInvalidReference},
 		{"Manifest", testManifest},
-		{"DeleteBlockedByActiveBinding", testDeleteBlockedByActiveBinding},
+		{"DeleteGameBlockedByConflictedSync", testDeleteGameBlockedByConflictedSync},
 		{"CascadeRuntimeOnGameDelete", testCascadeRuntimeOnGameDelete},
 		{"CascadeManifestOnNodeDelete", testCascadeManifestOnNodeDelete},
 		{"Syncs", testSyncs},
@@ -382,194 +381,119 @@ func testInvalidValue(t *testing.T, s store.Store) {
 	}
 }
 
-// ---- runtime: active_bindings ----
+// ---- runtime: per-sync state (conflict_at / last_synced) ----
 
-func testBindings(t *testing.T, s store.Store) {
+func testListSyncs(t *testing.T, s store.Store) {
 	c := ctx()
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	mustNode(t, s, "mister", nil)
-
-	b := store.ActiveBinding{
-		SyncID:      "sm-bob",
-		PrimaryNode: "bob-deck",
-		Direction:   "from-primary",
-	}
-	if err := s.CreateBinding(c, b); err != nil {
-		t.Fatalf("CreateBinding: %v", err)
-	}
-	// Duplicate sync_id -> conflict (one active session per sync invariant).
-	if err := s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "mister", Direction: "from-primary",
-	}); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("duplicate CreateBinding: want ErrConflict, got %v", err)
-	}
-
-	got, err := s.GetBinding(c, "sm-bob")
-	if err != nil {
-		t.Fatalf("GetBinding: %v", err)
-	}
-	if got.SyncID != "sm-bob" || got.PrimaryNode != "bob-deck" ||
-		got.Direction != "from-primary" {
-		t.Fatalf("GetBinding mismatch: %+v", got)
-	}
-	// started_at defaulted to a real time.
-	if got.StartedAt.IsZero() {
-		t.Fatalf("StartedAt is zero, want a default now()")
-	}
-	if got.ConflictAt != nil || got.LastSynced != nil {
-		t.Fatalf("new binding should have nil conflict_at/last_synced: %+v", got)
-	}
-
-	if _, err := s.GetBinding(c, "nope"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("GetBinding(missing): want ErrNotFound, got %v", err)
-	}
-
-	// A peer-direction binding for a second sync.
+	// ListSyncs returns ALL syncs across games, ordered by id. The daemon sweeps
+	// every one (there is no "active" subset under auto-mirror).
 	mustSync(t, s, "z-1", "zelda")
-	if err := s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "z-1", PrimaryNode: "mister", Direction: "from-peer-bob-deck",
-	}); err != nil {
-		t.Fatalf("CreateBinding(peer direction): %v", err)
-	}
-	list, err := s.ListBindings(c)
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustSync(t, s, "sm-alice", "super-metroid")
+
+	list, err := s.ListSyncs(c)
 	if err != nil {
-		t.Fatalf("ListBindings: %v", err)
+		t.Fatalf("ListSyncs: %v", err)
 	}
-	if len(list) != 2 {
-		t.Fatalf("ListBindings len = %d, want 2", len(list))
+	if len(list) != 3 {
+		t.Fatalf("ListSyncs len = %d, want 3", len(list))
 	}
-	if list[0].SyncID != "sm-bob" || list[1].SyncID != "z-1" {
-		t.Fatalf("ListBindings not ordered by sync_id: %+v", list)
+	if list[0].ID != "sm-alice" || list[1].ID != "sm-bob" || list[2].ID != "z-1" {
+		t.Fatalf("ListSyncs not ordered by id: %+v", list)
 	}
+	// A freshly-created sync has no runtime state.
+	for _, sy := range list {
+		if sy.ConflictAt != nil || sy.LastSynced != nil {
+			t.Fatalf("new sync %q should have nil conflict_at/last_synced: %+v", sy.ID, sy)
+		}
+	}
+}
 
-	// Update mutable fields.
+func testSyncMarkSynced(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+
 	synced := time.Date(2026, 6, 21, 14, 0, 0, 0, time.UTC)
-	got.PrimaryNode = "mister"
-	got.Direction = "from-peer-mister"
-	got.LastSynced = &synced
-	if err := s.UpdateBinding(c, got); err != nil {
-		t.Fatalf("UpdateBinding: %v", err)
+	if err := s.MarkSyncSynced(c, "sm-bob", synced); err != nil {
+		t.Fatalf("MarkSyncSynced: %v", err)
 	}
-	reread, _ := s.GetBinding(c, "sm-bob")
-	if reread.PrimaryNode != "mister" || reread.Direction != "from-peer-mister" {
-		t.Fatalf("UpdateBinding not applied: %+v", reread)
+	got, _ := s.GetSync(c, "sm-bob")
+	if got.LastSynced == nil || !got.LastSynced.Equal(synced) {
+		t.Fatalf("last_synced = %v, want %v", got.LastSynced, synced)
 	}
-	if reread.LastSynced == nil || !reread.LastSynced.Equal(synced) {
-		t.Fatalf("UpdateBinding last_synced = %v, want %v", reread.LastSynced, synced)
+	// MarkSyncSynced does not touch conflict_at.
+	if got.ConflictAt != nil {
+		t.Fatalf("MarkSyncSynced should not set conflict_at: %+v", got)
 	}
 
-	// Update missing -> not found.
-	if err := s.UpdateBinding(c, store.ActiveBinding{
-		SyncID: "ghost", PrimaryNode: "mister", Direction: "from-primary",
-	}); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("UpdateBinding(missing): want ErrNotFound, got %v", err)
-	}
-
-	// Delete returns the sync to idle.
-	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
-		t.Fatalf("DeleteBinding: %v", err)
-	}
-	if _, err := s.GetBinding(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("after DeleteBinding: want ErrNotFound, got %v", err)
+	// Missing sync -> ErrNotFound.
+	if err := s.MarkSyncSynced(c, "ghost", synced); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("MarkSyncSynced(missing): want ErrNotFound, got %v", err)
 	}
 }
 
-func testBindingInvalidReference(t *testing.T, s store.Store) {
+func testSyncConflictFlag(t *testing.T, s store.Store) {
 	c := ctx()
 	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
 
-	// Missing sync.
-	if err := s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "ghost-sync", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("CreateBinding(missing sync): want ErrInvalidReference, got %v", err)
-	}
-	// Missing node.
-	if err := s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "ghost-node", Direction: "from-primary",
-	}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("CreateBinding(missing node): want ErrInvalidReference, got %v", err)
-	}
-}
-
-func testBindingInvalidValue(t *testing.T, s store.Store) {
-	c := ctx()
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-
-	// Bad direction (neither from-primary nor from-peer-*).
-	if err := s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "newer-wins",
-	}); !errors.Is(err, store.ErrInvalidValue) {
-		t.Fatalf("CreateBinding(bad direction): want ErrInvalidValue, got %v", err)
+	got, _ := s.GetSync(c, "sm-bob")
+	if got.ConflictAt != nil {
+		t.Fatalf("new sync conflict_at = %v, want nil", got.ConflictAt)
 	}
 
-	// A valid binding, then an update to a bad direction.
-	must(t, s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}))
-	if err := s.UpdateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "garbage",
-	}); !errors.Is(err, store.ErrInvalidValue) {
-		t.Fatalf("UpdateBinding(bad direction): want ErrInvalidValue, got %v", err)
-	}
-}
-
-func testBindingDeleteIdempotent(t *testing.T, s store.Store) {
-	c := ctx()
-	// Deleting an absent binding is a no-op (api.md: deactivate is idempotent).
-	if err := s.DeleteBinding(c, "never-bound"); err != nil {
-		t.Fatalf("DeleteBinding(absent): want nil, got %v", err)
-	}
-
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}))
-	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
-		t.Fatalf("DeleteBinding: %v", err)
-	}
-	// Second delete is still a no-op, not ErrNotFound.
-	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
-		t.Fatalf("DeleteBinding(repeat): want nil, got %v", err)
-	}
-}
-
-func testBindingConflictFlag(t *testing.T, s store.Store) {
-	c := ctx()
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}))
-
-	b, _ := s.GetBinding(c, "sm-bob")
-	if b.ConflictAt != nil {
-		t.Fatalf("new binding conflict_at = %v, want nil", b.ConflictAt)
-	}
-
-	// Set conflict_at.
+	// Set conflict_at (a fork was detected; mirroring pauses).
 	conflictTS := time.Date(2026, 6, 21, 15, 30, 0, 0, time.UTC)
-	b.ConflictAt = &conflictTS
-	if err := s.UpdateBinding(c, b); err != nil {
-		t.Fatalf("UpdateBinding(set conflict): %v", err)
+	if err := s.SetSyncConflict(c, "sm-bob", &conflictTS); err != nil {
+		t.Fatalf("SetSyncConflict(set): %v", err)
 	}
-	got, _ := s.GetBinding(c, "sm-bob")
-	if got.ConflictAt == nil || !got.ConflictAt.Equal(conflictTS) {
-		t.Fatalf("conflict_at = %v, want %v", got.ConflictAt, conflictTS)
+	set, _ := s.GetSync(c, "sm-bob")
+	if set.ConflictAt == nil || !set.ConflictAt.Equal(conflictTS) {
+		t.Fatalf("conflict_at = %v, want %v", set.ConflictAt, conflictTS)
+	}
+
+	// Setting conflict does not touch last_synced.
+	if set.LastSynced != nil {
+		t.Fatalf("SetSyncConflict should not set last_synced: %+v", set)
 	}
 
 	// Clear conflict_at (resolution).
-	got.ConflictAt = nil
-	if err := s.UpdateBinding(c, got); err != nil {
-		t.Fatalf("UpdateBinding(clear conflict): %v", err)
+	if err := s.SetSyncConflict(c, "sm-bob", nil); err != nil {
+		t.Fatalf("SetSyncConflict(clear): %v", err)
 	}
-	cleared, _ := s.GetBinding(c, "sm-bob")
+	cleared, _ := s.GetSync(c, "sm-bob")
 	if cleared.ConflictAt != nil {
 		t.Fatalf("conflict_at after clear = %v, want nil", cleared.ConflictAt)
+	}
+
+	// Missing sync -> ErrNotFound.
+	if err := s.SetSyncConflict(c, "ghost", &conflictTS); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("SetSyncConflict(missing): want ErrNotFound, got %v", err)
+	}
+}
+
+func testSyncStateSurvivesRename(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	synced := time.Date(2026, 6, 21, 14, 0, 0, 0, time.UTC)
+	conflictTS := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
+	must(t, s.MarkSyncSynced(c, "sm-bob", synced))
+	must(t, s.SetSyncConflict(c, "sm-bob", &conflictTS))
+
+	// UpdateSync rewrites the registry fields (name) only; the runtime state
+	// (conflict_at, last_synced) must survive a rename.
+	sy, _ := s.GetSync(c, "sm-bob")
+	sy.Name = "Bob's renamed stream"
+	must(t, s.UpdateSync(c, sy))
+
+	got, _ := s.GetSync(c, "sm-bob")
+	if got.Name != "Bob's renamed stream" {
+		t.Fatalf("rename not applied: %+v", got)
+	}
+	if got.LastSynced == nil || !got.LastSynced.Equal(synced) {
+		t.Fatalf("UpdateSync clobbered last_synced: %v, want %v", got.LastSynced, synced)
+	}
+	if got.ConflictAt == nil || !got.ConflictAt.Equal(conflictTS) {
+		t.Fatalf("UpdateSync clobbered conflict_at: %v, want %v", got.ConflictAt, conflictTS)
 	}
 }
 
@@ -794,43 +718,39 @@ func testManifest(t *testing.T, s store.Store) {
 
 // ---- runtime: cross-cutting delete behavior ----
 
-// testDeleteBlockedByActiveBinding asserts both impls refuse to delete a game
-// or node that is referenced by an active binding (api.md "delete forbidden if
-// active"; the active_bindings NO-ACTION FKs in Postgres, an explicit check in
-// memory).
-func testDeleteBlockedByActiveBinding(t *testing.T, s store.Store) {
+// testDeleteGameBlockedByConflictedSync asserts both impls refuse to delete a
+// game while any of its syncs is CONFLICTED (paused awaiting human resolution).
+// Deleting it would cascade the syncs away and silently discard the unresolved
+// fork. A non-conflicted game deletes freely. (Under auto-mirror there is no
+// "active session" to block on — only an unresolved conflict.)
+func testDeleteGameBlockedByConflictedSync(t *testing.T, s store.Store) {
 	c := ctx()
 	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "a"}))
-	must(t, s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}))
 
-	// A game with an active sync may not be deleted: the FK graph would cascade
-	// the live binding away. Surfaced as ErrConflict (the explicit guard).
+	// Flag the sync as conflicted.
+	conflictTS := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
+	must(t, s.SetSyncConflict(c, "sm-bob", &conflictTS))
+
+	// A game with a conflicted sync may not be deleted: ErrConflict (the guard).
 	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("DeleteGame(active): want ErrConflict, got %v", err)
-	}
-	// A node that is the active primary may not be deleted (active_bindings
-	// .primary_node NO-ACTION FK -> ErrInvalidReference).
-	if err := s.DeleteNode(c, "bob-deck"); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("DeleteNode(active primary): want ErrInvalidReference, got %v", err)
+		t.Fatalf("DeleteGame(conflicted sync): want ErrConflict, got %v", err)
 	}
 
-	// After deactivation, both deletes succeed.
-	must(t, s.DeleteBinding(c, "sm-bob"))
-	if err := s.DeleteNode(c, "bob-deck"); err != nil {
-		t.Fatalf("DeleteNode after unbind: %v", err)
-	}
+	// After the conflict is resolved (cleared), the delete succeeds and cascades.
+	must(t, s.SetSyncConflict(c, "sm-bob", nil))
 	if err := s.DeleteGame(c, "super-metroid"); err != nil {
-		t.Fatalf("DeleteGame after unbind: %v", err)
+		t.Fatalf("DeleteGame after conflict cleared: %v", err)
+	}
+	if _, err := s.GetSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sync after game delete: want ErrNotFound, got %v", err)
 	}
 }
 
 // testCascadeRuntimeOnGameDelete asserts manifest and sync_log rows cascade
-// when a game with no active binding is deleted: the game's syncs cascade, and
-// each sync's manifest/sync_log cascade in turn.
+// when a non-conflicted game is deleted: the game's syncs cascade, and each
+// sync's manifest/sync_log cascade in turn.
 func testCascadeRuntimeOnGameDelete(t *testing.T, s store.Store) {
 	c := ctx()
 	mustSync(t, s, "sm-bob", "super-metroid")
@@ -1146,25 +1066,25 @@ func testSyncMembersByNode(t *testing.T, s store.Store) {
 	}
 }
 
-// testRuntimeCascadesOnSyncDelete asserts the new FK behavior: deleting a sync
-// cascades its active_binding, manifest, and sync_log rows (all REFERENCE syncs
-// ON DELETE CASCADE). Unlike DeleteGame, DeleteSync does NOT refuse an active
-// sync — the binding simply cascades away with it.
+// testRuntimeCascadesOnSyncDelete asserts the FK behavior: deleting a sync
+// cascades its manifest and sync_log rows (both REFERENCE syncs ON DELETE
+// CASCADE). The sync's own runtime state (conflict_at, last_synced) lives on the
+// sync row, so it goes with the delete. DeleteSync does NOT refuse a conflicted
+// sync — it intentionally discards the unresolved fork.
 func testRuntimeCascadesOnSyncDelete(t *testing.T, s store.Store) {
 	c := ctx()
 	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateBinding(c, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}))
+	conflictTS := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
+	must(t, s.SetSyncConflict(c, "sm-bob", &conflictTS))
 	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck"}))
 	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", Outcome: store.OutcomeOK}))
 
 	if err := s.DeleteSync(c, "sm-bob"); err != nil {
-		t.Fatalf("DeleteSync(active): want nil (binding cascades), got %v", err)
+		t.Fatalf("DeleteSync(conflicted): want nil (discards fork), got %v", err)
 	}
-	if _, err := s.GetBinding(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("binding after sync delete: want ErrNotFound (cascade), got %v", err)
+	if _, err := s.GetSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sync after delete: want ErrNotFound, got %v", err)
 	}
 	if man, _ := s.ListManifestBySync(c, "sm-bob"); len(man) != 0 {
 		t.Fatalf("manifest after sync delete = %d, want 0 (cascade)", len(man))
@@ -1172,7 +1092,7 @@ func testRuntimeCascadesOnSyncDelete(t *testing.T, s store.Store) {
 	if logs, _ := s.ListLogBySync(c, "sm-bob", 0); len(logs) != 0 {
 		t.Fatalf("sync_log after sync delete = %d, want 0 (cascade)", len(logs))
 	}
-	// The node, freed of its active-primary binding, is now deletable.
+	// The node, freed of its member, is now deletable.
 	if err := s.DeleteNode(c, "bob-deck"); err != nil {
 		t.Fatalf("DeleteNode after sync delete: %v", err)
 	}
@@ -1205,19 +1125,6 @@ func mustSync(t *testing.T, s store.Store, syncID, gameID string) {
 		t.Fatalf("setup game %q: %v", gameID, err)
 	}
 	must(t, s.CreateSync(ctx(), store.Sync{ID: syncID, GameID: gameID}))
-}
-
-// mustMember adds a (node, path) member to a sync (creating the node, tolerating
-// one already present), the sync-scoped equivalent of a game_path.
-func mustMember(t *testing.T, s store.Store, syncID, nodeID, path string) {
-	t.Helper()
-	if err := s.CreateNode(ctx(), store.Node{
-		ID: nodeID, Display: nodeID, Kind: store.KindGeneric, Reach: store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "ref"},
-	}); err != nil && !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("setup node %q: %v", nodeID, err)
-	}
-	must(t, s.SetSyncMember(ctx(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path}))
 }
 
 func mustNode(t *testing.T, s store.Store, id string, owner *string) {

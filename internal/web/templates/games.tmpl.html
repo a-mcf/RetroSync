@@ -159,7 +159,7 @@
   <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
   <div class="sub">
     system: {{.System}}
-    {{if .Active}}&nbsp;|&nbsp; <span class="badge ok">playing on {{.Active}}</span>{{end}}
+    {{if .Conflicted}}&nbsp;|&nbsp; <span class="badge bad">a sync is in conflict</span>{{end}}
   </div>
   {{if .Notes}}<div class="sub">{{.Notes}}</div>{{end}}
 
@@ -195,7 +195,7 @@
           <div class="sync-block" id="sync-{{.ID}}">
             <div class="sync-head">
               <strong>{{.Name}}</strong> <span class="sub">{{.ID}}</span>
-              {{if .ActivePrimary}} <span class="badge ok">active on {{.ActivePrimary}}</span>{{end}}
+              {{if .Conflict}} <span class="badge bad">conflict</span>{{end}}
             </div>
 
             <div class="members">
@@ -205,7 +205,7 @@
               {{else}}
                 {{range .Members}}
                   <div class="member-row">
-                    <span class="member-node">{{.NodeID}}{{if .IsPrimary}} <span class="badge ok">primary</span>{{end}}</span>
+                    <span class="member-node">{{.NodeID}}</span>
                     <form class="member-set" hx-post="/api/syncs/{{$syncID}}/members/{{.NodeID}}"
                           hx-target="#games-list" hx-swap="outerHTML">
                       <input type="hidden" name="csrf_token" value="{{$csrf}}">

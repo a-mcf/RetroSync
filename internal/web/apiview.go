@@ -14,17 +14,20 @@ import (
 // the persistence layer. Times are RFC3339 strings (or null) for a clean,
 // machine-readable contract.
 
-// statusResponse is the body of GET /api/status.
+// statusResponse is the body of GET /api/status. Under auto-mirror there is no
+// "active session": every sync mirrors. The `syncs` array reports each sync's
+// runtime state (conflicted, last_synced) so a client can see what is paused.
 type statusResponse struct {
-	Active []statusActive `json:"active"`
-	Nodes  []statusNode   `json:"nodes"`
+	Syncs []statusSync `json:"syncs"`
+	Nodes []statusNode `json:"nodes"`
 }
 
-type statusActive struct {
-	SyncID      string `json:"sync_id"`
-	PrimaryNode string `json:"primary_node"`
-	Since       string `json:"since"`
-	Conflict    bool   `json:"conflict"`
+type statusSync struct {
+	SyncID     string  `json:"sync_id"`
+	GameID     string  `json:"game_id"`
+	Conflict   bool    `json:"conflict"`
+	ConflictAt *string `json:"conflict_at"`
+	LastSynced *string `json:"last_synced"`
 }
 
 type statusNode struct {
@@ -34,9 +37,9 @@ type statusNode struct {
 }
 
 func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
-	bindings, err := s.store.ListBindings(ctx)
+	syncs, err := s.store.ListSyncs(ctx)
 	if err != nil {
-		return statusResponse{}, fmt.Errorf("list bindings: %w", err)
+		return statusResponse{}, fmt.Errorf("list syncs: %w", err)
 	}
 	nodes, err := s.store.ListNodes(ctx)
 	if err != nil {
@@ -44,15 +47,16 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	}
 
 	out := statusResponse{
-		Active: make([]statusActive, 0, len(bindings)),
-		Nodes:  make([]statusNode, 0, len(nodes)),
+		Syncs: make([]statusSync, 0, len(syncs)),
+		Nodes: make([]statusNode, 0, len(nodes)),
 	}
-	for _, b := range bindings {
-		out.Active = append(out.Active, statusActive{
-			SyncID:      b.SyncID,
-			PrimaryNode: b.PrimaryNode,
-			Since:       b.StartedAt.UTC().Format(time.RFC3339),
-			Conflict:    b.ConflictAt != nil,
+	for _, sy := range syncs {
+		out.Syncs = append(out.Syncs, statusSync{
+			SyncID:     sy.ID,
+			GameID:     sy.GameID,
+			Conflict:   sy.ConflictAt != nil,
+			ConflictAt: rfc3339Ptr(sy.ConflictAt),
+			LastSynced: rfc3339Ptr(sy.LastSynced),
 		})
 	}
 	for _, n := range nodes {
@@ -67,8 +71,8 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 
 // gameResponse is one element of GET /api/games. With syncs now first-class,
 // each game lists its syncs (id, name, members with node + path + last-known
-// manifest mtime, and active-binding state) — the registry view re-pointed onto
-// syncs (slice 16).
+// manifest mtime, and auto-mirror runtime state) — the registry view re-pointed
+// onto syncs (slice 16).
 type gameResponse struct {
 	ID      string         `json:"id"`
 	Display string         `json:"display"`
@@ -76,19 +80,20 @@ type gameResponse struct {
 	Syncs   []syncResponse `json:"syncs"`
 }
 
-// syncResponse is one sync of a game. Active is non-null when the sync has a live
-// binding (a play session in progress).
+// syncResponse is one sync of a game, with its auto-mirror runtime state.
 type syncResponse struct {
 	ID      string             `json:"id"`
 	Name    string             `json:"name"`
-	Active  *gameActive        `json:"active"`
+	State   syncState          `json:"state"`
 	Members []syncMemberOutput `json:"members"`
 }
 
-type gameActive struct {
-	PrimaryNode string `json:"primary_node"`
-	Since       string `json:"since"`
-	Conflict    bool   `json:"conflict"`
+// syncState is a sync's auto-mirror runtime state: whether it is paused on a
+// conflict, and when it last successfully synced.
+type syncState struct {
+	Conflict   bool    `json:"conflict"`
+	ConflictAt *string `json:"conflict_at"`
+	LastSynced *string `json:"last_synced"`
 }
 
 // syncMemberOutput is one member of a sync: its node, the save-file path, and
@@ -115,16 +120,14 @@ func (s *Server) buildGames(ctx context.Context, f store.GameFilter) ([]gameResp
 		}
 		gr.Syncs = make([]syncResponse, 0, len(syncs))
 		for _, sy := range syncs {
-			sr := syncResponse{ID: sy.ID, Name: sy.Name}
-
-			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
-				sr.Active = &gameActive{
-					PrimaryNode: b.PrimaryNode,
-					Since:       b.StartedAt.UTC().Format(time.RFC3339),
-					Conflict:    b.ConflictAt != nil,
-				}
-			} else if !errors.Is(err, store.ErrNotFound) {
-				return nil, fmt.Errorf("get binding %s: %w", sy.ID, err)
+			sr := syncResponse{
+				ID:   sy.ID,
+				Name: sy.Name,
+				State: syncState{
+					Conflict:   sy.ConflictAt != nil,
+					ConflictAt: rfc3339Ptr(sy.ConflictAt),
+					LastSynced: rfc3339Ptr(sy.LastSynced),
+				},
 			}
 
 			members, err := s.store.ListSyncMembers(ctx, sy.ID)

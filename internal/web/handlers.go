@@ -22,7 +22,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // HTML routes redirect to /login (303); /api/* routes get a 401 JSON error.
 //
 // Note: requireAuth itself does not check CSRF. GET routes behind it are safe
-// (read-only). The mutating action POSTs (/api/games/{id}/activate|deactivate)
+// (read-only). The mutating action POSTs (e.g. /api/syncs/{id}/resolve-conflict)
 // are additionally wrapped in requireCSRF (synchronizer-token check). The
 // /login and /logout POSTs are mounted OUTSIDE this middleware and rely on
 // SameSite=Lax for baseline CSRF protection.

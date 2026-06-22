@@ -46,7 +46,8 @@ func newTestServer(t *testing.T) *Server {
 	if err := st.CreateGame(ctx, store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes"}); err != nil {
 		t.Fatalf("create game: %v", err)
 	}
-	// The sync (the PLAY + registry unit): member + manifest + active binding on bob-deck.
+	// The sync (the mirror + registry unit): member + manifest on bob-deck, and a
+	// last_synced timestamp (it has mirrored at least once) — but NOT conflicted.
 	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}); err != nil {
 		t.Fatalf("create sync: %v", err)
 	}
@@ -57,12 +58,8 @@ func newTestServer(t *testing.T) *Server {
 	if err := st.SetManifest(ctx, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck", Mtime: &mtime}); err != nil {
 		t.Fatalf("set manifest: %v", err)
 	}
-	if err := st.CreateBinding(ctx, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck",
-		StartedAt: time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC),
-		Direction: "from-primary",
-	}); err != nil {
-		t.Fatalf("create binding: %v", err)
+	if err := st.MarkSyncSynced(ctx, "sm-bob", time.Date(2026, 6, 21, 11, 30, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("mark synced: %v", err)
 	}
 
 	srv, err := New(st, Options{})
@@ -239,15 +236,18 @@ func TestAPIStatusShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v\nbody: %s", err, rec.Body.String())
 	}
-	if len(got.Active) != 1 {
-		t.Fatalf("active len = %d, want 1", len(got.Active))
+	if len(got.Syncs) != 1 {
+		t.Fatalf("syncs len = %d, want 1", len(got.Syncs))
 	}
-	a := got.Active[0]
-	if a.SyncID != "sm-bob" || a.PrimaryNode != "bob-deck" || a.Conflict {
-		t.Errorf("active[0] = %+v, unexpected", a)
+	a := got.Syncs[0]
+	if a.SyncID != "sm-bob" || a.GameID != "super-metroid" || a.Conflict {
+		t.Errorf("syncs[0] = %+v, unexpected", a)
 	}
-	if a.Since == "" {
-		t.Error("active[0].since empty")
+	if a.LastSynced == nil {
+		t.Error("syncs[0].last_synced should be set (the sync has mirrored)")
+	}
+	if a.ConflictAt != nil {
+		t.Error("syncs[0].conflict_at should be null (not conflicted)")
 	}
 	if len(got.Nodes) != 1 {
 		t.Fatalf("nodes len = %d, want 1", len(got.Nodes))
@@ -305,8 +305,11 @@ func TestAPIGamesSyncsShape(t *testing.T) {
 	if sy.ID != "sm-bob" || sy.Name != "Bob's stream" {
 		t.Errorf("sync = %+v, unexpected", sy)
 	}
-	if sy.Active == nil || sy.Active.PrimaryNode != "bob-deck" || sy.Active.Conflict {
-		t.Errorf("sync.active = %+v, want active on bob-deck, no conflict", sy.Active)
+	if sy.State.Conflict || sy.State.ConflictAt != nil {
+		t.Errorf("sync.state = %+v, want not conflicted", sy.State)
+	}
+	if sy.State.LastSynced == nil {
+		t.Errorf("sync.state.last_synced should be set (the sync has mirrored)")
 	}
 	if len(sy.Members) != 2 {
 		t.Fatalf("members len = %d, want 2", len(sy.Members))
