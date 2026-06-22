@@ -1,17 +1,18 @@
 // Package daemon drives the engine on a timer: it is the background ticker the
-// engine deliberately does not own (see internal/engine, TODO(slice-daemon)).
+// engine deliberately does not own.
 //
-// Every interval the daemon runs a "sweep": it lists the active bindings and
-// calls Poll once per bound sync. Errors are isolated per sync — one sync's
-// failed poll (or a surfaced conflict) is logged and never aborts the sweep or
-// crashes the loop, since the loop is the only thing keeping every OTHER sync
-// syncing. The sweep is idempotent (the engine re-stats and resumes), so a
-// crash/restart simply picks up on the next tick (docs/state-machine.md,
-// "Crash safety").
+// Every interval the daemon runs a "sweep": it lists EVERY sync and calls Poll
+// once per sync. Under the auto-mirror model there is no "active" subset — every
+// sync mirrors automatically, so the daemon sweeps them all. Errors are isolated
+// per sync — one sync's failed poll (or a surfaced conflict) is logged and never
+// aborts the sweep or crashes the loop, since the loop is the only thing keeping
+// every OTHER sync syncing. The sweep is idempotent (the engine re-stats and
+// resumes), so a crash/restart simply picks up on the next tick
+// (docs/state-machine.md, "Crash safety").
 //
-// The daemon depends on narrow interfaces (Poller, BindingLister), not the
-// concrete *engine.Engine or *store.Store, so its logic is trivially testable
-// with stubs and the tick source is injectable for deterministic tests.
+// The daemon depends on narrow interfaces (Poller, SyncLister), not the concrete
+// *engine.Engine or *store.Store, so its logic is trivially testable with stubs
+// and the tick source is injectable for deterministic tests.
 package daemon
 
 import (
@@ -28,18 +29,18 @@ import (
 // the serial sweep forever. Overridable via New's pollTimeout argument.
 const defaultPollTimeout = 60 * time.Second
 
-// Poller runs one sync pass for a single sync. *engine.Engine satisfies this
-// via its Poll method. A conflict is not an error here: the engine flags the
-// binding and returns nil; the daemon keeps sweeping. The id passed is the
-// active binding's sync id.
+// Poller runs one auto-mirror pass for a single sync. *engine.Engine satisfies
+// this via its Poll method. A conflict is not an error here: the engine flags
+// the sync (conflict_at) and returns nil; the daemon keeps sweeping.
 type Poller interface {
 	Poll(ctx context.Context, syncID string) error
 }
 
-// BindingLister enumerates the active bindings (the syncs to poll). store.Store
-// satisfies this via ListBindings.
-type BindingLister interface {
-	ListBindings(ctx context.Context) ([]store.ActiveBinding, error)
+// SyncLister enumerates every sync to poll. store.Store satisfies this via
+// ListSyncs. (Under auto-mirror the daemon sweeps ALL syncs each tick — there is
+// no "active" subset.)
+type SyncLister interface {
+	ListSyncs(ctx context.Context) ([]store.Sync, error)
 }
 
 // Ticker is the minimal slice of time.Ticker the daemon uses. Injecting it
@@ -55,9 +56,9 @@ type Ticker interface {
 // realTicker (a thin time.Ticker wrapper); tests inject a fake.
 type NewTicker func(interval time.Duration) Ticker
 
-// Daemon polls every active binding on a fixed interval. Construct with New.
+// Daemon polls every sync on a fixed interval. Construct with New.
 type Daemon struct {
-	lister      BindingLister
+	lister      SyncLister
 	poller      Poller
 	interval    time.Duration
 	pollTimeout time.Duration
@@ -67,9 +68,9 @@ type Daemon struct {
 
 // New builds a Daemon. A nil logger discards output (slog.New of a discard
 // handler) so callers and tests need not supply one. interval must be > 0 for
-// Run; RunOnce ignores it. pollTimeout bounds each individual game's Poll; a
+// Run; RunOnce ignores it. pollTimeout bounds each individual sync's Poll; a
 // value <= 0 falls back to defaultPollTimeout.
-func New(lister BindingLister, poller Poller, interval, pollTimeout time.Duration, logger *slog.Logger) *Daemon {
+func New(lister SyncLister, poller Poller, interval, pollTimeout time.Duration, logger *slog.Logger) *Daemon {
 	if logger == nil {
 		logger = slog.New(discardHandler{})
 	}
@@ -88,53 +89,53 @@ func New(lister BindingLister, poller Poller, interval, pollTimeout time.Duratio
 
 // SweepResult summarizes one sweep, for tests and structured logging.
 type SweepResult struct {
-	// Polled is the number of bindings for which Poll was attempted.
+	// Polled is the number of syncs for which Poll was attempted.
 	Polled int
-	// Errors is the number of bindings whose Poll returned an error.
+	// Errors is the number of syncs whose Poll returned an error.
 	Errors int
 }
 
-// RunOnce performs one sweep: list the active bindings and Poll each exactly
-// once. Errors are isolated per sync (logged, counted, not propagated) so a
-// single bad sync never aborts the sweep. ctx cancellation is honored between
-// syncs. A failure to LIST the bindings is the one error returned, since
-// without the list there is nothing to sweep.
+// RunOnce performs one sweep: list every sync and Poll each exactly once.
+// Errors are isolated per sync (logged, counted, not propagated) so a single
+// bad sync never aborts the sweep. ctx cancellation is honored between syncs. A
+// failure to LIST the syncs is the one error returned, since without the list
+// there is nothing to sweep.
 func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 	// If the ctx is already cancelled (e.g. shutdown raced the tick), don't even
-	// issue the ListBindings query.
+	// issue the ListSyncs query.
 	if ctx.Err() != nil {
 		return SweepResult{}, nil
 	}
 
-	bindings, err := d.lister.ListBindings(ctx)
+	syncs, err := d.lister.ListSyncs(ctx)
 	if err != nil {
-		d.logger.ErrorContext(ctx, "sweep: list bindings failed", slog.String("err", err.Error()))
+		d.logger.ErrorContext(ctx, "sweep: list syncs failed", slog.String("err", err.Error()))
 		return SweepResult{}, err
 	}
 
-	d.logger.DebugContext(ctx, "sweep start", slog.Int("active_bindings", len(bindings)))
+	d.logger.DebugContext(ctx, "sweep start", slog.Int("syncs", len(syncs)))
 
 	var res SweepResult
-	for _, b := range bindings {
+	for _, sy := range syncs {
 		// Honor cancellation between syncs so shutdown is prompt even with many
-		// active bindings.
+		// syncs.
 		if err := ctx.Err(); err != nil {
 			d.logger.InfoContext(ctx, "sweep cancelled",
-				slog.Int("polled", res.Polled), slog.Int("remaining", len(bindings)-res.Polled))
+				slog.Int("polled", res.Polled), slog.Int("remaining", len(syncs)-res.Polled))
 			return res, nil
 		}
 
 		res.Polled++
-		if err := d.pollOne(ctx, b.SyncID); err != nil {
+		if err := d.pollOne(ctx, sy.ID); err != nil {
 			// Per-sync error isolation: log and continue. A poll error (including a
 			// timeout or a recovered panic) means the next sweep will re-stat and
 			// retry; one broken sync must not stall every other sync.
 			res.Errors++
 			d.logger.ErrorContext(ctx, "poll failed",
-				slog.String("sync_id", b.SyncID), slog.String("err", err.Error()))
+				slog.String("sync_id", sy.ID), slog.String("err", err.Error()))
 			continue
 		}
-		d.logger.DebugContext(ctx, "polled", slog.String("sync_id", b.SyncID))
+		d.logger.DebugContext(ctx, "polled", slog.String("sync_id", sy.ID))
 	}
 
 	d.logger.DebugContext(ctx, "sweep done",
@@ -150,7 +151,7 @@ func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 //   - a recover() that converts any panic inside Poll (nil map, slice bounds, a
 //     future SSH-lib panic) into an ordinary error. The recovered value is kept
 //     out of any secret-bearing context: only the panic value's default format
-//     is included, never the ctx or binding internals.
+//     is included, never the ctx or sync internals.
 func (d *Daemon) pollOne(ctx context.Context, syncID string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {

@@ -234,11 +234,11 @@ func (s *Server) handleEditNode(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/nodes/{id}/delete -----------------------------------------
 
-// handleDeleteNode handles POST /api/nodes/{id}/delete. sync_members and
-// manifest rows referencing the node cascade on delete, so only an active
-// binding whose primary is this node blocks it: that comes back from the Store
-// as ErrInvalidReference (the active_bindings.primary_node FK), which we surface
-// as a friendly "node is in use" 409 rather than a 500.
+// handleDeleteNode handles POST /api/nodes/{id}/delete. Under auto-mirror a
+// node delete simply cascades: its sync_members and manifest rows go with it,
+// and a removed member's file just stops mirroring (there is no active-binding
+// FK to block it anymore). The ErrInvalidReference/ErrConflict branch is kept as
+// a defensive friendly-409 in case a future FK ever blocks a node delete.
 func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -253,10 +253,11 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "no such node", http.StatusNotFound)
 	case errors.Is(err, store.ErrInvalidReference) || errors.Is(err, store.ErrConflict):
-		// The node is the primary of an active binding (members/manifest cascade,
-		// so only an active session blocks). Friendly, non-500 message so the admin
-		// knows to stop the session first.
-		http.Error(w, "node is in use by an active session — stop it first", http.StatusConflict)
+		// Under auto-mirror a node delete cascades its sync memberships and manifest
+		// rows, so nothing normally blocks it. This branch is a defensive,
+		// friendly-409 in case a future FK ever refuses the delete (e.g. a node tied
+		// to a conflicted sync) — non-500 so the admin sees a clear message.
+		http.Error(w, "node can't be deleted right now — resolve any conflicted syncs that use it first", http.StatusConflict)
 	default:
 		s.logger.ErrorContext(r.Context(), "delete node failed", "node", id, "err", err.Error())
 		http.Error(w, "could not delete node", http.StatusInternalServerError)

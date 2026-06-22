@@ -39,15 +39,19 @@ Adding a new device kind is "register a new reach-config strategy," not "fork th
 
 Single Go (or Python) service. Owns:
 
-- The registry (games, nodes, per-node game paths).
-- The active-bindings table.
-- A poll loop that, for each active binding, compares mtime/size against the
-  manifest across all in-scope nodes and fans the changed copy out (or flags a
-  conflict). **Implemented** as `internal/daemon` driving `internal/engine`: a
-  background ticker sweeps the active bindings every `RETROSYNC_POLL_INTERVAL`
-  (default 15s), one engine pass per game, per-game error isolation, idempotent.
-- A web UI (HTMX, no SPA framework) for browsing, binding, unbinding. **Implemented**
-  (`internal/web`), server-rendered fragments, no SPA.
+- The registry (games, nodes, syncs and their members — each member a node+path).
+- The per-sync manifest (last-known mtime/size per member) and conflict state.
+- A poll loop that, for **every** sync, compares each member's live mtime/size
+  against the manifest and acts on the changed set: 0 changed is a no-op, exactly
+  1 changed is the source and fans out to the others, 2+ changed flags a conflict
+  and pauses the sync. There is no primary/take-over and no activate/deactivate —
+  every sync mirrors automatically. **Implemented** as `internal/daemon` driving
+  `internal/engine`: a background ticker sweeps every sync every
+  `RETROSYNC_POLL_INTERVAL` (default 15s), one engine pass per sync, per-sync
+  error isolation, idempotent. The only human action is resolving a conflict
+  (picking the winning member), after which the sync resumes mirroring.
+- A web UI (HTMX, no SPA framework) for browsing the registry and resolving
+  conflicts. **Implemented** (`internal/web`), server-rendered fragments, no SPA.
 - The HTTP surface the UI is built on. **Implemented as HTMX/POST routes** (HTML
   forms can't issue PATCH/PUT/DELETE); a small read-only JSON surface
   (`GET /api/{status,games,nodes}`) is the seed of a future agent-facing API. See

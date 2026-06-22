@@ -10,22 +10,18 @@ import (
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/engine"
-	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// seedConflictBinding seeds sync sm-bob as bound on primaryNode with conflict_at
-// set, so the dashboard banner and the resolve handler's authorization path have
-// a conflicted binding to act on.
-func seedConflictBinding(t *testing.T, f *actionFixture, primaryNode string) {
+// seedConflictedSync marks sync sm-bob as conflicted (conflict_at set), so the
+// dashboard banner and the resolve handler's authorization path have a
+// conflicted sync to act on. Authority under auto-mirror is owning a member node
+// (bob-deck / carol-deck are the seeded members), so the primaryNode arg of the
+// old binding-based helper is gone.
+func seedConflictedSync(t *testing.T, f *actionFixture) {
 	t.Helper()
 	conflict := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: primaryNode,
-		StartedAt:  time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC),
-		Direction:  "from-primary",
-		ConflictAt: &conflict,
-	}); err != nil {
-		t.Fatalf("seed conflict binding: %v", err)
+	if err := f.store.SetSyncConflict(context.Background(), "sm-bob", &conflict); err != nil {
+		t.Fatalf("seed conflicted sync: %v", err)
 	}
 }
 
@@ -104,9 +100,9 @@ func TestConflictModal_ViewableByNonOwner(t *testing.T) {
 
 // --- POST resolve-conflict -----------------------------------------------
 
-func TestResolveConflict_Owner_CallsActionerAndRefreshes(t *testing.T) {
+func TestResolveConflict_MemberOwner_CallsActionerAndRefreshes(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck") // owned by carol
+	seedConflictedSync(t, f) // carol owns carol-deck, a member of sm-bob
 	c, csrf := loginAs(t, f, "carol")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
@@ -129,8 +125,8 @@ func TestResolveConflict_Owner_CallsActionerAndRefreshes(t *testing.T) {
 
 func TestResolveConflict_Admin_Allowed(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck") // not bob's node
-	c, csrf := loginAs(t, f, "bob")         // admin
+	seedConflictedSync(t, f)
+	c, csrf := loginAs(t, f, "bob") // admin
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
@@ -142,12 +138,18 @@ func TestResolveConflict_Admin_Allowed(t *testing.T) {
 	}
 }
 
-// TestResolveConflict_NonOwner_403_NoActionerCall: the most destructive action
-// must be owner/admin-gated, with zero engine calls on rejection.
-func TestResolveConflict_NonOwner_403_NoActionerCall(t *testing.T) {
+// TestResolveConflict_NonMemberOwner_403_NoActionerCall: the most destructive
+// action must be member-owner/admin-gated, with zero engine calls on rejection.
+// carol owns no member of this sync (we remove carol-deck so only bob-deck, which
+// carol does not own, remains).
+func TestResolveConflict_NonMemberOwner_403_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "bob-deck") // owned by bob (admin)
-	c, csrf := loginAs(t, f, "carol")     // does not own bob-deck
+	seedConflictedSync(t, f)
+	// Remove carol's node from the sync so carol owns NO member node of it.
+	if err := f.store.DeleteSyncMember(context.Background(), "sm-bob", "carol-deck"); err != nil {
+		t.Fatalf("remove carol-deck: %v", err)
+	}
+	c, csrf := loginAs(t, f, "carol") // owns no member of sm-bob now
 
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"bob-deck"},
@@ -162,7 +164,7 @@ func TestResolveConflict_NonOwner_403_NoActionerCall(t *testing.T) {
 
 func TestResolveConflict_CSRF_NoToken_403_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	c, _ := loginAs(t, f, "carol")
 
 	rec := postForm(t, f, c, "" /* no csrf */, "/api/syncs/sm-bob/resolve-conflict", url.Values{
@@ -178,7 +180,7 @@ func TestResolveConflict_CSRF_NoToken_403_NoActionerCall(t *testing.T) {
 
 func TestResolveConflict_CSRF_WrongToken_403_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	c, _ := loginAs(t, f, "carol")
 
 	rec := postForm(t, f, c, "totally-wrong-token", "/api/syncs/sm-bob/resolve-conflict", url.Values{
@@ -196,7 +198,7 @@ func TestResolveConflict_CSRF_WrongToken_403_NoActionerCall(t *testing.T) {
 // is a 400 and never reaches the engine.
 func TestResolveConflict_EmptyWinner_400_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	c, csrf := loginAs(t, f, "carol")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
@@ -214,7 +216,7 @@ func TestResolveConflict_EmptyWinner_400_NoActionerCall(t *testing.T) {
 // 409 that still refreshes the dashboard (already resolved).
 func TestResolveConflict_NotConflicted_409Refresh(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	f.act.resolveErr = engine.ErrNotConflicted
 	c, csrf := loginAs(t, f, "carol")
 
@@ -232,7 +234,7 @@ func TestResolveConflict_NotConflicted_409Refresh(t *testing.T) {
 // TestResolveConflict_SourceMissing_422 maps engine.ErrSourceMissing to 422.
 func TestResolveConflict_SourceMissing_422(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	f.act.resolveErr = engine.ErrSourceMissing
 	c, csrf := loginAs(t, f, "carol")
 
@@ -244,20 +246,20 @@ func TestResolveConflict_SourceMissing_422(t *testing.T) {
 	}
 }
 
-// TestResolveConflict_NoBinding_409 asserts that resolving an idle game (no
-// binding) is a 409 (nothing to resolve) and never reaches the engine.
-func TestResolveConflict_NoBinding_409(t *testing.T) {
+// TestResolveConflict_NoSuchSync_409 asserts that resolving a non-existent sync
+// is a 409 (nothing to resolve) and never reaches the engine — without leaking
+// whether the sync exists.
+func TestResolveConflict_NoSuchSync_409(t *testing.T) {
 	f := newActionFixture(t)
-	// No binding seeded.
 	c, csrf := loginAs(t, f, "bob") // admin
-	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/ghost-sync/resolve-conflict", url.Values{
 		"winner_node_id": {"bob-deck"},
 	})
 	if rec.Code != http.StatusConflict {
-		t.Fatalf("idle resolve status = %d, want 409\n%s", rec.Code, rec.Body.String())
+		t.Fatalf("no-such-sync resolve status = %d, want 409\n%s", rec.Code, rec.Body.String())
 	}
 	if n := len(f.act.resolveCalls()); n != 0 {
-		t.Fatalf("actioner called %d times on idle resolve, want 0", n)
+		t.Fatalf("actioner called %d times on missing-sync resolve, want 0", n)
 	}
 }
 
@@ -267,7 +269,7 @@ func TestResolveConflict_NoBinding_409(t *testing.T) {
 // modal-open button render when conflict_at is set.
 func TestDashboard_ConflictBanner_ShownWhenConflicted(t *testing.T) {
 	f := newActionFixture(t)
-	seedConflictBinding(t, f, "carol-deck")
+	seedConflictedSync(t, f)
 	c, _ := loginAs(t, f, "carol")
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -290,13 +292,7 @@ func TestDashboard_ConflictBanner_ShownWhenConflicted(t *testing.T) {
 // clean (idle/non-conflicted) game.
 func TestDashboard_NoConflictBanner_WhenClean(t *testing.T) {
 	f := newActionFixture(t)
-	// Active but NOT conflicted.
-	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "carol-deck",
-		StartedAt: time.Now(), Direction: "from-primary",
-	}); err != nil {
-		t.Fatalf("seed clean binding: %v", err)
-	}
+	// The seeded sync is in sync (not conflicted) by default.
 	c, _ := loginAs(t, f, "carol")
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)

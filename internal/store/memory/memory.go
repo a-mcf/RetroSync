@@ -21,8 +21,6 @@ type Store struct {
 	users map[string]store.User
 	nodes map[string]store.Node
 	games map[string]store.Game
-	// bindings keyed by sync_id (the PK / one-active-session invariant).
-	bindings map[string]store.ActiveBinding
 	// manifest keyed by (sync_id, node_id).
 	manifest map[smKey]store.ManifestEntry
 	// log is the append-only sync_log, ordered by append; nextLogID assigns the
@@ -46,7 +44,6 @@ func New() *Store {
 		users:       make(map[string]store.User),
 		nodes:       make(map[string]store.Node),
 		games:       make(map[string]store.Game),
-		bindings:    make(map[string]store.ActiveBinding),
 		manifest:    make(map[smKey]store.ManifestEntry),
 		nextLogID:   1,
 		syncs:       make(map[string]store.Sync),
@@ -191,14 +188,6 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 	if _, ok := s.nodes[id]; !ok {
 		return store.ErrNotFound
 	}
-	// An active binding holds play authority on this node. The Postgres
-	// NO-ACTION FK (active_bindings.primary_node) refuses the delete with a
-	// 23503 -> ErrInvalidReference; mirror that here so both impls agree.
-	for _, b := range s.bindings {
-		if b.PrimaryNode == id {
-			return store.ErrInvalidReference
-		}
-	}
 	delete(s.nodes, id)
 	// Cascade: delete manifest rows referencing this node.
 	for k := range s.manifest {
@@ -275,23 +264,22 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 	if _, ok := s.games[id]; !ok {
 		return store.ErrNotFound
 	}
-	// A game is "active" when any of its syncs has an active binding. Deleting it
-	// would cascade through syncs into active_bindings, silently tearing down a
-	// live session. Refuse instead (brief F: delete-active-game is a friendly
-	// 409). We surface ErrConflict so both impls agree and the web layer maps it
-	// to "being played right now — stop the session first".
+	// Under auto-mirror every sync is mirroring; there is no "active session" to
+	// tear down. But a CONFLICTED sync is paused awaiting a human's resolution —
+	// deleting its game would silently discard that unresolved fork. Refuse in
+	// that case (ErrConflict -> friendly 409 "resolve the conflict first"); a
+	// non-conflicted game deletes and cascades freely.
 	for syncID, sy := range s.syncs {
 		if sy.GameID != id {
 			continue
 		}
-		if _, active := s.bindings[syncID]; active {
+		if s.syncs[syncID].ConflictAt != nil {
 			return store.ErrConflict
 		}
 	}
 	delete(s.games, id)
 	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE. Each deleted sync
-	// in turn cascades its members, manifest, sync_log, and (none, since none are
-	// active here) any binding.
+	// in turn cascades its members, manifest, and sync_log.
 	for syncID, sy := range s.syncs {
 		if sy.GameID != id {
 			continue
@@ -302,8 +290,10 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 }
 
 // deleteSyncCascade removes a sync and every row that cascades from it:
-// sync_members, manifest, sync_log, and the active binding. The caller must hold
-// s.mu. It does NOT remove the syncs entry's siblings — only the given sync.
+// sync_members, manifest, and sync_log. The caller must hold s.mu. It does NOT
+// remove the syncs entry's siblings — only the given sync. (The sync's runtime
+// state — conflict_at/last_synced — lives on the sync row itself, so it goes
+// with the delete(s.syncs, ...) above.)
 func (s *Store) deleteSyncCascade(syncID string) {
 	delete(s.syncs, syncID)
 	for k := range s.syncMembers {
@@ -323,79 +313,6 @@ func (s *Store) deleteSyncCascade(syncID string) {
 		}
 	}
 	s.log = kept
-	delete(s.bindings, syncID)
-}
-
-// ---- ActiveBindings ----
-
-func (s *Store) CreateBinding(_ context.Context, b store.ActiveBinding) error {
-	if !store.ValidDirection(b.Direction) {
-		return store.ErrInvalidValue
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.syncs[b.SyncID]; !ok {
-		return store.ErrInvalidReference
-	}
-	if _, ok := s.nodes[b.PrimaryNode]; !ok {
-		return store.ErrInvalidReference
-	}
-	if _, ok := s.bindings[b.SyncID]; ok {
-		return store.ErrConflict
-	}
-	if b.StartedAt.IsZero() {
-		b.StartedAt = time.Now().UTC()
-	}
-	s.bindings[b.SyncID] = cloneBinding(b)
-	return nil
-}
-
-func (s *Store) GetBinding(_ context.Context, syncID string) (store.ActiveBinding, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	b, ok := s.bindings[syncID]
-	if !ok {
-		return store.ActiveBinding{}, store.ErrNotFound
-	}
-	return cloneBinding(b), nil
-}
-
-func (s *Store) ListBindings(_ context.Context) ([]store.ActiveBinding, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]store.ActiveBinding, 0, len(s.bindings))
-	for _, b := range s.bindings {
-		out = append(out, cloneBinding(b))
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SyncID < out[j].SyncID })
-	return out, nil
-}
-
-func (s *Store) UpdateBinding(_ context.Context, b store.ActiveBinding) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Match Postgres: a no-match UPDATE reports ErrNotFound before the CHECK
-	// constraint can fire, so the existence check comes first.
-	if _, ok := s.bindings[b.SyncID]; !ok {
-		return store.ErrNotFound
-	}
-	if !store.ValidDirection(b.Direction) {
-		return store.ErrInvalidValue
-	}
-	if _, ok := s.nodes[b.PrimaryNode]; !ok {
-		return store.ErrInvalidReference
-	}
-	s.bindings[b.SyncID] = cloneBinding(b)
-	return nil
-}
-
-func (s *Store) DeleteBinding(_ context.Context, syncID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Idempotent: deleting an absent binding is a no-op (api.md "deactivate is
-	// idempotent"). No ErrNotFound here, unlike the other Delete* methods.
-	delete(s.bindings, syncID)
-	return nil
 }
 
 // ---- SyncLog ----
@@ -492,7 +409,11 @@ func (s *Store) CreateSync(_ context.Context, sy store.Sync) error {
 	if _, ok := s.syncs[sy.ID]; ok {
 		return store.ErrConflict
 	}
-	s.syncs[sy.ID] = sy
+	// A freshly-created sync has no runtime state yet (not conflicted, never
+	// synced), regardless of what the caller passed.
+	sy.ConflictAt = nil
+	sy.LastSynced = nil
+	s.syncs[sy.ID] = cloneSync(sy)
 	return nil
 }
 
@@ -503,7 +424,7 @@ func (s *Store) GetSync(_ context.Context, id string) (store.Sync, error) {
 	if !ok {
 		return store.Sync{}, store.ErrNotFound
 	}
-	return sy, nil
+	return cloneSync(sy), nil
 }
 
 func (s *Store) ListSyncsByGame(_ context.Context, gameID string) ([]store.Sync, error) {
@@ -512,8 +433,19 @@ func (s *Store) ListSyncsByGame(_ context.Context, gameID string) ([]store.Sync,
 	out := make([]store.Sync, 0)
 	for _, sy := range s.syncs {
 		if sy.GameID == gameID {
-			out = append(out, sy)
+			out = append(out, cloneSync(sy))
 		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (s *Store) ListSyncs(_ context.Context) ([]store.Sync, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]store.Sync, 0, len(s.syncs))
+	for _, sy := range s.syncs {
+		out = append(out, cloneSync(sy))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -524,13 +456,44 @@ func (s *Store) UpdateSync(_ context.Context, sy store.Sync) error {
 	defer s.mu.Unlock()
 	// Match Postgres: a no-match UPDATE reports ErrNotFound before the FK can
 	// fire, so the existence check comes first.
-	if _, ok := s.syncs[sy.ID]; !ok {
+	cur, ok := s.syncs[sy.ID]
+	if !ok {
 		return store.ErrNotFound
 	}
 	if _, ok := s.games[sy.GameID]; !ok {
 		return store.ErrInvalidReference
 	}
-	s.syncs[sy.ID] = sy
+	// UpdateSync rewrites the registry fields (game_id, name) only; the runtime
+	// state (conflict_at, last_synced) is owned by SetSyncConflict/MarkSyncSynced
+	// and preserved across a rename, mirroring the Postgres UPDATE column list.
+	cur.GameID = sy.GameID
+	cur.Name = sy.Name
+	s.syncs[sy.ID] = cur
+	return nil
+}
+
+func (s *Store) SetSyncConflict(_ context.Context, syncID string, at *time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sy, ok := s.syncs[syncID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	sy.ConflictAt = clonePtr(at)
+	s.syncs[syncID] = sy
+	return nil
+}
+
+func (s *Store) MarkSyncSynced(_ context.Context, syncID string, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sy, ok := s.syncs[syncID]
+	if !ok {
+		return store.ErrNotFound
+	}
+	v := t
+	sy.LastSynced = &v
+	s.syncs[syncID] = sy
 	return nil
 }
 
@@ -540,10 +503,11 @@ func (s *Store) DeleteSync(_ context.Context, id string) error {
 	if _, ok := s.syncs[id]; !ok {
 		return store.ErrNotFound
 	}
-	// Cascade: sync_members, manifest, sync_log, and the active binding all
-	// REFERENCE syncs ON DELETE CASCADE. (Unlike DeleteGame, DeleteSync does NOT
-	// refuse an active sync: a sync's binding cascades away with it, mirroring the
-	// Postgres active_bindings.sync_id ON DELETE CASCADE.)
+	// Cascade: sync_members, manifest, and sync_log all REFERENCE syncs ON DELETE
+	// CASCADE. The sync's own runtime state (conflict_at, last_synced) lives on
+	// the sync row, so it goes with the delete. DeleteSync does NOT refuse a
+	// conflicted sync — deleting it intentionally discards the unresolved fork
+	// (the web layer guards delete-game on conflict, but delete-sync is direct).
 	s.deleteSyncCascade(id)
 	return nil
 }
@@ -619,11 +583,12 @@ func (s *Store) DeleteSyncMember(_ context.Context, syncID, nodeID string) error
 	return nil
 }
 
-// cloneBinding deep-copies pointer fields so callers can't mutate stored state.
-func cloneBinding(b store.ActiveBinding) store.ActiveBinding {
-	out := b
-	out.ConflictAt = clonePtr(b.ConflictAt)
-	out.LastSynced = clonePtr(b.LastSynced)
+// cloneSync deep-copies the sync's pointer runtime fields (conflict_at,
+// last_synced) so callers can't mutate stored state through a returned value.
+func cloneSync(sy store.Sync) store.Sync {
+	out := sy
+	out.ConflictAt = clonePtr(sy.ConflictAt)
+	out.LastSynced = clonePtr(sy.LastSynced)
 	return out
 }
 

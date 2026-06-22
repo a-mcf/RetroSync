@@ -22,11 +22,12 @@ import (
 // No secrets are involved in syncs or members (a path is not a credential), but
 // we keep the same discipline: nothing sensitive is logged.
 //
-// Two delete/remove guards, both surfaced as a friendly 409 rather than a 500:
-//   - Deleting a SYNC that has an active binding is refused — tearing it down
-//     would cascade a live session away. Checked here against GetBinding(syncID).
-//   - Removing a MEMBER whose node is the active primary of the sync is refused
-//     — checked here against the sync's binding before the Store delete.
+// Auto-mirror simplified the delete/remove guards. There is no "active session"
+// to protect anymore — every sync just mirrors. The one remaining guard
+// (friendly 409): deleting a SYNC (or its game) while it is CONFLICTED is
+// refused, since that would silently discard an unresolved fork. (The store
+// enforces the game-level guard; delete-sync is checked here.) Removing a MEMBER
+// is always allowed — a removed member's file simply stops mirroring.
 //
 // Member paths can now be filled by the save-file PICKER (slice-17): the
 // "Add member" form's "Browse…" button hits GET /api/nodes/{id}/browse
@@ -52,34 +53,31 @@ type gamesPageData struct {
 }
 
 // gameAdminRow is one game in the admin list, with its syncs (each with their
-// members) and, if any sync is active, the primary node currently playing it.
+// members) and whether any of its syncs is currently in conflict.
 type gameAdminRow struct {
 	ID      string
 	Display string
 	System  string
 	Notes   string
-	// Active is non-empty (the primary node id of the first active sync) when a
-	// binding makes this game active; "" when idle.
-	Active string
-	Syncs  []syncAdminRow
+	// Conflicted is true when any of the game's syncs is paused on a conflict
+	// (so the registry can badge the game and explain why a delete is refused).
+	Conflicted bool
+	Syncs      []syncAdminRow
 }
 
-// syncAdminRow is one sync of a game, with its members and active state.
+// syncAdminRow is one sync of a game, with its members and runtime state.
 type syncAdminRow struct {
 	ID      string
 	Name    string
 	Members []syncMemberRow
-	// ActivePrimary is the node currently bound as primary for this sync, or ""
-	// if the sync is idle. Used to badge the primary member and guard removal.
-	ActivePrimary string
+	// Conflict is true when the sync is paused on a fork (conflict_at set).
+	Conflict bool
 }
 
-// syncMemberRow is one (node, path) member of a sync, plus whether that node is
-// the sync's active primary (so the Remove control can warn / be guarded).
+// syncMemberRow is one (node, path) member of a sync.
 type syncMemberRow struct {
-	NodeID    string
-	Path      string
-	IsPrimary bool
+	NodeID string
+	Path   string
 }
 
 // gameRowContext is the per-row template context: one game plus the shared
@@ -161,12 +159,9 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 			return gamesPageData{}, err
 		}
 		for _, sy := range syncs {
-			sr := syncAdminRow{ID: sy.ID, Name: sy.Name}
-			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
-				sr.ActivePrimary = b.PrimaryNode
-				row.Active = b.PrimaryNode
-			} else if !errors.Is(err, store.ErrNotFound) {
-				return gamesPageData{}, err
+			sr := syncAdminRow{ID: sy.ID, Name: sy.Name, Conflict: sy.ConflictAt != nil}
+			if sr.Conflict {
+				row.Conflicted = true
 			}
 			members, err := s.store.ListSyncMembers(ctx, sy.ID)
 			if err != nil {
@@ -174,9 +169,8 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 			}
 			for _, m := range members {
 				sr.Members = append(sr.Members, syncMemberRow{
-					NodeID:    m.NodeID,
-					Path:      m.Path,
-					IsPrimary: sr.ActivePrimary == m.NodeID,
+					NodeID: m.NodeID,
+					Path:   m.Path,
 				})
 			}
 			row.Syncs = append(row.Syncs, sr)
@@ -244,8 +238,9 @@ func (s *Server) handleEditGame(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteGame handles POST /api/games/{id}/delete. The game's syncs (and
 // their members + runtime rows) cascade — but only if NONE of those syncs is
-// active. The Store refuses to delete a game with any active sync, returning
-// ErrConflict — surfaced as a friendly 409 "being played right now".
+// in conflict. The Store refuses to delete a game with a conflicted sync,
+// returning ErrConflict — surfaced as a friendly 409 "resolve the conflict
+// first" (deleting it would silently discard an unresolved fork).
 func (s *Server) handleDeleteGame(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -260,7 +255,7 @@ func (s *Server) handleDeleteGame(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "no such game", http.StatusNotFound)
 	case errors.Is(err, store.ErrInvalidReference) || errors.Is(err, store.ErrConflict):
-		http.Error(w, "game is being played right now — stop the session first", http.StatusConflict)
+		http.Error(w, "a sync of this game is in conflict — resolve it first", http.StatusConflict)
 	default:
 		s.logger.ErrorContext(r.Context(), "delete game failed", "game", id, "err", err.Error())
 		http.Error(w, "could not delete game", http.StatusInternalServerError)
@@ -366,9 +361,10 @@ func (s *Server) handleRenameSync(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/syncs/{id}/delete -----------------------------------------
 
-// handleDeleteSync handles POST /api/syncs/{id}/delete. A sync with an active
-// binding is refused with a friendly 409 (deleting it would cascade away a live
-// session). Otherwise we delete; its members cascade. Missing sync -> 404.
+// handleDeleteSync handles POST /api/syncs/{id}/delete. A CONFLICTED sync is
+// refused with a friendly 409 (deleting it would silently discard an unresolved
+// fork — resolve it first). Otherwise we delete; its members + runtime rows
+// cascade. Missing sync -> 404.
 func (s *Server) handleDeleteSync(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -377,14 +373,16 @@ func (s *Server) handleDeleteSync(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	// Guard: refuse deleting an active sync (don't tear down a live session).
-	// NOTE: GetBinding-then-DeleteSync is a benign TOCTOU — admin-only, not driven
+	// Guard: refuse deleting a conflicted sync (don't discard an unresolved fork).
+	// NOTE: GetSync-then-DeleteSync is a benign TOCTOU — admin-only, not driven
 	// concurrently, so the window cannot be raced in practice.
-	if _, err := s.store.GetBinding(r.Context(), id); err == nil {
-		http.Error(w, "this sync is being played right now — stop the session first", http.StatusConflict)
-		return
+	if sy, err := s.store.GetSync(r.Context(), id); err == nil {
+		if sy.ConflictAt != nil {
+			http.Error(w, "this sync is in conflict — resolve it first", http.StatusConflict)
+			return
+		}
 	} else if !errors.Is(err, store.ErrNotFound) {
-		s.logger.ErrorContext(r.Context(), "delete sync: get binding failed", "sync", id, "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "delete sync: get sync failed", "sync", id, "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -446,9 +444,9 @@ func (s *Server) handleSetSyncMember(w http.ResponseWriter, r *http.Request) {
 // --- POST /api/syncs/{id}/members/{node_id}/delete (remove member) -------
 
 // handleDeleteSyncMember handles POST /api/syncs/{id}/members/{node_id}/delete.
-// Refused with a friendly 409 if that node is the active primary of this sync
-// (checked against the binding before delete). Otherwise we delete; a missing
-// member is a 404.
+// Under auto-mirror any member is removable — a removed member's file simply
+// stops mirroring (there is no "active primary" to protect). A missing member is
+// a 404.
 func (s *Server) handleDeleteSyncMember(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -457,19 +455,6 @@ func (s *Server) handleDeleteSyncMember(w http.ResponseWriter, r *http.Request) 
 	}
 	syncID := r.PathValue("id")
 	nodeID := r.PathValue("node_id")
-
-	// Guard: refuse removing the member whose node is the active primary of this
-	// sync (benign TOCTOU — admin-only, not raced in practice).
-	if b, err := s.store.GetBinding(r.Context(), syncID); err == nil {
-		if b.PrimaryNode == nodeID {
-			http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)
-			return
-		}
-	} else if !errors.Is(err, store.ErrNotFound) {
-		s.logger.ErrorContext(r.Context(), "delete member: get binding failed", "sync", syncID, "err", err.Error())
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
 
 	err := s.store.DeleteSyncMember(r.Context(), syncID, nodeID)
 	switch {

@@ -7,9 +7,9 @@
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
-    // The activate POST returns 409 with a "take over" fragment when the game is
-    // already bound to a different primary. htmx swaps only 2xx by default; allow
-    // 409 to swap (the handler sends HX-Retarget:#modal so it lands in the modal).
+    // The resolve-conflict POST returns 409 + a dashboard refresh when the sync
+    // was already resolved by someone else. htmx swaps only 2xx by default; allow
+    // 409 to swap so the now-stale banner disappears.
     document.addEventListener('htmx:beforeOnLoad', function (e) {
       if (e.detail.xhr.status === 409) {
         e.detail.shouldSwap = true;
@@ -30,7 +30,7 @@
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <!-- Modal mount: action fragments (activation / takeover) swap in here. -->
+  <!-- Modal mount: the conflict-resolution modal swaps in here. -->
   <div id="modal"></div>
   <div class="wrap" id="dashboard">
     <header class="top">
@@ -45,48 +45,11 @@
       </span>
     </header>
 
-    <!-- ACTIVE BINDINGS ------------------------------------------------ -->
-    <section>
-      <h2>Active</h2>
-      {{if not .Active}}
-        <p class="empty">Nothing is being played right now.</p>
-      {{else}}
-        {{range .Active}}
-        <div class="card">
-          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
-          <div class="sub">Bound on <strong>{{.PrimaryNode}}</strong> since {{.Since}}</div>
-          {{if .Conflict}}
-            <div class="conflict">
-              <strong>Sync paused — more than one node changed.</strong>
-              retrosync won't choose for you.
-              <button class="btn conflict-btn"
-                      hx-get="/syncs/{{.SyncID}}/conflict"
-                      hx-target="#modal" hx-swap="innerHTML">
-                Resolve conflict
-              </button>
-            </div>
-          {{end}}
-          {{if .Peers}}
-          <ul class="peers">
-            {{range .Peers}}<li>{{.NodeID}} — {{.Mtime}}</li>{{end}}
-          </ul>
-          {{end}}
-          <div class="sub">Last sync: {{.LastSync}}</div>
-          <p>
-            <form hx-post="/api/syncs/{{.SyncID}}/deactivate"
-                  hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
-              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-              <button class="btn" type="submit">Done playing</button>
-            </form>
-          </p>
-        </div>
-        {{end}}
-      {{end}}
-    </section>
-
-    <!-- MY SYNCS ------------------------------------------------------- -->
+    <!-- MY SYNCS (status) ---------------------------------------------- -->
     <section>
       <h2>My syncs</h2>
+      <p class="sub">Every sync mirrors automatically. There is nothing to start or
+         stop — this is a status view. The only action is resolving a conflict.</p>
       <!-- Client-side filter over the My-syncs cards below (by game display +
            sync name). Each card carries a data-filter string; the input hides
            non-matching cards. No round-trip — the list is already rendered. -->
@@ -98,7 +61,6 @@
         <p class="empty">No syncs map to your nodes yet.</p>
       {{else}}
         {{range .MySyncs}}
-        {{$sync := .}}
         <div class="card mysync-card" data-filter="{{.GameDisplay}} {{.SyncName}}">
           <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
           {{if .Conflict}}
@@ -111,41 +73,12 @@
                 Resolve conflict
               </button>
             </div>
+          {{else}}
+            <div class="sub"><span class="badge ok">in sync</span> &nbsp; last synced: {{.LastSync}}</div>
           {{end}}
           <ul class="node-lines">
-            {{range .Nodes}}<li>{{.NodeID}}: {{.Mtime}}</li>{{end}}
+            {{range .Nodes}}<li>{{.NodeID}}{{if .Owned}} <span class="sub">(yours)</span>{{end}}: {{.Mtime}}</li>{{end}}
           </ul>
-          <!-- One action per OWNED member node (largest tap target). A direct
-               activate POST is allowed ONLY for the non-takeover, single-source
-               case (one member, sync idle). EVERYTHING else — a multi-member sync
-               OR a takeover of a session bound elsewhere — opens the "use my save"
-               activation modal (hx-get), which lists every member's mtime BEFORE
-               binding. A takeover must NEVER be a one-click force POST: the user
-               has to see what each save holds first (docs/state-machine.md
-               "surface, don't hide"). The modal's activate POST 409s when
-               already-bound and returns the takeover fragment that carries
-               force=true, so force still happens — but only after the mtimes were
-               surfaced. -->
-          {{range .Nodes}}
-            {{if .Owned}}
-            <p>
-              {{if or $sync.MultiSource .Takeover}}
-                <button class="btn big"
-                        hx-get="/syncs/{{$sync.SyncID}}/activate?node={{.NodeID}}"
-                        hx-target="#modal" hx-swap="innerHTML">
-                  {{if .Takeover}}Take over from {{$sync.ActivePrimary}} ({{.NodeID}}){{else}}Play on {{.NodeID}}{{end}}
-                </button>
-              {{else}}
-                <button class="btn big"
-                        hx-post="/api/syncs/{{$sync.SyncID}}/activate"
-                        hx-vals='{"primary_node": "{{.NodeID}}", "direction": "from-primary"}'
-                        hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
-                  Play on {{.NodeID}}
-                </button>
-              {{end}}
-            </p>
-            {{end}}
-          {{end}}
         </div>
         {{end}}
       {{end}}

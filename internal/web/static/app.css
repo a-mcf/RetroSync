@@ -166,7 +166,7 @@ form.logout { display: inline; }
   padding: 0;
 }
 
-/* Activation / takeover modal — dark, consistent with the cards. */
+/* Conflict-resolution modal — dark, consistent with the cards. */
 .modal-backdrop {
   position: fixed;
   inset: 0;

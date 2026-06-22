@@ -231,27 +231,26 @@ func TestDeleteNode_HappyPath(t *testing.T) {
 	}
 }
 
-func TestDeleteNode_InUse_Friendly409(t *testing.T) {
+// TestDeleteNode_MemberNode_CascadesMembership: under auto-mirror a node that is
+// a sync member is freely deletable — its membership (and manifest) cascade, and
+// the removed member's file just stops mirroring. There is no active-binding FK
+// to block it anymore.
+func TestDeleteNode_MemberNode_CascadesMembership(t *testing.T) {
 	f := newActionFixture(t)
 	ctx := context.Background()
-	// Bind sync sm-bob to bob-deck so the node is an active binding's primary
-	// (active_bindings.primary_node NO-ACTION FK blocks the node delete).
-	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
-	}); err != nil {
-		t.Fatalf("create binding: %v", err)
-	}
 	c, csrf := loginAs(t, f, "bob")
 
+	// bob-deck is a member of sm-bob in the fixture; deleting it should succeed.
 	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck/delete", nil)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("in-use delete status = %d, want 409 (not 500)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("member-node delete status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(strings.ToLower(rec.Body.String()), "in use") {
-		t.Errorf("expected a friendly 'in use' message, got: %s", rec.Body.String())
+	if nodeIDs(t, f)["bob-deck"] {
+		t.Error("node not deleted")
 	}
-	if !nodeIDs(t, f)["bob-deck"] {
-		t.Error("node was deleted despite being in use")
+	// Its sync membership cascaded away.
+	if _, err := f.store.GetSyncMember(ctx, "sm-bob", "bob-deck"); err != store.ErrNotFound {
+		t.Errorf("membership not cascaded, err = %v", err)
 	}
 }
 

@@ -1,10 +1,10 @@
 package localfs_test
 
-// End-to-end: the slice-3 engine, the in-memory store, and the REAL localfs
-// adapter wired through the production resolver, driving an actual Activate +
-// Poll fan-out and asserting the bytes and mtime land on the peer's real file on
-// disk. This proves the engine works against real filesystems, not just the
-// fakereach. It needs no database, so it runs under plain `make test`.
+// End-to-end: the auto-mirror engine, the in-memory store, and the REAL localfs
+// adapter wired through the production resolver, driving an actual Poll fan-out
+// and asserting the bytes and mtime land on the peer's real file on disk. This
+// proves the engine works against real filesystems, not just the fakereach. It
+// needs no database, so it runs under plain `make test`.
 
 import (
 	"context"
@@ -37,8 +37,9 @@ func steppingClock(start time.Time, step time.Duration) engine.Clock {
 }
 
 // TestEngineFanOut_RealLocalFS sets up two "nodes" as two temp-dir roots, seeds
-// a save on the primary, activates (first-sync fan-out from primary), and
-// asserts the peer's real file on disk now holds the same bytes and mtime.
+// a save on the primary (peer empty, empty manifest), and Polls: the primary is
+// the single changed member, so the engine fans out to the peer's real file on
+// disk. It then mutates + Polls again, and asserts a no-change Poll is a noop.
 func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	ctx := context.Background()
 
@@ -76,8 +77,12 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	clock := steppingClock(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), time.Second)
 	eng := engine.New(st, resolve.ResolveReach, clock)
 
-	if err := eng.Activate(ctx, syncID, "primary", "from-primary", false); err != nil {
-		t.Fatalf("Activate: %v", err)
+	// First Poll: empty manifest, primary present, peer absent. The primary is the
+	// only "changed" member (it appeared); the absent peer is not changed (both it
+	// and its manifest agree it has no file). So the primary is the lone source and
+	// fans out — no conflict, even though this is the very first pass.
+	if err := eng.Poll(ctx, syncID); err != nil {
+		t.Fatalf("first Poll (fan-out): %v", err)
 	}
 
 	// Assert the peer's REAL file received the bytes and the source mtime.

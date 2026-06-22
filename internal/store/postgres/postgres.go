@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -286,22 +287,21 @@ func (s *Store) UpdateGame(ctx context.Context, g store.Game) error {
 }
 
 func (s *Store) DeleteGame(ctx context.Context, id string) error {
-	// A game is "active" when any of its syncs has an active binding. The FK
-	// graph would CASCADE a game delete through syncs into active_bindings,
-	// silently tearing down a live session — so we refuse it explicitly here
-	// (brief F: delete-active-game is a friendly 409). We surface ErrConflict so
-	// the web layer maps it to "being played right now — stop the session first".
-	// This guard mirrors the memory store's; both impls agree.
-	var active bool
+	// Under auto-mirror every sync just mirrors; there is no "active session" to
+	// tear down. But a CONFLICTED sync is paused awaiting a human's resolution.
+	// A game delete CASCADEs through syncs, which would silently discard that
+	// unresolved fork — so we refuse if any of the game's syncs is conflicted
+	// (ErrConflict -> friendly 409 "resolve the conflict first"). This guard
+	// mirrors the memory store's; both impls agree.
+	var conflicted bool
 	if err := s.db.QueryRow(ctx,
 		`SELECT EXISTS (
-		   SELECT 1 FROM active_bindings ab
-		   JOIN syncs sy ON sy.id = ab.sync_id
-		   WHERE sy.game_id = $1)`, id,
-	).Scan(&active); err != nil {
+		   SELECT 1 FROM syncs sy
+		   WHERE sy.game_id = $1 AND sy.conflict_at IS NOT NULL)`, id,
+	).Scan(&conflicted); err != nil {
 		return mapErr(err)
 	}
-	if active {
+	if conflicted {
 		return store.ErrConflict
 	}
 	tag, err := s.db.Exec(ctx, `DELETE FROM games WHERE id = $1`, id)
@@ -312,89 +312,6 @@ func (s *Store) DeleteGame(ctx context.Context, id string) error {
 		return store.ErrNotFound
 	}
 	return nil
-}
-
-// ---- ActiveBindings ----
-//
-// The active_bindings.sync_id PRIMARY KEY enforces one active session per sync
-// (duplicate insert -> 23505 -> ErrConflict). sync_id REFERENCES syncs ON DELETE
-// CASCADE; primary_node is NO ACTION, so DeleteNode of an active primary fails
-// with 23503 -> ErrInvalidReference without any extra check here.
-
-func (s *Store) CreateBinding(ctx context.Context, b store.ActiveBinding) error {
-	// Let the DB default started_at when the caller leaves it zero.
-	var startedAt any
-	if !b.StartedAt.IsZero() {
-		startedAt = b.StartedAt
-	}
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO active_bindings
-		   (sync_id, primary_node, started_at, direction, conflict_at, last_synced)
-		 VALUES ($1, $2, COALESCE($3, now()), $4, $5, $6)`,
-		b.SyncID, b.PrimaryNode, startedAt, b.Direction, b.ConflictAt, b.LastSynced)
-	return mapErr(err)
-}
-
-func (s *Store) GetBinding(ctx context.Context, syncID string) (store.ActiveBinding, error) {
-	row := s.db.QueryRow(ctx,
-		`SELECT sync_id, primary_node, started_at, direction, conflict_at, last_synced
-		 FROM active_bindings WHERE sync_id = $1`, syncID)
-	b, err := scanBinding(row)
-	if err != nil {
-		return store.ActiveBinding{}, mapErr(err)
-	}
-	return b, nil
-}
-
-func (s *Store) ListBindings(ctx context.Context) ([]store.ActiveBinding, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT sync_id, primary_node, started_at, direction, conflict_at, last_synced
-		 FROM active_bindings ORDER BY sync_id`)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	defer rows.Close()
-	out := make([]store.ActiveBinding, 0)
-	for rows.Next() {
-		b, err := scanBinding(rows)
-		if err != nil {
-			return nil, mapErr(err)
-		}
-		out = append(out, b)
-	}
-	return out, mapErr(rows.Err())
-}
-
-func (s *Store) UpdateBinding(ctx context.Context, b store.ActiveBinding) error {
-	tag, err := s.db.Exec(ctx,
-		`UPDATE active_bindings
-		 SET primary_node = $2, direction = $3,
-		     conflict_at = $4, last_synced = $5
-		 WHERE sync_id = $1`,
-		b.SyncID, b.PrimaryNode, b.Direction, b.ConflictAt, b.LastSynced)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) DeleteBinding(ctx context.Context, syncID string) error {
-	// Idempotent: an absent binding is not an error (api.md "deactivate is
-	// idempotent"), so we ignore RowsAffected.
-	_, err := s.db.Exec(ctx, `DELETE FROM active_bindings WHERE sync_id = $1`, syncID)
-	return mapErr(err)
-}
-
-func scanBinding(r rowScanner) (store.ActiveBinding, error) {
-	var b store.ActiveBinding
-	if err := r.Scan(&b.SyncID, &b.PrimaryNode, &b.StartedAt, &b.Direction,
-		&b.ConflictAt, &b.LastSynced); err != nil {
-		return store.ActiveBinding{}, err
-	}
-	return b, nil
 }
 
 // ---- SyncLog ----
@@ -514,13 +431,17 @@ func scanManifest(r rowScanner) (store.ManifestEntry, error) {
 
 // ---- Syncs ----
 //
-// syncs/sync_members are the unit of mirroring. The runtime tables
-// (active_bindings, manifest, sync_log) key off sync_id, REFERENCES syncs ON
-// DELETE CASCADE — so DeleteSync tears down a sync's binding/manifest/log too.
+// syncs/sync_members are the unit of mirroring. Each sync row also carries its
+// own runtime state — conflict_at (paused/forked) and last_synced (last mirror
+// pass) — since slice-18 retired active_bindings. The runtime tables (manifest,
+// sync_log) key off sync_id, REFERENCES syncs ON DELETE CASCADE — so DeleteSync
+// tears down a sync's manifest/log too.
 
 func (s *Store) CreateSync(ctx context.Context, sy store.Sync) error {
 	// A missing game (FK) -> 23503 -> ErrInvalidReference; a duplicate id (PK) ->
-	// 23505 -> ErrConflict. Both are handled by mapErr.
+	// 23505 -> ErrConflict. Both are handled by mapErr. A freshly-created sync has
+	// no runtime state (conflict_at/last_synced default NULL), so we don't write
+	// those columns here.
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO syncs (id, game_id, name) VALUES ($1, $2, $3)`,
 		sy.ID, sy.GameID, sy.Name)
@@ -528,10 +449,9 @@ func (s *Store) CreateSync(ctx context.Context, sy store.Sync) error {
 }
 
 func (s *Store) GetSync(ctx context.Context, id string) (store.Sync, error) {
-	var sy store.Sync
-	err := s.db.QueryRow(ctx,
-		`SELECT id, game_id, name FROM syncs WHERE id = $1`, id,
-	).Scan(&sy.ID, &sy.GameID, &sy.Name)
+	row := s.db.QueryRow(ctx,
+		`SELECT id, game_id, name, conflict_at, last_synced FROM syncs WHERE id = $1`, id)
+	sy, err := scanSync(row)
 	if err != nil {
 		return store.Sync{}, mapErr(err)
 	}
@@ -539,16 +459,26 @@ func (s *Store) GetSync(ctx context.Context, id string) (store.Sync, error) {
 }
 
 func (s *Store) ListSyncsByGame(ctx context.Context, gameID string) ([]store.Sync, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT id, game_id, name FROM syncs WHERE game_id = $1 ORDER BY id`, gameID)
+	return s.querySyncs(ctx,
+		`SELECT id, game_id, name, conflict_at, last_synced
+		 FROM syncs WHERE game_id = $1 ORDER BY id`, gameID)
+}
+
+func (s *Store) ListSyncs(ctx context.Context) ([]store.Sync, error) {
+	return s.querySyncs(ctx,
+		`SELECT id, game_id, name, conflict_at, last_synced FROM syncs ORDER BY id`)
+}
+
+func (s *Store) querySyncs(ctx context.Context, sql string, args ...any) ([]store.Sync, error) {
+	rows, err := s.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	defer rows.Close()
 	out := make([]store.Sync, 0)
 	for rows.Next() {
-		var sy store.Sync
-		if err := rows.Scan(&sy.ID, &sy.GameID, &sy.Name); err != nil {
+		sy, err := scanSync(rows)
+		if err != nil {
 			return nil, mapErr(err)
 		}
 		out = append(out, sy)
@@ -557,6 +487,9 @@ func (s *Store) ListSyncsByGame(ctx context.Context, gameID string) ([]store.Syn
 }
 
 func (s *Store) UpdateSync(ctx context.Context, sy store.Sync) error {
+	// UpdateSync rewrites only the registry fields (game_id, name); the runtime
+	// state (conflict_at, last_synced) is owned by SetSyncConflict/MarkSyncSynced
+	// and left untouched here.
 	tag, err := s.db.Exec(ctx,
 		`UPDATE syncs SET game_id = $2, name = $3 WHERE id = $1`,
 		sy.ID, sy.GameID, sy.Name)
@@ -567,6 +500,38 @@ func (s *Store) UpdateSync(ctx context.Context, sy store.Sync) error {
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) SetSyncConflict(ctx context.Context, syncID string, at *time.Time) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE syncs SET conflict_at = $2 WHERE id = $1`, syncID, at)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) MarkSyncSynced(ctx context.Context, syncID string, t time.Time) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE syncs SET last_synced = $2 WHERE id = $1`, syncID, t)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
+func scanSync(r rowScanner) (store.Sync, error) {
+	var sy store.Sync
+	if err := r.Scan(&sy.ID, &sy.GameID, &sy.Name, &sy.ConflictAt, &sy.LastSynced); err != nil {
+		return store.Sync{}, err
+	}
+	return sy, nil
 }
 
 func (s *Store) DeleteSync(ctx context.Context, id string) error {

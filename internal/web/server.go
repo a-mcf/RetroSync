@@ -1,21 +1,21 @@
-// Package web is RetroSync's HTTP surface: session auth and a read-only
-// dashboard, served with the Go stdlib net/http and html/template. No web
-// framework. Templates and static assets (CSS, a vendored htmx.min.js) are
-// embedded via embed.FS so the binary is self-contained and runs offline — no
-// runtime CDN (docs/ui.md self-hosted ethos).
+// Package web is RetroSync's HTTP surface: session auth and a dashboard, served
+// with the Go stdlib net/http and html/template. No web framework. Templates and
+// static assets (CSS, a vendored htmx.min.js) are embedded via embed.FS so the
+// binary is self-contained and runs offline — no runtime CDN (docs/ui.md
+// self-hosted ethos).
 //
-// The play-sync ACTIONS — the "Play on <node>" / "Done playing" buttons, the
-// activation "use my save" modal, force-takeover, conflict resolution — are keyed
-// by SYNC id (a sync is the unit of mirroring; its members are its scope). Every
-// state-changing POST is CSRF-protected. The web layer drives play-sync only
-// through the narrow Actioner interface (no internal/reach import).
+// Under the auto-mirror model there are NO play actions: no "Play on <node>",
+// no "Done playing", no activation modal, no take-over. Every sync mirrors
+// automatically; the dashboard "My syncs" section is a STATUS view (each sync's
+// members, their last-known mtime, and whether the sync is in sync or in
+// conflict). The ONLY human action is resolving a conflict.
 //
 // Conflict RESOLUTION: the dashboard conflict banner, the conflict modal
 // (GET /syncs/{id}/conflict) that surfaces every member's live state, and the
 // owner/admin-gated, CSRF-protected POST /api/syncs/{id}/resolve-conflict that
-// drives the engine's ResolveConflict. The /games registry editing UI manages a
-// game's syncs and each sync's members (node + path) directly (game_paths is
-// retired).
+// drives the engine's ResolveConflict. Authority is owning one of the sync's
+// member nodes (or admin). The /games registry editing UI manages a game's
+// syncs and each sync's members (node + path) directly.
 package web
 
 import (
@@ -44,21 +44,23 @@ type ctxKey int
 
 const userCtxKey ctxKey = iota
 
-// Actioner is the narrow play-sync surface the web layer drives for the action
-// endpoints (activate / deactivate / resolve-conflict). It is deliberately small
-// and reach-free: the web package must NOT import internal/reach or any
+// Actioner is the narrow surface the web layer drives for the action endpoints
+// (conflict resolution + the registry's smoke-test / browse). It is deliberately
+// small and reach-free: the web package must NOT import internal/reach or any
 // persistence driver — it depends only on this interface, which *engine.Engine
 // satisfies. The web package MAY depend on internal/engine for the NodeState
 // value type (engine is core play-sync logic, not infrastructure). main.go wires
 // the real engine; tests pass a recording stub.
+//
+// There are no Activate/Deactivate methods: under auto-mirror there is no play
+// session to start or stop. The only state-changing engine action the web layer
+// drives is ResolveConflict.
 type Actioner interface {
-	Activate(ctx context.Context, syncID, primaryNode, direction string, force bool) error
-	Deactivate(ctx context.Context, syncID string) error
 	// ResolveConflict makes winnerNodeID's current save the authority for a
-	// conflicted binding, fanning it out to every other in-scope peer (after
-	// backing each loser up) and clearing the conflict flag. The single most
-	// destructive action in the system: the POST handler gates it on
-	// owner-or-admin AND CSRF before ever reaching here.
+	// conflicted sync, fanning it out to every other member (after backing each
+	// loser up) and clearing the conflict flag. The single most destructive
+	// action in the system: the POST handler gates it on owner-of-a-member-node-
+	// or-admin AND CSRF before ever reaching here.
 	ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error
 	// NodeStates returns the live per-node state (mtime, size, presence) of every
 	// member of the sync, read-only, for the conflict modal to render so the human
@@ -108,9 +110,10 @@ type Options struct {
 	Now func() time.Time
 	// Logger receives request/error logs; defaults to a discarding logger.
 	Logger *slog.Logger
-	// Actioner drives the play-sync action endpoints (activate/deactivate). May
-	// be nil when only the read-only surface is exercised; the action handlers
-	// guard against a nil Actioner with a 500 rather than panicking.
+	// Actioner drives the engine-backed action endpoints (resolve-conflict and
+	// smoke-test/status). May be nil when only the read-only surface is exercised;
+	// the action handlers guard against a nil Actioner with a 500 rather than
+	// panicking.
 	Actioner Actioner
 }
 
@@ -183,19 +186,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/games", s.requireAuth(http.HandlerFunc(s.handleAPIGames)))
 	mux.Handle("GET /api/nodes", s.requireAuth(http.HandlerFunc(s.handleAPINodes)))
 
-	// Play-sync action endpoints, keyed by SYNC id. The activation modal fragment
-	// is a GET (no state change, no CSRF needed). The state-changing POSTs are
-	// wrapped in requireCSRF *inside* requireAuth so an unauthenticated request
-	// 303s to /login (friendly) while an authenticated-but-tokenless request 403s.
-	mux.Handle("GET /syncs/{id}/activate", s.requireAuth(http.HandlerFunc(s.handleActivateModal)))
-	mux.Handle("POST /api/syncs/{id}/activate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleActivate))))
-	mux.Handle("POST /api/syncs/{id}/deactivate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleDeactivate))))
-
-	// Conflict resolution, keyed by SYNC id. The modal fragment is a read-only GET
-	// (viewable by any authenticated user, consistent with "can see others'
-	// sessions" — docs/ui.md / brief D). The resolve POST is the single most
-	// destructive action in the system: it is wrapped in requireCSRF AND re-checks
-	// owner-or-admin inside the handler before touching the engine.
+	// Conflict resolution, keyed by SYNC id — the only play-side action under
+	// auto-mirror. The modal fragment is a read-only GET (viewable by any
+	// authenticated user, consistent with "can see others' syncs" — docs/ui.md).
+	// The resolve POST is the single most destructive action in the system: it is
+	// wrapped in requireCSRF AND re-checks owner-of-a-member-node-or-admin inside
+	// the handler before touching the engine.
 	mux.Handle("GET /syncs/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
 	mux.Handle("POST /api/syncs/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
 
@@ -231,9 +227,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/games/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGame)))))
 
 	// Sync registry mutations (slice-16). Same admin + CSRF wrapping. Note these
-	// are distinct from the PLAY-side /api/syncs/{id}/activate|deactivate|
-	// resolve-conflict routes above: those drive the engine and are owner/admin-
-	// gated; these edit the registry and are admin-only.
+	// are distinct from the engine-side /api/syncs/{id}/resolve-conflict route
+	// above: that drives the auto-mirror engine and is owner/admin-gated; these
+	// edit the registry and are admin-only.
 	mux.Handle("POST /api/syncs", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateSync)))))
 	mux.Handle("POST /api/syncs/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleRenameSync)))))
 	mux.Handle("POST /api/syncs/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSync)))))

@@ -18,17 +18,18 @@ There's no per-node API token because nodes don't call retrosync; retrosync call
 
 ## Roles
 
-- `user` — can act on their own nodes. Can bind games to nodes they own. Can see other users' active sessions but not modify them.
-- `admin` — can edit the registry, force-takeovers across users, add nodes, delete games.
+- `user` — can act on their own nodes. Can resolve a conflict on any sync that includes a node they own. Can view other syncs but not resolve their conflicts.
+- `admin` — can edit the registry, add nodes, delete games, and resolve any sync's conflict.
 
 Single-tenant household — keep this minimal, two roles is enough.
 
-**Implemented gating.** Registry mutations (`/nodes`, `/games`, path mappings,
-smoke-test) are admin-only — a non-admin gets a `403` before the Store is touched.
-The play-sync actions (activate / deactivate / resolve-conflict) require the caller
-to **own the relevant node** *or* be an admin; viewing another user's session and
-the conflict modal is allowed (read-only). See api.md for the per-route status
-codes.
+**Implemented gating.** Registry mutations (`/nodes`, `/games`, syncs and their
+members, smoke-test) are admin-only — a non-admin gets a `403` before the Store
+is touched. Resolving a conflict (`/api/syncs/{id}/resolve-conflict`) requires the
+caller to **own a member node of that sync** *or* be an admin — enforced by
+`userOwnsAnyMember` (admins always pass). Viewing a sync and its conflict modal is
+allowed for any authenticated user (read-only). See api.md for the per-route
+status codes.
 
 ## Reaching nodes
 

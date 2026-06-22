@@ -7,13 +7,14 @@ package engine_test
 // mtimes round-trip through timestamptz, which stores only microseconds) to the
 // REAL localfs adapter over t.TempDir() roots (stat returns nanosecond mtimes).
 //
-// Activate fans the primary's save out to a peer and records both nodes'
-// manifest mtimes through Postgres — truncating the sub-microsecond digits. The
-// next Poll re-stats the files at full nanosecond precision and compares against
-// the truncated manifest. With exact equality this flagged a SPURIOUS conflict
-// on the very first poll after a write; with mtimeEqual's microsecond-resolution
-// compare it must be a noop. We assert: conflict_at stays nil and Poll adds no
-// new fan-out sync_log rows. A second Poll must stay a noop too.
+// A first auto-mirror Poll fans the primary's save out to a peer (the primary is
+// the lone changed member) and records both nodes' manifest mtimes through
+// Postgres — truncating the sub-microsecond digits. The NEXT Poll re-stats the
+// files at full nanosecond precision and compares against the truncated manifest.
+// With exact equality this flagged a SPURIOUS conflict on the very first poll
+// after a write; with mtimeEqual's microsecond-resolution compare it must be a
+// noop. We assert: conflict_at stays nil and the noop Polls add no new fan-out
+// sync_log rows.
 //
 // The fakereach + memory-store unit path cannot reproduce this: both keep
 // time.Time exact, so the precision mismatch never appears.
@@ -101,10 +102,10 @@ func pgPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestEngine_PollNoopAfterActivate_PostgresLocalFS proves no spurious conflict
-// after a normal activate fan-out when the manifest mtime round-trips through
+// TestEngine_PollNoopAfterFanOut_PostgresLocalFS proves no spurious conflict
+// after a normal auto-mirror fan-out when the manifest mtime round-trips through
 // Postgres µs precision but the filesystem stats at ns precision.
-func TestEngine_PollNoopAfterActivate_PostgresLocalFS(t *testing.T) {
+func TestEngine_PollNoopAfterFanOut_PostgresLocalFS(t *testing.T) {
 	ctx := context.Background()
 	st := postgres.New(pgPool(t))
 
@@ -144,43 +145,45 @@ func TestEngine_PollNoopAfterActivate_PostgresLocalFS(t *testing.T) {
 	clock := steppingClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Second)
 	eng := engine.New(st, resolve.ResolveReach, clock)
 
-	// Activate: fan-out primary -> peer; manifest mtimes recorded through Postgres.
-	if err := eng.Activate(ctx, syncID, "primary", "from-primary", false); err != nil {
-		t.Fatalf("Activate: %v", err)
+	// First Poll: empty manifest, primary present, peer absent -> the primary is
+	// the lone changed member, so it fans out to the peer; manifest mtimes recorded
+	// through Postgres (truncated to µs).
+	if err := eng.Poll(ctx, syncID); err != nil {
+		t.Fatalf("Poll #1 (fan-out): %v", err)
 	}
 
 	// Confirm the peer received the bytes (sanity: fan-out actually ran).
 	peerAbs := filepath.Join(peerRoot, relPath)
 	if got, err := os.ReadFile(peerAbs); err != nil || string(got) != string(saveData) {
-		t.Fatalf("peer file after activate = %q (err %v), want %q", got, err, saveData)
+		t.Fatalf("peer file after fan-out = %q (err %v), want %q", got, err, saveData)
 	}
 
 	okBefore := countOutcome(t, st, store.OutcomeOK)
 
-	// First Poll after activate: MUST be a noop. Pre-fix this flagged a conflict
-	// because manifest(µs) != stat(ns).
-	if err := eng.Poll(ctx, syncID); err != nil {
-		t.Fatalf("Poll #1: %v", err)
-	}
-	assertNoConflictNoFanout(t, st, "after Poll #1", okBefore)
-
-	// Second Poll: still a noop.
+	// Second Poll: MUST be a noop. Pre-fix this flagged a conflict because
+	// manifest(µs) != stat(ns).
 	if err := eng.Poll(ctx, syncID); err != nil {
 		t.Fatalf("Poll #2: %v", err)
 	}
 	assertNoConflictNoFanout(t, st, "after Poll #2", okBefore)
+
+	// Third Poll: still a noop.
+	if err := eng.Poll(ctx, syncID); err != nil {
+		t.Fatalf("Poll #3: %v", err)
+	}
+	assertNoConflictNoFanout(t, st, "after Poll #3", okBefore)
 }
 
 func assertNoConflictNoFanout(t *testing.T, st store.Store, when string, okBefore int) {
 	t.Helper()
 	ctx := context.Background()
 
-	b, err := st.GetBinding(ctx, syncID)
+	sy, err := st.GetSync(ctx, syncID)
 	if err != nil {
-		t.Fatalf("%s: get binding: %v", when, err)
+		t.Fatalf("%s: get sync: %v", when, err)
 	}
-	if b.ConflictAt != nil {
-		t.Fatalf("%s: spurious conflict — conflict_at = %v, want nil", when, b.ConflictAt)
+	if sy.ConflictAt != nil {
+		t.Fatalf("%s: spurious conflict — conflict_at = %v, want nil", when, sy.ConflictAt)
 	}
 	if got := countOutcome(t, st, store.OutcomeConflict); got != 0 {
 		t.Fatalf("%s: %d conflict sync_log rows, want 0", when, got)

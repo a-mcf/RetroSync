@@ -5,8 +5,16 @@
 > fake, one conformance suite). The registry (users, nodes, games, syncs,
 > sync_members) is edited through the admin UI; game/node/sync ids are slugs,
 > auto-generated from the display/name when omitted (manual id overrides).
-> `active_bindings`, `manifest`, and `sync_log` are written by the engine/daemon.
-> See the "Storage choice" note below.
+> Per-sync runtime state (`syncs.conflict_at` / `syncs.last_synced`), `manifest`,
+> and `sync_log` are written by the engine/daemon. See the "Storage choice" note
+> below.
+>
+> **Note (auto-mirror, slice 18):** the old `active_bindings` table (one row per
+> game/sync in an explicit "play session", with a primary node + direction) was
+> **dropped** (migration 0006). There is no primary, no binding, no
+> activate/deactivate/take-over anymore — every sync auto-mirrors. The two pieces
+> of per-sync runtime state that lived on the binding (`conflict_at`,
+> `last_synced`) moved onto the `syncs` row itself.
 >
 > **Note:** `game_paths` (one row per `(game, node)`) was the original
 > registry-of-paths table. It has been **retired** (migration 0005): a game's
@@ -65,14 +73,18 @@ sync together. It belongs to one game, but a game may have MANY independent sync
 (e.g. two unrelated streams of the same title) so long as they do not share a
 `(node, path)` member.
 
-| field    | type | notes                                |
-|----------|------|--------------------------------------|
-| id       | text | slug, e.g. `sm-bob`                  |
-| game_id  | text | FK → games, `ON DELETE CASCADE`      |
-| name     | text | free-form label, e.g. "Bob's stream" |
+| field        | type | notes                                                        |
+|--------------|------|--------------------------------------------------------------|
+| id           | text | slug, e.g. `sm-bob`                                           |
+| game_id      | text | FK → games, `ON DELETE CASCADE`                              |
+| name         | text | free-form label, e.g. "Bob's stream"                         |
+| conflict_at  | ts   | nullable; set when the sync forked (2+ members changed) — mirroring is paused until a human resolves it |
+| last_synced  | ts   | nullable; time of the last successful mirror pass            |
 
-The runtime tables (`active_bindings`, `manifest`, `sync_log`) key off `sync_id`;
-the engine, daemon, and web play side all operate on a `sync` and its members.
+`conflict_at` / `last_synced` are the per-sync runtime state (formerly on
+`active_bindings`). The runtime tables (`manifest`, `sync_log`) key off `sync_id`;
+the engine, daemon, and web all operate on a `sync` and its members. A sync with
+`conflict_at IS NULL` is mirroring normally; a non-null `conflict_at` pauses it.
 
 ### `sync_members`
 
@@ -115,21 +127,8 @@ games:
 
 ## Runtime state
 
-### `active_bindings`
-
-| field        | type | notes                                                              |
-|--------------|------|--------------------------------------------------------------------|
-| game_id      | text | PK; one row max per game (enforced unique)                         |
-| primary_node | text | the node currently holding play authority                          |
-| started_at   | ts   |                                                                    |
-| direction    | text | `from-primary` (initial: primary wins on first sync) or `from-peer-<node_id>` |
-| peer_scope   | text | `all-configured` (default) or csv of node ids                      |
-| conflict_at  | ts   | nullable; set when a non-primary peer mutates mid-session          |
-| last_synced  | ts   | last successful pass                                               |
-
-Unique on `game_id` enforces "only one active session per game at a time."
-
-The `from-peer-<node_id>` form of `direction` embeds a node id as plain text (not an FK), so it is an initial-sync hint only and may dangle if that peer node is later deleted.
+The per-sync runtime state (`conflict_at`, `last_synced`) lives on the `syncs`
+row (see above) — there is no separate bindings table under auto-mirror.
 
 ### `sync_log` (append-only)
 
@@ -137,7 +136,7 @@ The `from-peer-<node_id>` form of `direction` embeds a node id as plain text (no
 |-----------|-----------|----------------------------------------|
 | id        | bigserial | PK; surrogate key, also the tiebreaker for "most recent" ordering |
 | ts        | ts        |                                        |
-| game_id   | text      | FK → games, `ON DELETE CASCADE`        |
+| sync_id   | text      | FK → syncs, `ON DELETE CASCADE`        |
 | from_node | text      | unconstrained text by design (see below) |
 | to_node   | text      | unconstrained text by design (see below) |
 | bytes     | int       |                                        |
@@ -146,26 +145,26 @@ The `from-peer-<node_id>` form of `direction` embeds a node id as plain text (no
 | outcome   | text      | `ok`, `noop`, `conflict`, `error`      |
 | message   | text      | error detail                           |
 
-Used for the UI history panel and conflict diagnostics. One row per directional copy; a single sync pass can produce N rows when fanning out from primary to multiple peers.
+Used for the UI history panel and conflict diagnostics. One row per directional copy; a single mirror pass can produce N rows when fanning the lone changed member out to multiple others.
 
-`from_node`/`to_node` are **plain text, not foreign keys**, on purpose: the log is historical and a node may be removed later. We never want a node deletion to erase or block log history, so those columns are left unconstrained. (`game_id`, by contrast, *is* an FK and cascades, so deleting a game cleans up its history.)
+`from_node`/`to_node` are **plain text, not foreign keys**, on purpose: the log is historical and a node may be removed later. We never want a node deletion to erase or block log history, so those columns are left unconstrained. (`sync_id`, by contrast, *is* an FK and cascades, so deleting a sync cleans up its history.)
 
 ### `manifest` (per side)
 
 | field        | type | notes                                              |
 |--------------|------|----------------------------------------------------|
-| game_id      | text |                                                    |
+| sync_id      | text |                                                    |
 | node_id      | text |                                                    |
 | mtime        | ts   |                                                    |
 | size         | int  |                                                    |
 | sha256       | text | computed lazily; size+mtime is the fast path       |
 | last_checked | ts   |                                                    |
 
-PK: (game_id, node_id). The poll loop updates this; conflict detection compares last-known mtime per node with current.
+PK: (sync_id, node_id). The poll loop updates this; conflict detection compares each member's last-known mtime/size with its current stat — the **changed set** drives the mirror (0 = noop, 1 = propagate, 2+ = conflict).
 
 ## Storage choice
 
-- **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the unique constraint on `active_bindings`, JSONB for `reach_config`, `ON DELETE CASCADE` for `syncs` / `sync_members`, and a managed/HA operator in k8s.
+- **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the `UNIQUE (node_id, path)` invariant on `sync_members`, JSONB for `reach_config`, `ON DELETE CASCADE` for `syncs` / `sync_members` / `manifest` / `sync_log`, and a managed/HA operator in k8s.
 - All business logic depends on a Go **`Store` interface** (`internal/store`), never on the driver. There are two implementations: a thread-safe in-memory store (used by fast unit tests) and a pgx v5 Postgres store. Both run an identical **conformance suite** (`internal/store/storetest`) so they cannot drift in behavior.
 - Access is via **pgx v5** with hand-written parameterized queries — no ORM, no sqlc. Migrations are embedded (`embed.FS`) and applied programmatically at startup and in tests (`internal/migrate`).
 - Integration tests run against a real Postgres started with **podman** (gated by a build tag / `DATABASE_URL`); plain `go test ./...` needs no database.
