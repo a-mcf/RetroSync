@@ -168,6 +168,113 @@ func TestWriteAtomic_RejectionCreatesNothing(t *testing.T) {
 	}
 }
 
+// seedTree writes a nested directory tree under root for List tests:
+//
+//	root/
+//	  alpha.srm
+//	  beta.srm
+//	  saves/
+//	    deep/
+//	      nested.srm
+//	    game.srm
+func seedTree(t *testing.T, root string) {
+	t.Helper()
+	mustWrite := func(rel, data string) {
+		abs := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatalf("mkdir for %q: %v", rel, err)
+		}
+		if err := os.WriteFile(abs, []byte(data), 0o600); err != nil {
+			t.Fatalf("write %q: %v", rel, err)
+		}
+	}
+	mustWrite("beta.srm", "bb")
+	mustWrite("alpha.srm", "a")
+	mustWrite("saves/game.srm", "game-bytes")
+	mustWrite("saves/deep/nested.srm", "x")
+}
+
+func TestList_RootSortedDirsFirst(t *testing.T) {
+	l, root := newRooted(t)
+	seedTree(t, root)
+	ctx := context.Background()
+
+	for _, rel := range []string{"", "."} {
+		entries, err := l.List(ctx, rel)
+		if err != nil {
+			t.Fatalf("List(%q): %v", rel, err)
+		}
+		// Expect: saves/ (dir) first, then alpha.srm, beta.srm (files, alphabetical).
+		if len(entries) != 3 {
+			t.Fatalf("List(%q) len = %d, want 3: %+v", rel, len(entries), entries)
+		}
+		if !entries[0].IsDir || entries[0].Name != "saves" {
+			t.Errorf("List(%q)[0] = %+v, want dir saves first", rel, entries[0])
+		}
+		if entries[1].Name != "alpha.srm" || entries[2].Name != "beta.srm" {
+			t.Errorf("List(%q) files = %q,%q, want alpha,beta", rel, entries[1].Name, entries[2].Name)
+		}
+		// A file entry carries its size; a directory does not require contents.
+		var alpha reach.DirEntry
+		for _, e := range entries {
+			if e.Name == "alpha.srm" {
+				alpha = e
+			}
+		}
+		if alpha.IsDir || alpha.Size != 1 {
+			t.Errorf("alpha.srm entry = %+v, want file size 1", alpha)
+		}
+	}
+}
+
+func TestList_Subdir(t *testing.T) {
+	l, root := newRooted(t)
+	seedTree(t, root)
+	entries, err := l.List(context.Background(), "saves")
+	if err != nil {
+		t.Fatalf("List(saves): %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("List(saves) len = %d, want 2: %+v", len(entries), entries)
+	}
+	if !entries[0].IsDir || entries[0].Name != "deep" {
+		t.Errorf("List(saves)[0] = %+v, want dir deep", entries[0])
+	}
+	if entries[1].IsDir || entries[1].Name != "game.srm" {
+		t.Errorf("List(saves)[1] = %+v, want file game.srm", entries[1])
+	}
+}
+
+func TestList_TraversalRejected(t *testing.T) {
+	l, _ := newRooted(t)
+	ctx := context.Background()
+	for _, bad := range []string{"../escape", "/etc", "a/../../b"} {
+		if _, err := l.List(ctx, bad); err == nil {
+			t.Fatalf("List(%q) = nil err, want rejection", bad)
+		}
+	}
+}
+
+func TestList_NotExist(t *testing.T) {
+	l, _ := newRooted(t)
+	_, err := l.List(context.Background(), "no-such-dir")
+	if !errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("List(missing) = %v, want ErrNotExist", err)
+	}
+}
+
+func TestList_NotADirectory(t *testing.T) {
+	l, root := newRooted(t)
+	seedTree(t, root)
+	_, err := l.List(context.Background(), "alpha.srm")
+	if err == nil {
+		t.Fatal("List(file) = nil err, want not-a-directory error")
+	}
+	if errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("List(file) mapped to ErrNotExist; want a distinct not-a-directory error: %v", err)
+	}
+}
+
 func assertNoTempLeftover(t *testing.T, dir string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)

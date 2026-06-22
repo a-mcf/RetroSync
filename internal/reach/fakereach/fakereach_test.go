@@ -98,3 +98,70 @@ func TestDataIsCopied(t *testing.T) {
 		t.Fatalf("stored data aliased caller buffer: %q", got.Data)
 	}
 }
+
+func TestList_DerivesTreeFromFlatKeys(t *testing.T) {
+	mt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	f := fakereach.New().
+		Put("beta.srm", []byte("bb"), mt).
+		Put("alpha.srm", []byte("a"), mt).
+		Put("saves/game.srm", []byte("game-bytes"), mt).
+		Put("saves/deep/nested.srm", []byte("x"), mt)
+
+	// Root: saves/ (dir) first, then alpha.srm, beta.srm (files, alphabetical).
+	for _, rel := range []string{"", "."} {
+		entries, err := f.List(ctx(), rel)
+		if err != nil {
+			t.Fatalf("List(%q): %v", rel, err)
+		}
+		if len(entries) != 3 {
+			t.Fatalf("List(%q) len = %d, want 3: %+v", rel, len(entries), entries)
+		}
+		if !entries[0].IsDir || entries[0].Name != "saves" {
+			t.Errorf("List(%q)[0] = %+v, want dir saves", rel, entries[0])
+		}
+		if entries[1].Name != "alpha.srm" || entries[2].Name != "beta.srm" {
+			t.Errorf("List(%q) files = %q,%q, want alpha,beta", rel, entries[1].Name, entries[2].Name)
+		}
+		if entries[1].Size != 1 || entries[2].Size != 2 {
+			t.Errorf("List(%q) file sizes = %d,%d, want 1,2", rel, entries[1].Size, entries[2].Size)
+		}
+	}
+
+	// Subdir: saves/ has deep/ (dir) then game.srm (file).
+	sub, err := f.List(ctx(), "saves")
+	if err != nil {
+		t.Fatalf("List(saves): %v", err)
+	}
+	if len(sub) != 2 || !sub[0].IsDir || sub[0].Name != "deep" || sub[1].Name != "game.srm" {
+		t.Fatalf("List(saves) = %+v, want deep/ then game.srm", sub)
+	}
+}
+
+func TestList_MissingDir(t *testing.T) {
+	f := fakereach.New().Put("a.srm", nil, time.Now())
+	if _, err := f.List(ctx(), "nope"); !errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("List(missing) = %v, want ErrNotExist", err)
+	}
+}
+
+func TestList_NotADirectory(t *testing.T) {
+	f := fakereach.New().Put("a.srm", []byte("x"), time.Now())
+	_, err := f.List(ctx(), "a.srm")
+	if err == nil {
+		t.Fatal("List(file) = nil err, want not-a-directory")
+	}
+	if errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("List(file) mapped to ErrNotExist; want a distinct error: %v", err)
+	}
+}
+
+func TestList_EmptyFakeRootIsEmptyNotMissing(t *testing.T) {
+	f := fakereach.New()
+	entries, err := f.List(ctx(), "")
+	if err != nil {
+		t.Fatalf("List(root) on empty fake = %v, want nil (empty listing)", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("List(root) on empty fake = %+v, want empty", entries)
+	}
+}

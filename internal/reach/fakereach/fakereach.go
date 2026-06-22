@@ -11,7 +11,9 @@ package fakereach
 import (
 	"context"
 	"fmt"
+	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -178,6 +180,83 @@ func (f *Fake) Read(_ context.Context, path string) ([]byte, error) {
 	cp := make([]byte, len(file.Data))
 	copy(cp, file.Data)
 	return cp, nil
+}
+
+// List implements reach.Reach over the flat in-memory file map. The map is keyed
+// by full node-relative path; List derives the directory tree from those keys by
+// looking at each stored path that lives under relDir and emitting either the
+// file itself (when it is a direct child) or the intermediate directory (when it
+// is deeper). It returns metadata only — never file contents — sorted
+// directories-first then alphabetically, mirroring the localfs adapter.
+//
+// An empty relPath (or ".") names the node root. A relPath that names no file
+// AND has no descendants maps to reach.ErrNotExist (the directory does not
+// exist); a relPath that names an existing FILE is a clear not-a-directory error.
+func (f *Fake) List(_ context.Context, relPath string) ([]reach.DirEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Normalize the requested directory to a clean prefix. "" and "." are the root.
+	dir := path.Clean(relPath)
+	if dir == "." || relPath == "" {
+		dir = ""
+	}
+
+	// A relPath that names a stored FILE is not a directory.
+	if _, ok := f.files[dir]; ok && dir != "" {
+		return nil, fmt.Errorf("fakereach: list %q: not a directory", relPath)
+	}
+
+	// prefix is what a child path must start with to be under dir.
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+
+	// Collapse the flat key set into the immediate children of dir. files maps a
+	// direct child file name -> its meta; dirs is the set of immediate subdir
+	// names (any deeper descendant contributes its first segment as a dir).
+	files := make(map[string]reach.DirEntry)
+	dirs := make(map[string]struct{})
+	found := dir == "" // the root always "exists" even when empty
+	for full, file := range f.files {
+		if dir != "" && full == dir {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(full, prefix) {
+			continue
+		}
+		found = true
+		rest := strings.TrimPrefix(full, prefix)
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			dirs[rest[:i]] = struct{}{}
+		} else {
+			files[rest] = reach.DirEntry{
+				Name:  rest,
+				IsDir: false,
+				Size:  int64(len(file.Data)),
+				Mtime: file.Mtime,
+			}
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("fakereach: list %q: %w", relPath, reach.ErrNotExist)
+	}
+
+	out := make([]reach.DirEntry, 0, len(files)+len(dirs))
+	for name := range dirs {
+		out = append(out, reach.DirEntry{Name: name, IsDir: true})
+	}
+	for _, de := range files {
+		out = append(out, de)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IsDir != out[j].IsDir {
+			return out[i].IsDir
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
 }
 
 // WriteAtomic implements reach.Reach. It honors any injected failure BEFORE

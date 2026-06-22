@@ -5,8 +5,10 @@ import (
 	"errors"
 	"html/template"
 	"net/http"
+	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/a-mcf/retrosync/internal/engine"
 	"github.com/a-mcf/retrosync/internal/store"
@@ -313,6 +315,150 @@ type smokeResult struct {
 	NodeID  string
 	OK      bool
 	Message string
+}
+
+// --- GET /api/nodes/{id}/browse (save-file picker) -----------------------
+
+// browsePicker drives the "node-browse" fragment: the directory listing the
+// save-file picker renders. It carries the node id and the directory being
+// browsed (so folder/file links can build correct relative paths), an optional
+// up-link, the entries, and — when browsing is impossible — a friendly message.
+type browsePicker struct {
+	NodeID string
+	// Dir is the node-relative path of the directory being shown ("" = the node
+	// save root). Folder and file links join their Name onto Dir.
+	Dir string
+	// Parent is the node-relative path of Dir's parent, shown as a ".." up-link.
+	// HasParent is false at the root (no up-link there).
+	Parent    string
+	HasParent bool
+	// Entries are the directory's contents (dirs first, then files), metadata only.
+	Entries []browseEntry
+	// Message, when non-empty, replaces the listing with a friendly note (e.g.
+	// "browsing not supported for this node", or a missing/not-a-directory path).
+	Message string
+}
+
+// browseEntry is one row in the picker: a folder (click to re-browse) or a file
+// (click to select its relative path). Rel is the full node-relative path of the
+// entry (Dir joined with Name), which is exactly the member path a file click
+// fills in. It carries metadata only — no contents.
+type browseEntry struct {
+	Name  string
+	Rel   string
+	IsDir bool
+	Size  int64
+	Mtime time.Time
+}
+
+// handleBrowseNode implements GET /api/nodes/{id}/browse?path=<rel>. It returns
+// an HTML fragment (htmx) listing the node's directory so the operator can click
+// a real save file instead of typing its path. Admin-only (mounted behind
+// requireAdmin) because it exposes a node's directory listing. Read-only.
+//
+// It is path-safe and contents-safe: the relative path goes straight to
+// engine.BrowseNode, where the adapter's safepath check rejects any
+// traversal/absolute path (mapped to 400 here via engine.ErrBrowseUnsafePath),
+// and the listing carries metadata ONLY — names, sizes, mtimes — never file
+// bytes. Error mapping:
+//   - unsafe/traversal path (ErrBrowseUnsafePath)   -> 400
+//   - missing node (store.ErrNotFound)              -> 404
+//   - unsupported reach / ssh (ErrBrowseUnsupported)-> 200 + friendly message
+//   - missing dir / not-a-directory (other err)     -> 200 + friendly message
+func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
+	if s.actioner == nil {
+		http.Error(w, "browsing unavailable", http.StatusInternalServerError)
+		return
+	}
+	id := r.PathValue("id")
+	// The requested directory is a node-relative path; "" means the node root.
+	// We Clean it for display/link math but pass the RAW query value to the engine
+	// so the adapter's safepath gets the unmodified hostile input to reject.
+	raw := r.URL.Query().Get("path")
+
+	entries, err := s.actioner.BrowseNode(r.Context(), id, raw)
+	if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrBrowseUnsafePath):
+			http.Error(w, "that path is not allowed", http.StatusBadRequest)
+			return
+		case errors.Is(err, store.ErrNotFound):
+			http.Error(w, "no such node", http.StatusNotFound)
+			return
+		case errors.Is(err, engine.ErrBrowseUnsupported):
+			s.renderBrowse(w, r, browsePicker{
+				NodeID:  id,
+				Dir:     cleanBrowseDir(raw),
+				Message: "browsing not supported for this node yet",
+			})
+			return
+		default:
+			// A missing directory or a not-a-directory path: surface a friendly note
+			// in-place rather than a 500. reach_config holds no secret, so the engine
+			// error text leaks nothing sensitive, but we keep the message generic.
+			s.renderBrowse(w, r, browsePicker{
+				NodeID:  id,
+				Dir:     cleanBrowseDir(raw),
+				Message: "could not browse that folder",
+			})
+			return
+		}
+	}
+
+	dir := cleanBrowseDir(raw)
+	pick := browsePicker{NodeID: id, Dir: dir}
+	if dir != "" {
+		pick.HasParent = true
+		// path.Dir of a single segment is "."; normalize back to "" (the root).
+		parent := path.Dir(dir)
+		if parent == "." {
+			parent = ""
+		}
+		pick.Parent = parent
+	}
+	for _, e := range entries {
+		rel := e.Name
+		if dir != "" {
+			rel = dir + "/" + e.Name
+		}
+		pick.Entries = append(pick.Entries, browseEntry{
+			Name:  e.Name,
+			Rel:   rel,
+			IsDir: e.IsDir,
+			Size:  e.Size,
+			Mtime: e.Mtime,
+		})
+	}
+	s.renderBrowse(w, r, pick)
+}
+
+// cleanBrowseDir normalizes a raw query path into a node-relative directory for
+// display/link math: "" and "." both become "" (the node root); otherwise it is
+// path.Clean'd. This is purely cosmetic — the RAW value is what the engine's
+// safepath validates — but it keeps the rendered up-link/child links tidy. A
+// value that path.Clean would let escape (".." prefix) is flattened to "" so a
+// rejected request never renders an escaping link; in practice the engine has
+// already 400'd such a path before render.
+func cleanBrowseDir(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	c := path.Clean(raw)
+	if c == "." || c == "/" {
+		return ""
+	}
+	if strings.HasPrefix(c, "..") || strings.HasPrefix(c, "/") {
+		return ""
+	}
+	return c
+}
+
+// renderBrowse writes the node-browse fragment.
+func (s *Server) renderBrowse(w http.ResponseWriter, r *http.Request, pick browsePicker) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.templates.ExecuteTemplate(w, "node-browse", pick); err != nil {
+		s.logger.ErrorContext(r.Context(), "browse render failed", "err", err.Error())
+	}
 }
 
 // touchLastSeen updates a node's last_seen_at to now via UpdateNode. It re-reads

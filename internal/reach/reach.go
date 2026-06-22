@@ -42,6 +42,24 @@ type FileMeta struct {
 	Size int64
 }
 
+// DirEntry is one entry in a directory listing returned by List. It carries
+// ONLY metadata (name, type, size, mtime) — never file contents. It is what the
+// save-file picker renders so an operator can browse a node's save directory and
+// click the real file instead of typing the path by hand. The Name is a single
+// path component (not a full relative path); the caller joins it onto the
+// listed directory's relative path to descend or to select a file.
+type DirEntry struct {
+	// Name is the entry's base name (one path component, no separators).
+	Name string
+	// IsDir is true for a subdirectory (the picker re-browses into it) and false
+	// for a regular file (the picker selects it).
+	IsDir bool
+	// Size is the file's size in bytes (0 for a directory).
+	Size int64
+	// Mtime is the entry's last-modified time.
+	Mtime time.Time
+}
+
 // Reach is the engine's port onto one node's save filesystem.
 //
 // Path semantics: every path passed to these methods is the node's
@@ -57,6 +75,20 @@ type Reach interface {
 
 	// Read returns the full file contents, or ErrNotExist when absent.
 	Read(ctx context.Context, path string) ([]byte, error)
+
+	// List returns the directory entries directly under relPath, which is a
+	// node-relative path (same semantics as every other method: relative to the
+	// node's save root, resolved by the ADAPTER, never the engine). An empty
+	// relPath or "." names the node's save ROOT. It returns metadata ONLY (names,
+	// types, sizes, mtimes) — NEVER file contents — so it backs the save-file
+	// picker without exposing saves.
+	//
+	// Entries are sorted directories-first, then alphabetically by name, so the
+	// picker render is deterministic. A relPath that does not exist maps to
+	// ErrNotExist (a sentinel in this package); a relPath that exists but is not a
+	// directory is a clear (non-ErrNotExist) error. A path that would escape the
+	// node root is rejected by the adapter's containment check (safepath).
+	List(ctx context.Context, relPath string) ([]DirEntry, error)
 
 	// WriteAtomic writes data to path crash-safely and sets the file's mtime to
 	// the given mtime. The contract (from docs/state-machine.md "Crash safety"):

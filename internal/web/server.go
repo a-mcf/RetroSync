@@ -73,6 +73,17 @@ type Actioner interface {
 	// yet"). Read-only: it never mutates the node (the handler updates
 	// last_seen_at via the Store on success).
 	SmokeTest(ctx context.Context, nodeID string) error
+	// BrowseNode lists the directory entries directly under relPath on a node, for
+	// the registry's save-file picker. relPath is node-relative ("" / "." = the
+	// node's save root). It is the engine method that lets the web layer browse a
+	// node's mounted save directory WITHOUT importing internal/reach (the engine
+	// owns the resolver, the safepath containment, and the List). It returns
+	// metadata only — names, types, sizes, mtimes — NEVER file contents. A
+	// traversal/unsafe relPath surfaces the adapter's containment rejection
+	// (safepath.ErrUnsafePath) in the error chain; an unsupported reach (ssh)
+	// returns engine.ErrBrowseUnsupported; a missing node returns store.ErrNotFound.
+	// Read-only.
+	BrowseNode(ctx context.Context, nodeID, relPath string) ([]engine.DirEntry, error)
 }
 
 // Server holds the web service's dependencies. Construct with New; build the
@@ -200,6 +211,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/nodes/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditNode)))))
 	mux.Handle("POST /api/nodes/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteNode)))))
 	mux.Handle("POST /api/nodes/{id}/smoke-test", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSmokeTest)))))
+	// Save-file picker (slice-17): an admin-only, read-only GET that lists a
+	// node's mounted save directory so the operator can click the real file in
+	// the "Add member" form instead of typing the path. It exposes a node's
+	// directory listing (metadata only — names/sizes/mtimes, NEVER contents), so
+	// it is gated behind requireAdmin like the rest of the registry. No CSRF: it
+	// is a safe GET (read-only) and admin-gated.
+	mux.Handle("GET /api/nodes/{id}/browse", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleBrowseNode))))
 
 	// Games registry (slice-11 + slice-16). Admin-only per docs/auth.md, same
 	// wrapping as /nodes: every page and mutation behind requireAuth+requireAdmin

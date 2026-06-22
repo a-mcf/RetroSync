@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/reach"
+	"github.com/a-mcf/retrosync/internal/reach/safepath"
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
@@ -80,6 +81,20 @@ var (
 	// internal/reach (it wraps reach.ErrUnsupportedReach for engine-side callers
 	// that still want the underlying cause).
 	ErrSmokeTestUnsupported = errors.New("engine: smoke-test not supported for this reach")
+	// ErrBrowseUnsupported is returned by BrowseNode when the node's reach
+	// strategy has no adapter wired yet (today: ssh). Like ErrSmokeTestUnsupported
+	// it is the engine's own sentinel so the web save-file picker can render
+	// "browsing not supported for this node" WITHOUT importing internal/reach; the
+	// underlying reach.ErrUnsupportedReach stays in the chain.
+	// TODO(slice-ssh): ssh nodes become browsable once the ssh/sftp adapter lands.
+	ErrBrowseUnsupported = errors.New("engine: browsing not supported for this reach")
+	// ErrBrowseUnsafePath is returned by BrowseNode when the requested relPath is
+	// rejected by the adapter's containment check (it is absolute, or it escapes
+	// the node root via ".."/symlink). It is the engine's own sentinel — wrapping
+	// safepath.ErrUnsafePath — so the web layer can map an unsafe browse path to a
+	// 400 WITHOUT importing internal/reach or internal/reach/safepath. The
+	// underlying safepath.ErrUnsafePath stays in the chain.
+	ErrBrowseUnsafePath = errors.New("engine: browse path is unsafe (escapes node root)")
 )
 
 // scopedNode pairs an in-scope node (a sync member) with its member path and
@@ -377,6 +392,75 @@ func (e *Engine) SmokeTest(ctx context.Context, nodeID string) error {
 		return fmt.Errorf("engine: smoke-test stat %q: %w", nodeID, err)
 	}
 	return nil
+}
+
+// DirEntry is one entry in a node directory listing returned by BrowseNode. It
+// is the engine's OWN value type (a copy of reach.DirEntry's fields) so the web
+// layer can render the picker by depending on internal/engine alone, WITHOUT
+// importing internal/reach — exactly as NodeState lets the conflict modal avoid
+// a reach import. It carries metadata only; never file contents.
+type DirEntry struct {
+	// Name is the entry's base name (one path component, no separators).
+	Name string
+	// IsDir is true for a subdirectory (the picker re-browses) and false for a
+	// regular file (the picker selects it).
+	IsDir bool
+	// Size is the file's size in bytes (0 for a directory).
+	Size int64
+	// Mtime is the entry's last-modified time.
+	Mtime time.Time
+}
+
+// BrowseNode lists the directory entries directly under relPath on the given
+// node, for the registry's save-file picker (the operator browses a node's
+// mounted save directory and clicks the real file instead of typing its path).
+// relPath is node-relative (empty / "." names the node's save root); the adapter
+// resolves and contains it. It returns metadata only — names, types, sizes,
+// mtimes — never file contents.
+//
+//   - syncthing-share: resolves to the localfs adapter and lists the directory
+//     (safepath rejects any traversal/escape path before any I/O).
+//   - ssh: resolve has no adapter yet, so this returns ErrBrowseUnsupported
+//     (which wraps reach.ErrUnsupportedReach). The web layer matches the engine
+//     sentinel and renders "browsing not supported for this node" WITHOUT
+//     importing internal/reach.
+//     TODO(slice-ssh): a real ssh adapter makes ssh nodes browsable.
+//
+// BrowseNode is read-only: it never mutates the store or the node. A missing
+// node returns store.ErrNotFound. A traversal/unsafe relPath surfaces the
+// adapter's safepath rejection (safepath.ErrUnsafePath) in the error chain.
+func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirEntry, error) {
+	node, err := e.store.GetNode(ctx, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("engine: browse get node %q: %w", nodeID, err)
+	}
+	r, err := e.resolve(node)
+	if err != nil {
+		// No adapter wired (ssh today) surfaces as the engine's own
+		// ErrBrowseUnsupported so the web layer maps "not supported yet" without
+		// importing internal/reach; the underlying cause stays in the chain.
+		if errors.Is(err, reach.ErrUnsupportedReach) {
+			return nil, fmt.Errorf("engine: browse %q: %w: %w", nodeID, ErrBrowseUnsupported, err)
+		}
+		return nil, fmt.Errorf("engine: browse resolve %q: %w", nodeID, err)
+	}
+	entries, err := r.List(ctx, relPath)
+	if err != nil {
+		// An unsafe (escaping/absolute) path is the adapter's safepath rejection;
+		// surface it as the engine's own sentinel so the web maps it to a 400
+		// without importing internal/reach/safepath. The underlying cause is kept.
+		if errors.Is(err, safepath.ErrUnsafePath) {
+			return nil, fmt.Errorf("engine: browse %q path %q: %w: %w", nodeID, relPath, ErrBrowseUnsafePath, err)
+		}
+		return nil, fmt.Errorf("engine: browse list %q: %w", nodeID, err)
+	}
+	// Map reach.DirEntry -> engine.DirEntry so callers (the web picker) depend on
+	// engine alone, not internal/reach.
+	out := make([]DirEntry, len(entries))
+	for i, de := range entries {
+		out[i] = DirEntry{Name: de.Name, IsDir: de.IsDir, Size: de.Size, Mtime: de.Mtime}
+	}
+	return out, nil
 }
 
 // ResolveConflict resolves a flagged conflict by making winnerNodeID's current
