@@ -234,9 +234,10 @@ func TestDeleteNode_HappyPath(t *testing.T) {
 func TestDeleteNode_InUse_Friendly409(t *testing.T) {
 	f := newActionFixture(t)
 	ctx := context.Background()
-	// Bind super-metroid to bob-deck so the node is an active binding's primary.
+	// Bind sync sm-bob to bob-deck so the node is an active binding's primary
+	// (active_bindings.primary_node NO-ACTION FK blocks the node delete).
 	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("create binding: %v", err)
 	}

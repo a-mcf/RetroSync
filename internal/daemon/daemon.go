@@ -2,9 +2,9 @@
 // engine deliberately does not own (see internal/engine, TODO(slice-daemon)).
 //
 // Every interval the daemon runs a "sweep": it lists the active bindings and
-// calls Poll once per bound game. Errors are isolated per game — one game's
+// calls Poll once per bound sync. Errors are isolated per sync — one sync's
 // failed poll (or a surfaced conflict) is logged and never aborts the sweep or
-// crashes the loop, since the loop is the only thing keeping every OTHER game
+// crashes the loop, since the loop is the only thing keeping every OTHER sync
 // syncing. The sweep is idempotent (the engine re-stats and resumes), so a
 // crash/restart simply picks up on the next tick (docs/state-machine.md,
 // "Crash safety").
@@ -12,9 +12,6 @@
 // The daemon depends on narrow interfaces (Poller, BindingLister), not the
 // concrete *engine.Engine or *store.Store, so its logic is trivially testable
 // with stubs and the tick source is injectable for deterministic tests.
-//
-// TODO(slice-api): the HTTP/HTMX surface that drives Activate/Deactivate runs
-// alongside this loop in the same process.
 package daemon
 
 import (
@@ -26,19 +23,20 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// defaultPollTimeout bounds a single game's Poll. Saves are tiny, so this only
+// defaultPollTimeout bounds a single sync's Poll. Saves are tiny, so this only
 // ever fires on a genuinely hung node; it stops one stuck poll from stalling
 // the serial sweep forever. Overridable via New's pollTimeout argument.
 const defaultPollTimeout = 60 * time.Second
 
-// Poller runs one sync pass for a single game. *engine.Engine satisfies this
+// Poller runs one sync pass for a single sync. *engine.Engine satisfies this
 // via its Poll method. A conflict is not an error here: the engine flags the
-// binding and returns nil; the daemon keeps sweeping.
+// binding and returns nil; the daemon keeps sweeping. The id passed is the
+// active binding's sync id.
 type Poller interface {
-	Poll(ctx context.Context, gameID string) error
+	Poll(ctx context.Context, syncID string) error
 }
 
-// BindingLister enumerates the active bindings (the games to poll). store.Store
+// BindingLister enumerates the active bindings (the syncs to poll). store.Store
 // satisfies this via ListBindings.
 type BindingLister interface {
 	ListBindings(ctx context.Context) ([]store.ActiveBinding, error)
@@ -97,9 +95,9 @@ type SweepResult struct {
 }
 
 // RunOnce performs one sweep: list the active bindings and Poll each exactly
-// once. Errors are isolated per game (logged, counted, not propagated) so a
-// single bad game never aborts the sweep. ctx cancellation is honored between
-// games. A failure to LIST the bindings is the one error returned, since
+// once. Errors are isolated per sync (logged, counted, not propagated) so a
+// single bad sync never aborts the sweep. ctx cancellation is honored between
+// syncs. A failure to LIST the bindings is the one error returned, since
 // without the list there is nothing to sweep.
 func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 	// If the ctx is already cancelled (e.g. shutdown raced the tick), don't even
@@ -118,7 +116,7 @@ func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 
 	var res SweepResult
 	for _, b := range bindings {
-		// Honor cancellation between games so shutdown is prompt even with many
+		// Honor cancellation between syncs so shutdown is prompt even with many
 		// active bindings.
 		if err := ctx.Err(); err != nil {
 			d.logger.InfoContext(ctx, "sweep cancelled",
@@ -127,16 +125,16 @@ func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 		}
 
 		res.Polled++
-		if err := d.pollOne(ctx, b.GameID); err != nil {
-			// Per-game error isolation: log and continue. A poll error (including a
+		if err := d.pollOne(ctx, b.SyncID); err != nil {
+			// Per-sync error isolation: log and continue. A poll error (including a
 			// timeout or a recovered panic) means the next sweep will re-stat and
-			// retry; one broken game must not stall every other game's sync.
+			// retry; one broken sync must not stall every other sync.
 			res.Errors++
 			d.logger.ErrorContext(ctx, "poll failed",
-				slog.String("game_id", b.GameID), slog.String("err", err.Error()))
+				slog.String("sync_id", b.SyncID), slog.String("err", err.Error()))
 			continue
 		}
-		d.logger.DebugContext(ctx, "polled", slog.String("game_id", b.GameID))
+		d.logger.DebugContext(ctx, "polled", slog.String("sync_id", b.SyncID))
 	}
 
 	d.logger.DebugContext(ctx, "sweep done",
@@ -144,16 +142,16 @@ func (d *Daemon) RunOnce(ctx context.Context) (SweepResult, error) {
 	return res, nil
 }
 
-// pollOne runs exactly one game's Poll with two layers of isolation, so a
-// single misbehaving game can never take down the sweep or the daemon loop:
+// pollOne runs exactly one sync's Poll with two layers of isolation, so a
+// single misbehaving sync can never take down the sweep or the daemon loop:
 //
-//   - a per-game timeout (d.pollTimeout) so a hung Poll surfaces as a normal
+//   - a per-sync timeout (d.pollTimeout) so a hung Poll surfaces as a normal
 //     deadline error and the sweep moves on, and
 //   - a recover() that converts any panic inside Poll (nil map, slice bounds, a
 //     future SSH-lib panic) into an ordinary error. The recovered value is kept
 //     out of any secret-bearing context: only the panic value's default format
 //     is included, never the ctx or binding internals.
-func (d *Daemon) pollOne(ctx context.Context, gameID string) (err error) {
+func (d *Daemon) pollOne(ctx context.Context, syncID string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("poll panicked: %v", r)
@@ -163,7 +161,7 @@ func (d *Daemon) pollOne(ctx context.Context, gameID string) (err error) {
 	pollCtx, cancel := context.WithTimeout(ctx, d.pollTimeout)
 	defer cancel()
 
-	return d.poller.Poll(pollCtx, gameID)
+	return d.poller.Poll(pollCtx, syncID)
 }
 
 // Run loops: one sweep immediately, then one per interval tick, until ctx is

@@ -16,11 +16,13 @@ var (
 	// ErrNotFound is returned when a requested entity does not exist.
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is returned on a uniqueness violation: a duplicate primary
-	// key (id) or a duplicate (game_id, node_id) game_path.
+	// key (id) or a duplicate (game_id, node_id) game_path / (sync_id, node_id)
+	// manifest / (node_id, path) sync_member.
 	ErrConflict = errors.New("store: conflict")
 	// ErrInvalidReference is returned when a write references a parent row that
-	// does not exist: e.g. a node with an owner_user_id for a missing user, or
-	// a game_path naming a missing game or node (a foreign-key violation).
+	// does not exist: e.g. a node with an owner_user_id for a missing user, a
+	// game_path naming a missing game or node, or a binding/manifest/log naming a
+	// missing sync (a foreign-key violation).
 	ErrInvalidReference = errors.New("store: invalid reference")
 	// ErrInvalidValue is returned when a field fails a domain/enum constraint:
 	// e.g. a bad role, kind, or reach (a CHECK violation).
@@ -165,20 +167,21 @@ func ValidDirection(d string) bool {
 	return id != d && id != ""
 }
 
-// ActiveBinding is the runtime row that makes a game "active" (in a play
-// session). A game with no ActiveBinding is idle (backup-only). The GameID is
-// the primary key: at most one active binding may exist per game.
+// ActiveBinding is the runtime row that makes a sync "active" (in a play
+// session). A sync with no ActiveBinding is idle (backup-only). The SyncID is
+// the primary key: at most one active binding may exist per sync.
+//
+// There is no PeerScope: a sync's members ARE its scope. The in-scope nodes for
+// an active binding are exactly the sync's SyncMembers.
 type ActiveBinding struct {
-	// GameID is the bound game; the PK enforces one active session per game.
-	GameID string
+	// SyncID is the bound sync; the PK enforces one active session per sync.
+	SyncID string
 	// PrimaryNode is the node currently holding play authority.
 	PrimaryNode string
 	StartedAt   time.Time
 	// Direction is "from-primary" (primary wins the first sync) or
 	// "from-peer-<node_id>".
 	Direction string
-	// PeerScope is "all-configured" (default) or a csv of node ids.
-	PeerScope string
 	// ConflictAt is non-nil when a non-primary peer mutated mid-session; it
 	// flags the conflict (paused) state. Nil otherwise.
 	ConflictAt *time.Time
@@ -193,8 +196,8 @@ type LogEntry struct {
 	ID int64
 	// TS is the time of the copy; the store defaults it to now() when zero.
 	TS time.Time
-	// GameID is the game this entry concerns (FK; cascades on game delete).
-	GameID string
+	// SyncID is the sync this entry concerns (FK; cascades on sync delete).
+	SyncID string
 	// FromNode/ToNode are historical node ids, unconstrained text (NOT FKs) so
 	// a later node removal neither erases nor blocks log history. May be empty.
 	FromNode string
@@ -210,10 +213,10 @@ type LogEntry struct {
 	Message string
 }
 
-// ManifestEntry is the last-known file state for a (game, node) pair, updated
-// by the poll loop. PK is (GameID, NodeID); cascades on game/node delete.
+// ManifestEntry is the last-known file state for a (sync, node) pair, updated
+// by the poll loop. PK is (SyncID, NodeID); cascades on sync/node delete.
 type ManifestEntry struct {
-	GameID string
+	SyncID string
 	NodeID string
 	// Mtime / Size are the fast-path identity of the file; nil when unknown.
 	Mtime *time.Time
@@ -288,51 +291,47 @@ type Store interface {
 	ListGamePathsByNode(ctx context.Context, nodeID string) ([]GamePath, error)
 	DeleteGamePath(ctx context.Context, gameID, nodeID string) error
 
-	// ActiveBindings. The game_id PK enforces one active session per game.
-	// CreateBinding: duplicate game_id -> ErrConflict; missing game/node ->
+	// ActiveBindings. The sync_id PK enforces one active session per sync.
+	// CreateBinding: duplicate sync_id -> ErrConflict; missing sync/node ->
 	// ErrInvalidReference; bad direction -> ErrInvalidValue.
 	//
 	// Typed-error precedence: inputs are expected to violate at most one
-	// constraint. When an input violates several at once (e.g. duplicate game_id
+	// constraint. When an input violates several at once (e.g. duplicate sync_id
 	// AND bad direction), which typed error is returned is unspecified and may
 	// differ between backends. (Applies to UpdateBinding too.)
 	CreateBinding(ctx context.Context, b ActiveBinding) error
-	GetBinding(ctx context.Context, gameID string) (ActiveBinding, error)
+	GetBinding(ctx context.Context, syncID string) (ActiveBinding, error)
 	ListBindings(ctx context.Context) ([]ActiveBinding, error)
 	// UpdateBinding rewrites the mutable fields (primary_node, direction,
-	// peer_scope, conflict_at, last_synced) of an existing binding. Missing ->
-	// ErrNotFound; bad direction -> ErrInvalidValue.
+	// conflict_at, last_synced) of an existing binding. Missing -> ErrNotFound;
+	// bad direction -> ErrInvalidValue.
 	UpdateBinding(ctx context.Context, b ActiveBinding) error
 	// DeleteBinding is idempotent: deleting an absent binding returns nil (per
 	// api.md "deactivate is idempotent").
-	DeleteBinding(ctx context.Context, gameID string) error
+	DeleteBinding(ctx context.Context, syncID string) error
 
 	// SyncLog (append-only).
-	// AppendLog: bad outcome -> ErrInvalidValue; missing game ->
+	// AppendLog: bad outcome -> ErrInvalidValue; missing sync ->
 	// ErrInvalidReference. A non-zero LogEntry.TS is honored as-is; a zero TS
 	// defaults to now() (UTC). The store assigns the entry's id (bigserial);
 	// AppendLog does not write it back into the passed entry, so callers that
-	// need the id re-read via ListLogByGame.
+	// need the id re-read via ListLogBySync.
 	AppendLog(ctx context.Context, e LogEntry) error
-	// ListLogByGame returns a game's entries most-recent-first, ordered by ts
+	// ListLogBySync returns a sync's entries most-recent-first, ordered by ts
 	// descending, with ties broken by id descending. Capped at limit
 	// (limit <= 0 means no cap). Because ts may be caller-supplied or skewed
 	// (RTC-less / drifting clocks), this ts-then-id ordering — not insertion
 	// order — is the contract both implementations honor.
-	ListLogByGame(ctx context.Context, gameID string, limit int) ([]LogEntry, error)
+	ListLogBySync(ctx context.Context, syncID string, limit int) ([]LogEntry, error)
 
 	// Manifest (per-side last-known file state).
-	SetManifest(ctx context.Context, m ManifestEntry) error // upsert on (game_id, node_id)
-	GetManifest(ctx context.Context, gameID, nodeID string) (ManifestEntry, error)
-	ListManifestByGame(ctx context.Context, gameID string) ([]ManifestEntry, error)
+	SetManifest(ctx context.Context, m ManifestEntry) error // upsert on (sync_id, node_id)
+	GetManifest(ctx context.Context, syncID, nodeID string) (ManifestEntry, error)
+	ListManifestBySync(ctx context.Context, syncID string) ([]ManifestEntry, error)
 
-	// Syncs and SyncMembers — the additive foundation of the sync data-model
-	// redesign. These tables sit ALONGSIDE the game-based tables above; nothing
-	// here re-points the engine, runtime tables, or web yet.
-	//
-	// TODO(slice-sync-cutover): the engine, runtime tables (active_bindings,
-	// manifest, sync_log), and web all key off game_id today. Later slices move
-	// them onto sync_id, using Sync/SyncMember as the unit of mirroring.
+	// Syncs and SyncMembers — the unit of mirroring. The runtime tables
+	// (active_bindings, manifest, sync_log) above key off sync_id; the engine,
+	// daemon, and web PLAY side all operate on a Sync and its SyncMembers.
 
 	// CreateSync inserts a sync. Duplicate id -> ErrConflict; missing game ->
 	// ErrInvalidReference.

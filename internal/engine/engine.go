@@ -1,19 +1,18 @@
-// Package engine is the heart of RetroSync's play-sync: it activates a game
+// Package engine is the heart of RetroSync's play-sync: it activates a SYNC
 // for a play session, polls an active binding to fan-out changes from the
 // primary to its peers, detects (and flags, but does not resolve) conflicts,
 // and deactivates with a final sync pass. It implements docs/state-machine.md.
 //
+// A *sync* is the unit of mirroring: a specific set of (node, save-file)
+// members that sync together (one game may have many independent syncs). The
+// engine operates on a sync id and that sync's SyncMembers — each member's
+// node_id + path is the in-scope (node, file) pair. There is no peer-scope: a
+// sync's members ARE its scope.
+//
 // The engine is pure logic over two ports: a store.Store for persistence and a
 // reach.Reach per node for filesystem access. It owns no goroutines, no timers,
-// and no real I/O. The background ticker that calls Poll on a schedule, plus
-// the HTTP/API surface, live in later slices.
-//
-// TODO(slice-daemon): the poll-loop ticker that calls Poll(ctx, gameID) every
-// N seconds for each active binding.
-// TODO(slice-api): the HTTP handlers that drive Activate/Poll/Deactivate.
-// TODO(slice-conflict-ui): the conflict modal and the
-// POST /api/games/{id}/resolve-conflict handler that drives ResolveConflict /
-// NodeStates, plus the dashboard wiring that surfaces a conflicted binding.
+// and no real I/O. The background ticker that calls Poll on a schedule lives in
+// internal/daemon; the HTTP/API surface lives in internal/web.
 package engine
 
 import (
@@ -60,9 +59,17 @@ var (
 	// ErrSourceMissing is returned when the direction names a source node whose
 	// file is absent (e.g. from-peer-<id> but that peer has no save).
 	ErrSourceMissing = errors.New("engine: chosen source node has no save")
-	// ErrNoPath is returned when a referenced node has no game_paths row for the
-	// game (e.g. the direction names a node not configured for this game).
-	ErrNoPath = errors.New("engine: node has no path for game")
+	// ErrNoPath is returned when a referenced node is not a member of the sync
+	// (e.g. the direction names a node not in the sync's members).
+	ErrNoPath = errors.New("engine: node is not a member of the sync")
+	// ErrPrimaryNotMember is returned by Activate when primaryNode is not a member
+	// of the sync. The web layer validates that the caller OWNS primaryNode, but
+	// ownership alone does not entitle a node to play authority over a sync it has
+	// no part in: the primary MUST also be a member. Without this check a user who
+	// owns some unrelated node could seize a sync's binding (and thereby its
+	// deactivate/resolve authority) by naming that owned non-member as primary.
+	// Returned BEFORE any write so a rejected activate mutates nothing.
+	ErrPrimaryNotMember = errors.New("engine: primary node is not a member of the sync")
 	// ErrNotConflicted is returned by ResolveConflict when the binding is not in
 	// conflict (conflict_at == nil): there is nothing to resolve, and forcing a
 	// fan-out would silently overwrite peers the human never reviewed.
@@ -75,31 +82,31 @@ var (
 	ErrSmokeTestUnsupported = errors.New("engine: smoke-test not supported for this reach")
 )
 
-// scopedNode pairs an in-scope node with its game_paths.path and resolved Reach.
+// scopedNode pairs an in-scope node (a sync member) with its member path and
+// resolved Reach.
 type scopedNode struct {
 	node store.Node
 	path string
 	r    reach.Reach
 }
 
-// Activate starts a play session for gameID with primaryNode holding play
+// Activate starts a play session for syncID with primaryNode holding play
 // authority. direction selects the first-sync source ("from-primary" or
-// "from-peer-<nodeID>"); peerScope is "all-configured" or a csv of node ids.
+// "from-peer-<nodeID>"). The in-scope nodes are the sync's members.
 //
-// It determines the in-scope nodes (those with a game_paths row for the game,
-// filtered by peerScope), stats them, resolves the source per direction, creates
-// the active_bindings row, and fans the source file out to every other in-scope
-// node — updating the manifest and appending a sync_log row per directional
-// copy.
+// It determines the in-scope nodes (the sync's SyncMembers, each member's
+// node_id + path), stats them, resolves the source per direction, creates the
+// active_bindings row, and fans the source file out to every other in-scope node
+// — updating the manifest and appending a sync_log row per directional copy.
 //
 // force controls the already-active case (docs/state-machine.md step 1):
-//   - force=false: activating a game that already has a binding is rejected with
+//   - force=false: activating a sync that already has a binding is rejected with
 //     store.ErrConflict ("currently bound to <other>; force takeover?").
 //   - force=true: the existing binding row is deleted (a raw replace — NOT a
 //     Deactivate-with-final-sync) and the new session proceeds with the normal
 //     activate + fan-out. The takeover's chosen source (per direction) is what
 //     gets fanned out, so the taker's "use my save" choice wins.
-func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string, force bool) error {
+func (e *Engine) Activate(ctx context.Context, syncID, primaryNode, direction string, force bool) error {
 	if !store.ValidDirection(direction) {
 		return fmt.Errorf("engine: invalid direction %q: %w", direction, store.ErrInvalidValue)
 	}
@@ -108,12 +115,21 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 	// A force-takeover that turns out to be non-viable (no save in scope, chosen
 	// source missing, etc.) must return its error WITHOUT having displaced the
 	// existing session (the displaced row would otherwise be lost for nothing).
-	scoped, err := e.inScopeNodes(ctx, gameID, peerScope)
+	scoped, err := e.inScopeNodes(ctx, syncID)
 	if err != nil {
 		return err
 	}
 	if len(scoped) == 0 {
-		return fmt.Errorf("engine: no in-scope nodes for game %q: %w", gameID, ErrNoSave)
+		return fmt.Errorf("engine: no members for sync %q: %w", syncID, ErrNoSave)
+	}
+
+	// Authority gate: primaryNode MUST be a member of the sync. The web layer
+	// only validates that the caller OWNS primaryNode; owning an unrelated node
+	// does not grant play authority over a sync that node has no part in. We
+	// reject here — BEFORE any stat, the force-takeover delete, or CreateBinding —
+	// so an activate naming a non-member primary mutates nothing.
+	if _, ok := byID(scoped, primaryNode); !ok {
+		return fmt.Errorf("engine: primary %q for sync %q: %w", primaryNode, syncID, ErrPrimaryNotMember)
 	}
 
 	// Stat every in-scope node. Absent files are fine (a node may not yet hold a
@@ -132,7 +148,7 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 		present[sn.node.ID] = true
 	}
 	if len(present) == 0 {
-		return fmt.Errorf("engine: game %q: %w", gameID, ErrNoSave)
+		return fmt.Errorf("engine: sync %q: %w", syncID, ErrNoSave)
 	}
 
 	// Resolve the source node from direction.
@@ -142,7 +158,7 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 	}
 	src, ok := byID(scoped, sourceID)
 	if !ok {
-		return fmt.Errorf("engine: source %q for game %q: %w", sourceID, gameID, ErrNoPath)
+		return fmt.Errorf("engine: source %q for sync %q: %w", sourceID, syncID, ErrNoPath)
 	}
 	if !present[sourceID] {
 		return fmt.Errorf("engine: source %q: %w", sourceID, ErrSourceMissing)
@@ -156,8 +172,8 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 	// could overwrite that choice (docs/state-machine.md step 1: "Force = delete
 	// the existing row, create new").
 	if force {
-		if _, err := e.store.GetBinding(ctx, gameID); err == nil {
-			if err := e.store.DeleteBinding(ctx, gameID); err != nil {
+		if _, err := e.store.GetBinding(ctx, syncID); err == nil {
+			if err := e.store.DeleteBinding(ctx, syncID); err != nil {
 				return fmt.Errorf("engine: force-takeover delete binding: %w", err)
 			}
 		} else if !errors.Is(err, store.ErrNotFound) {
@@ -167,13 +183,12 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 
 	now := e.clock()
 	binding := store.ActiveBinding{
-		GameID:      gameID,
+		SyncID:      syncID,
 		PrimaryNode: primaryNode,
 		StartedAt:   now,
 		Direction:   direction,
-		PeerScope:   peerScope,
 	}
-	// CreateBinding rejects a duplicate game_id via the PK (store.ErrConflict),
+	// CreateBinding rejects a duplicate sync_id via the PK (store.ErrConflict),
 	// which surfaces "currently bound to ... force takeover?" at the UI layer.
 	if err := e.store.CreateBinding(ctx, binding); err != nil {
 		return fmt.Errorf("engine: create binding: %w", err)
@@ -185,8 +200,8 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 	// and the operator would be stuck on a half-active game. Unlike Poll (which
 	// self-heals on the next pass), Activate has no later pass to recover, so we
 	// best-effort roll back to idle on ANY error and let the operator retry.
-	if err := e.activateFanOut(ctx, gameID, src, scoped, metas[sourceID], binding, now); err != nil {
-		if delErr := e.store.DeleteBinding(ctx, gameID); delErr != nil {
+	if err := e.activateFanOut(ctx, syncID, src, scoped, metas[sourceID], binding, now); err != nil {
+		if delErr := e.store.DeleteBinding(ctx, syncID); delErr != nil {
 			// Rollback is best-effort: the original error is what the caller acts
 			// on. We do not have a logger wired into the engine yet, so wrap the
 			// rollback failure into the returned error for visibility.
@@ -200,19 +215,19 @@ func (e *Engine) Activate(ctx context.Context, gameID, primaryNode, direction, p
 // activateFanOut performs the first-sync fan-out plus the source-manifest and
 // last_synced bookkeeping. Split out so Activate can wrap any failure in a
 // best-effort rollback (see the call site).
-func (e *Engine) activateFanOut(ctx context.Context, gameID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, binding store.ActiveBinding, now time.Time) error {
+func (e *Engine) activateFanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, binding store.ActiveBinding, now time.Time) error {
 	// Initial fan-out from the chosen source to every other in-scope node.
-	if err := e.fanOut(ctx, gameID, src, scoped, srcMeta, now); err != nil {
+	if err := e.fanOut(ctx, syncID, src, scoped, srcMeta, now); err != nil {
 		return err
 	}
 	// Record the source's own manifest state (it is the authority for this pass).
-	if err := e.setManifest(ctx, gameID, src.node.ID, srcMeta, now); err != nil {
+	if err := e.setManifest(ctx, syncID, src.node.ID, srcMeta, now); err != nil {
 		return err
 	}
 	return e.markSynced(ctx, binding, now)
 }
 
-// Poll runs ONE pass for the game's active binding. If the binding is already
+// Poll runs ONE pass for the sync's active binding. If the binding is already
 // in conflict it does nothing (paused, awaiting human resolution). Otherwise it
 // stats the primary plus every in-scope peer, compares each against the
 // manifest, and applies the docs/state-machine.md case table:
@@ -225,8 +240,8 @@ func (e *Engine) activateFanOut(ctx context.Context, gameID string, src scopedNo
 //
 // The manifest and last_synced advance only after a successful write
 // (crash-safety: the manifest trails the actual write).
-func (e *Engine) Poll(ctx context.Context, gameID string) error {
-	binding, err := e.store.GetBinding(ctx, gameID)
+func (e *Engine) Poll(ctx context.Context, syncID string) error {
+	binding, err := e.store.GetBinding(ctx, syncID)
 	if err != nil {
 		return fmt.Errorf("engine: get binding: %w", err)
 	}
@@ -241,9 +256,9 @@ func (e *Engine) Poll(ctx context.Context, gameID string) error {
 // primary -> peers if the primary changed). If that final pass WOULD be a
 // conflict, the binding is left active and the conflict is surfaced (the row is
 // NOT deleted). Otherwise the active_bindings row is deleted. Idempotent: if the
-// game is already idle, it returns nil.
-func (e *Engine) Deactivate(ctx context.Context, gameID string) error {
-	binding, err := e.store.GetBinding(ctx, gameID)
+// sync is already idle, it returns nil.
+func (e *Engine) Deactivate(ctx context.Context, syncID string) error {
+	binding, err := e.store.GetBinding(ctx, syncID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil // already idle
@@ -259,14 +274,14 @@ func (e *Engine) Deactivate(ctx context.Context, gameID string) error {
 		return err
 	}
 	// Re-read: syncPass may have flagged a conflict. If so, leave the binding.
-	binding, err = e.store.GetBinding(ctx, gameID)
+	binding, err = e.store.GetBinding(ctx, syncID)
 	if err != nil {
 		return fmt.Errorf("engine: re-read binding: %w", err)
 	}
 	if binding.ConflictAt != nil {
 		return nil // conflict on final pass: leave active + flagged
 	}
-	if err := e.store.DeleteBinding(ctx, gameID); err != nil {
+	if err := e.store.DeleteBinding(ctx, syncID); err != nil {
 		return fmt.Errorf("engine: delete binding: %w", err)
 	}
 	return nil
@@ -287,25 +302,16 @@ type NodeState struct {
 	Size  int64
 }
 
-// NodeStates returns the live per-node state of every in-scope node that has a
-// game_paths row for gameID, sorted by NodeID for determinism. It is read-only:
-// no manifest, binding, or filesystem mutation. A node whose file is absent is
-// returned with Present=false; any Stat error other than reach.ErrNotExist is a
-// real error.
+// NodeStates returns the live per-node state of every member of the sync, sorted
+// by NodeID for determinism. It is read-only: no manifest, binding, or
+// filesystem mutation. A node whose file is absent is returned with
+// Present=false; any Stat error other than reach.ErrNotExist is a real error.
 //
-// The in-scope set is filtered by the binding's peer_scope when a binding
-// exists; for an idle game (no binding) every configured node is in scope so the
-// pre-bind stale-peer view (docs/state-machine.md "Stale-peer visibility") can
-// render too.
-func (e *Engine) NodeStates(ctx context.Context, gameID string) ([]NodeState, error) {
-	peerScope := "all-configured"
-	if b, err := e.store.GetBinding(ctx, gameID); err == nil {
-		peerScope = b.PeerScope
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return nil, fmt.Errorf("engine: get binding: %w", err)
-	}
-
-	scoped, err := e.inScopeNodes(ctx, gameID, peerScope)
+// The in-scope set is exactly the sync's members (a sync's members ARE its
+// scope), so the pre-bind stale-peer view (docs/state-machine.md "Stale-peer
+// visibility") renders the same set whether or not a binding exists.
+func (e *Engine) NodeStates(ctx context.Context, syncID string) ([]NodeState, error) {
+	scoped, err := e.inScopeNodes(ctx, syncID)
 	if err != nil {
 		return nil, err
 	}
@@ -398,16 +404,16 @@ func (e *Engine) SmokeTest(ctx context.Context, nodeID string) error {
 //
 // If any backup or fan-out write fails, conflict_at is left set (the binding
 // stays conflicted and re-resolvable) and the error is returned.
-func (e *Engine) ResolveConflict(ctx context.Context, gameID, winnerNodeID string) error {
-	binding, err := e.store.GetBinding(ctx, gameID)
+func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error {
+	binding, err := e.store.GetBinding(ctx, syncID)
 	if err != nil {
 		return fmt.Errorf("engine: get binding: %w", err)
 	}
 	if binding.ConflictAt == nil {
-		return fmt.Errorf("engine: game %q: %w", gameID, ErrNotConflicted)
+		return fmt.Errorf("engine: sync %q: %w", syncID, ErrNotConflicted)
 	}
 
-	scoped, err := e.inScopeNodes(ctx, gameID, binding.PeerScope)
+	scoped, err := e.inScopeNodes(ctx, syncID)
 	if err != nil {
 		return err
 	}
@@ -435,19 +441,19 @@ func (e *Engine) ResolveConflict(ctx context.Context, gameID, winnerNodeID strin
 	// any overwrite. A backup failure aborts WITHOUT having touched the saves and
 	// leaves the conflict set (re-resolvable). No loser file is overwritten until
 	// every loser-with-a-file has been backed up.
-	if err := e.backupLosers(ctx, gameID, scoped, winner, now); err != nil {
+	if err := e.backupLosers(ctx, syncID, scoped, winner, now); err != nil {
 		return err
 	}
 
 	// Step 2: fan out the winner to every other in-scope node, advancing the
 	// manifest only after each successful write. A partial fan-out returns the
-	// error and (because we have NOT cleared conflict_at) leaves the game
+	// error and (because we have NOT cleared conflict_at) leaves the sync
 	// conflicted for re-resolution.
-	if err := e.fanOut(ctx, gameID, winner, scoped, winnerMeta, now); err != nil {
+	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, now); err != nil {
 		return err
 	}
 	// Record the winner's own manifest state (it is the authority for this pass).
-	if err := e.setManifest(ctx, gameID, winner.node.ID, winnerMeta, now); err != nil {
+	if err := e.setManifest(ctx, syncID, winner.node.ID, winnerMeta, now); err != nil {
 		return err
 	}
 
@@ -467,7 +473,7 @@ func (e *Engine) ResolveConflict(ctx context.Context, gameID, winnerNodeID strin
 // "ok" sync_log row per backup. Nodes with no current file are skipped (nothing
 // to preserve). Called before any overwrite so each loser's pre-resolution save
 // survives. A backup write or read failure is returned (and aborts resolution).
-func (e *Engine) backupLosers(ctx context.Context, gameID string, scoped []scopedNode, winner scopedNode, now time.Time) error {
+func (e *Engine) backupLosers(ctx context.Context, syncID string, scoped []scopedNode, winner scopedNode, now time.Time) error {
 	suffix := backupSuffix(now)
 	for _, sn := range scoped {
 		if sn.node.ID == winner.node.ID {
@@ -493,7 +499,7 @@ func (e *Engine) backupLosers(ctx context.Context, gameID string, scoped []scope
 		}
 		bytes := meta.Size
 		if err := e.appendLog(ctx, store.LogEntry{
-			GameID:   gameID,
+			SyncID:   syncID,
 			FromNode: sn.node.ID,
 			ToNode:   sn.node.ID,
 			Bytes:    &bytes,
@@ -530,7 +536,7 @@ func backupSuffix(t time.Time) string {
 // identical (the spec's "final sync pass ... but if it does [conflict], leave
 // the binding active and surface the conflict").
 func (e *Engine) syncPass(ctx context.Context, binding store.ActiveBinding, finalPass bool) error {
-	scoped, err := e.inScopeNodes(ctx, binding.GameID, binding.PeerScope)
+	scoped, err := e.inScopeNodes(ctx, binding.SyncID)
 	if err != nil {
 		return err
 	}
@@ -539,7 +545,7 @@ func (e *Engine) syncPass(ctx context.Context, binding store.ActiveBinding, fina
 		return fmt.Errorf("engine: primary %q: %w", binding.PrimaryNode, ErrNoPath)
 	}
 
-	manifest, err := e.manifestMap(ctx, binding.GameID)
+	manifest, err := e.manifestMap(ctx, binding.SyncID)
 	if err != nil {
 		return err
 	}
@@ -589,10 +595,10 @@ func (e *Engine) syncPass(ctx context.Context, binding store.ActiveBinding, fina
 			// conflict rather than deleting peers. Surfacing beats destruction.
 			return e.flagConflict(ctx, binding, now, finalPass)
 		}
-		if err := e.fanOut(ctx, binding.GameID, primary, scoped, primaryMeta, now); err != nil {
+		if err := e.fanOut(ctx, binding.SyncID, primary, scoped, primaryMeta, now); err != nil {
 			return err
 		}
-		if err := e.setManifest(ctx, binding.GameID, primary.node.ID, primaryMeta, now); err != nil {
+		if err := e.setManifest(ctx, binding.SyncID, primary.node.ID, primaryMeta, now); err != nil {
 			return err
 		}
 		return e.markSynced(ctx, binding, now)
@@ -606,7 +612,7 @@ func (e *Engine) syncPass(ctx context.Context, binding store.ActiveBinding, fina
 // in-scope node, advancing each written node's manifest and appending a
 // sync_log "ok" row per copy. The destination mtime is the source's mtime so
 // the next poll sees source == peer.
-func (e *Engine) fanOut(ctx context.Context, gameID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, now time.Time) error {
+func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, now time.Time) error {
 	data, err := src.r.Read(ctx, src.path)
 	if err != nil {
 		return fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
@@ -627,7 +633,7 @@ func (e *Engine) fanOut(ctx context.Context, gameID string, src scopedNode, scop
 			// Log the error and abort the pass; the next poll re-detects and
 			// retries.
 			_ = e.appendLog(ctx, store.LogEntry{
-				GameID:   gameID,
+				SyncID:   syncID,
 				FromNode: src.node.ID,
 				ToNode:   dst.node.ID,
 				SrcMtime: tptr(srcMeta.Mtime),
@@ -642,12 +648,12 @@ func (e *Engine) fanOut(ctx context.Context, gameID string, src scopedNode, scop
 		// Advance the written node's manifest to the post-write state (mtime ==
 		// source mtime, size == source size).
 		written := reach.FileMeta{Mtime: srcMeta.Mtime, Size: srcMeta.Size}
-		if err := e.setManifest(ctx, gameID, dst.node.ID, written, now); err != nil {
+		if err := e.setManifest(ctx, syncID, dst.node.ID, written, now); err != nil {
 			return err
 		}
 		bytes := srcMeta.Size
 		if err := e.appendLog(ctx, store.LogEntry{
-			GameID:   gameID,
+			SyncID:   syncID,
 			FromNode: src.node.ID,
 			ToNode:   dst.node.ID,
 			Bytes:    &bytes,
@@ -676,7 +682,7 @@ func (e *Engine) flagConflict(ctx context.Context, binding store.ActiveBinding, 
 		msg = "conflict on final (deactivation) pass: " + msg + "; binding left active"
 	}
 	return e.appendLog(ctx, store.LogEntry{
-		GameID:   binding.GameID,
+		SyncID:   binding.SyncID,
 		FromNode: binding.PrimaryNode,
 		Outcome:  store.OutcomeConflict,
 		Message:  msg,
@@ -695,30 +701,26 @@ func (e *Engine) markSynced(ctx context.Context, binding store.ActiveBinding, no
 
 // --- helpers -------------------------------------------------------------
 
-// inScopeNodes returns the nodes that have a game_paths row for gameID, filtered
-// by peerScope, each paired with its path and a resolved Reach. Results are
-// sorted by node id for determinism.
-func (e *Engine) inScopeNodes(ctx context.Context, gameID, peerScope string) ([]scopedNode, error) {
-	paths, err := e.store.ListGamePathsByGame(ctx, gameID)
+// inScopeNodes returns the sync's members (each member's node + path), paired
+// with a resolved Reach. A sync's members ARE its scope — there is no further
+// filtering. Results are sorted by node id for determinism.
+func (e *Engine) inScopeNodes(ctx context.Context, syncID string) ([]scopedNode, error) {
+	members, err := e.store.ListSyncMembers(ctx, syncID)
 	if err != nil {
-		return nil, fmt.Errorf("engine: list game paths: %w", err)
+		return nil, fmt.Errorf("engine: list sync members: %w", err)
 	}
-	scopeSet, scopeAll := parseScope(peerScope)
 
-	out := make([]scopedNode, 0, len(paths))
-	for _, gp := range paths {
-		if !scopeAll && !scopeSet[gp.NodeID] {
-			continue
-		}
-		node, err := e.store.GetNode(ctx, gp.NodeID)
+	out := make([]scopedNode, 0, len(members))
+	for _, m := range members {
+		node, err := e.store.GetNode(ctx, m.NodeID)
 		if err != nil {
-			return nil, fmt.Errorf("engine: get node %s: %w", gp.NodeID, err)
+			return nil, fmt.Errorf("engine: get node %s: %w", m.NodeID, err)
 		}
 		r, err := e.resolve(node)
 		if err != nil {
 			return nil, fmt.Errorf("engine: resolve reach for %s: %w", node.ID, err)
 		}
-		out = append(out, scopedNode{node: node, path: gp.Path, r: r})
+		out = append(out, scopedNode{node: node, path: m.Path, r: r})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].node.ID < out[j].node.ID })
 	return out, nil
@@ -737,8 +739,8 @@ func (e *Engine) statOpt(ctx context.Context, sn scopedNode) (reach.FileMeta, bo
 	return fm, true, nil
 }
 
-func (e *Engine) manifestMap(ctx context.Context, gameID string) (map[string]store.ManifestEntry, error) {
-	entries, err := e.store.ListManifestByGame(ctx, gameID)
+func (e *Engine) manifestMap(ctx context.Context, syncID string) (map[string]store.ManifestEntry, error) {
+	entries, err := e.store.ListManifestBySync(ctx, syncID)
 	if err != nil {
 		return nil, fmt.Errorf("engine: list manifest: %w", err)
 	}
@@ -749,7 +751,7 @@ func (e *Engine) manifestMap(ctx context.Context, gameID string) (map[string]sto
 	return m, nil
 }
 
-func (e *Engine) setManifest(ctx context.Context, gameID, nodeID string, meta reach.FileMeta, now time.Time) error {
+func (e *Engine) setManifest(ctx context.Context, syncID, nodeID string, meta reach.FileMeta, now time.Time) error {
 	size := meta.Size
 	// Truncate to the comparison resolution before storing so the manifest value
 	// matches what a later changed() compare will use, regardless of where it is
@@ -759,7 +761,7 @@ func (e *Engine) setManifest(ctx context.Context, gameID, nodeID string, meta re
 	// timestamptz would store anyway).
 	mtime := meta.Mtime.UTC().Truncate(mtimeResolution)
 	m := store.ManifestEntry{
-		GameID:      gameID,
+		SyncID:      syncID,
 		NodeID:      nodeID,
 		Mtime:       &mtime,
 		Size:        &size,
@@ -835,22 +837,6 @@ func sourceNodeID(direction, primaryNode string) (string, error) {
 		return id, nil
 	}
 	return "", fmt.Errorf("engine: invalid direction %q: %w", direction, store.ErrInvalidValue)
-}
-
-// parseScope interprets peer_scope. "all-configured" (or empty) => match all.
-// Otherwise a csv of node ids.
-func parseScope(peerScope string) (set map[string]bool, all bool) {
-	if peerScope == "" || peerScope == "all-configured" {
-		return nil, true
-	}
-	set = make(map[string]bool)
-	for _, id := range strings.Split(peerScope, ",") {
-		id = strings.TrimSpace(id)
-		if id != "" {
-			set[id] = true
-		}
-	}
-	return set, false
 }
 
 func byID(scoped []scopedNode, id string) (scopedNode, bool) {

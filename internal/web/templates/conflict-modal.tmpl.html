@@ -2,7 +2,7 @@
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" role="dialog" aria-modal="true" aria-label="Resolve conflict for {{.GameDisplay}}">
     <div class="modal-head">
-      <h3>{{.GameDisplay}} — sync paused <span class="sub">{{.System}}</span></h3>
+      <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} — sync paused <span class="sub">{{.System}}</span></h3>
       <button class="modal-close" type="button"
               aria-label="Close"
               onclick="document.getElementById('modal').innerHTML='';">&times;</button>
@@ -20,7 +20,7 @@
             {{if .Present}}{{.Mtime}}, {{.Size}}{{else}}no save{{end}}
           </span>
           {{if .Present}}
-          <form hx-post="/api/games/{{$.GameID}}/resolve-conflict"
+          <form hx-post="/api/syncs/{{$.SyncID}}/resolve-conflict"
                 hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
                 hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
             <input type="hidden" name="csrf_token" value="{{$.CSRF}}">

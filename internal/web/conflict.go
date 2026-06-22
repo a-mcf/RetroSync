@@ -17,7 +17,8 @@ import (
 // with full disclosure (docs/state-machine.md "UI shows every node's current
 // state ... and a 'use this one' button per node").
 type conflictModalData struct {
-	GameID      string
+	SyncID      string
+	SyncName    string
 	GameDisplay string
 	System      string
 	Nodes       []conflictNode
@@ -34,7 +35,7 @@ type conflictNode struct {
 	Size    string // human-readable size, or "" when !Present
 }
 
-// handleConflictModal serves GET /games/{id}/conflict as an HTML modal
+// handleConflictModal serves GET /syncs/{id}/conflict as an HTML modal
 // fragment. It is intentionally read-only and NOT owner-gated: any authenticated
 // user may VIEW a conflict (consistent with "can see others' sessions",
 // docs/ui.md / brief D). The destructive resolve POST it submits to re-checks
@@ -45,9 +46,19 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 
-	g, err := s.store.GetGame(r.Context(), gameID)
+	sy, err := s.store.GetSync(r.Context(), syncID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "no such sync", http.StatusNotFound)
+			return
+		}
+		s.logger.ErrorContext(r.Context(), "conflict modal: get sync failed", "err", err.Error())
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	g, err := s.store.GetGame(r.Context(), sy.GameID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			http.Error(w, "no such game", http.StatusNotFound)
@@ -58,15 +69,16 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	states, err := s.actioner.NodeStates(r.Context(), gameID)
+	states, err := s.actioner.NodeStates(r.Context(), syncID)
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "conflict modal: node states failed", "game", gameID, "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "conflict modal: node states failed", "sync", syncID, "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	data := conflictModalData{
-		GameID:      g.ID,
+		SyncID:      sy.ID,
+		SyncName:    sy.Name,
 		GameDisplay: g.Display,
 		System:      g.System,
 		CSRF:        s.csrfFor(r),
@@ -86,7 +98,7 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleResolveConflict handles POST /api/games/{id}/resolve-conflict. Form
+// handleResolveConflict handles POST /api/syncs/{id}/resolve-conflict. Form
 // field: winner_node_id.
 //
 // This is the single most destructive action in the system (it overwrites every
@@ -99,7 +111,7 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 // Engine error mapping:
 //   - ErrNotConflicted     -> 409 + dashboard refresh (someone else already
 //     resolved it; the refreshed dashboard drops the banner).
-//   - ErrNoPath            -> 400 (winner not in scope for this game).
+//   - ErrNoPath            -> 400 (winner is not a member of this sync).
 //   - ErrSourceMissing     -> 422 (winner currently holds no file).
 //   - anything else        -> 500.
 func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
@@ -117,20 +129,20 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 	winner := strings.TrimSpace(r.PostFormValue("winner_node_id"))
 
 	// Authorization FIRST, before any validation that could reach the engine. The
 	// resolve action requires that the user own the binding's primary node (or be
 	// admin) — the same rule as deactivate, because this is the most destructive
-	// action and a wrong user must not pick a winner. A non-conflicted/idle game
+	// action and a wrong user must not pick a winner. A non-conflicted/idle sync
 	// is still owner-gated here: there is nothing to resolve, but a stranger
 	// shouldn't be probing the action either.
-	b, err := s.store.GetBinding(r.Context(), gameID)
+	b, err := s.store.GetBinding(r.Context(), syncID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// No binding: nothing to resolve. Treat as already-resolved (409) and
-			// refresh, rather than leaking whether the game exists.
+			// refresh, rather than leaking whether the sync exists.
 			http.Error(w, "no active session to resolve", http.StatusConflict)
 			return
 		}
@@ -156,7 +168,7 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.actioner.ResolveConflict(r.Context(), gameID, winner)
+	err = s.actioner.ResolveConflict(r.Context(), syncID, winner)
 	switch {
 	case err == nil:
 		s.refreshDashboard(w, r, u)
@@ -170,11 +182,11 @@ func (s *Server) handleResolveConflict(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		s.writeDashboardFragment(w, r, u)
 	case errors.Is(err, engine.ErrNoPath):
-		http.Error(w, "that node is not in scope for this game", http.StatusBadRequest)
+		http.Error(w, "that node is not a member of this sync", http.StatusBadRequest)
 	case errors.Is(err, engine.ErrSourceMissing):
 		http.Error(w, "that node currently has no save to use", http.StatusUnprocessableEntity)
 	default:
-		s.logger.ErrorContext(r.Context(), "resolve-conflict failed", "game", gameID, "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "resolve-conflict failed", "sync", syncID, "err", err.Error())
 		http.Error(w, "could not resolve conflict", http.StatusInternalServerError)
 	}
 }

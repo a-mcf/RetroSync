@@ -16,7 +16,7 @@ import (
 type dashboardData struct {
 	User    userView
 	Active  []activeRow
-	MyGames []myGameRow
+	MySyncs []mySyncRow
 	Nodes   []nodeRow
 	CSRF    string
 }
@@ -30,9 +30,10 @@ type userView struct {
 	Role    store.Role
 }
 
-// activeRow is one active-binding card.
+// activeRow is one active-binding card, keyed by sync.
 type activeRow struct {
-	GameID      string
+	SyncID      string
+	SyncName    string
 	GameDisplay string
 	System      string
 	PrimaryNode string
@@ -49,19 +50,23 @@ type peerLine struct {
 	Mtime  string
 }
 
-// myGameRow is one "my games" card: a game with a path on a node I own, with a
-// per-node last-known mtime line and a "Play on <node>" (or "Take over")
-// action per owned node.
-type myGameRow struct {
-	GameID      string
+// mySyncRow is one "my syncs" card: a sync with a member on a node I own, with a
+// per-node last-known mtime line and a "Play on <node>" (or "Take over") action
+// per owned member node.
+type mySyncRow struct {
+	SyncID      string
+	SyncName    string
 	GameDisplay string
 	System      string
 	Nodes       []nodeMtimeLine
-	// ActivePrimary is the node currently bound as primary for this game, or ""
-	// if the game is idle. When set and != an owned node, the Play button reads
+	// ActivePrimary is the node currently bound as primary for this sync, or ""
+	// if the sync is idle. When set and != an owned node, the Play button reads
 	// "Take over from <ActivePrimary>" and posts force=true.
 	ActivePrimary string
-	// MultiSource is true when more than one node has a path for this game, so
+	// Conflict is true when the sync's active binding is in conflict; the row
+	// shows a "Resolve conflict" banner.
+	Conflict bool
+	// MultiSource is true when more than one node is a member of this sync, so
 	// the Play button opens the "use my save" modal (hx-get) instead of posting
 	// directly (docs/ui.md: modal only appears with multiple saves/sources).
 	MultiSource bool
@@ -109,32 +114,37 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 
 	data := dashboardData{User: userView{ID: u.ID, Display: u.Display, Role: u.Role}}
 
-	// --- Active bindings ---
+	// --- Active bindings (keyed by sync) ---
 	bindings, err := s.store.ListBindings(ctx)
 	if err != nil {
 		return dashboardData{}, fmt.Errorf("list bindings: %w", err)
 	}
-	// primaryByGame: game_id -> the node currently bound as primary. Used in the
-	// "my games" section to decide Play vs "Take over from <other>".
-	primaryByGame := make(map[string]string, len(bindings))
+	// bindingBySync: sync_id -> its active binding. Used in the "my syncs"
+	// section to decide Play vs "Take over from <other>" and the conflict banner.
+	bindingBySync := make(map[string]store.ActiveBinding, len(bindings))
 	for _, b := range bindings {
-		primaryByGame[b.GameID] = b.PrimaryNode
+		bindingBySync[b.SyncID] = b
 	}
 	for _, b := range bindings {
+		sy, gErr := s.store.GetSync(ctx, b.SyncID)
+		if gErr != nil && !errors.Is(gErr, store.ErrNotFound) {
+			return dashboardData{}, fmt.Errorf("get sync %s: %w", b.SyncID, gErr)
+		}
 		row := activeRow{
-			GameID:      b.GameID,
-			GameDisplay: displayOf(gameByID, b.GameID),
-			System:      systemOf(gameByID, b.GameID),
+			SyncID:      b.SyncID,
+			SyncName:    sy.Name,
+			GameDisplay: displayOf(gameByID, sy.GameID),
+			System:      systemOf(gameByID, sy.GameID),
 			PrimaryNode: b.PrimaryNode,
 			Since:       fmtTime(&b.StartedAt),
 			Conflict:    b.ConflictAt != nil,
 			LastSync:    fmtTimeAgo(b.LastSynced, now),
 		}
 		// Peers: every node (other than the primary) that has a manifest entry
-		// for this game, with its last-known mtime.
-		manifest, err := s.store.ListManifestByGame(ctx, b.GameID)
+		// for this sync, with its last-known mtime.
+		manifest, err := s.store.ListManifestBySync(ctx, b.SyncID)
 		if err != nil {
-			return dashboardData{}, fmt.Errorf("list manifest %s: %w", b.GameID, err)
+			return dashboardData{}, fmt.Errorf("list manifest %s: %w", b.SyncID, err)
 		}
 		for _, m := range manifest {
 			if m.NodeID == b.PrimaryNode {
@@ -145,8 +155,9 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		sort.Slice(row.Peers, func(i, j int) bool { return row.Peers[i].NodeID < row.Peers[j].NodeID })
 		data.Active = append(data.Active, row)
 	}
+	sort.Slice(data.Active, func(i, j int) bool { return data.Active[i].SyncID < data.Active[j].SyncID })
 
-	// --- My games ---
+	// --- My syncs ---
 	// Nodes owned by this user.
 	myNodes := make(map[string]bool)
 	for _, n := range nodes {
@@ -154,49 +165,75 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 			myNodes[n.ID] = true
 		}
 	}
-	// For each game, collect path mappings that land on one of my nodes. The
-	// total path count (across all nodes, owned or not) decides whether Play
-	// opens the "use my save" modal: with more than one configured source the
-	// user must choose which save to start from (docs/ui.md).
-	for _, g := range games {
-		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
+	// A sync is "mine" when at least one of its members lives on a node I own.
+	// ListSyncMembersByNode for each of my nodes yields the candidate sync ids.
+	mySyncIDs := make(map[string]bool)
+	for nodeID := range myNodes {
+		members, err := s.store.ListSyncMembersByNode(ctx, nodeID)
 		if err != nil {
-			return dashboardData{}, fmt.Errorf("list paths %s: %w", g.ID, err)
+			return dashboardData{}, fmt.Errorf("list members by node %s: %w", nodeID, err)
 		}
-		activePrimary := primaryByGame[g.ID]
-		var lines []nodeMtimeLine
-		for _, p := range paths {
-			if !myNodes[p.NodeID] {
+		for _, m := range members {
+			mySyncIDs[m.SyncID] = true
+		}
+	}
+
+	for syncID := range mySyncIDs {
+		sy, err := s.store.GetSync(ctx, syncID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
 				continue
 			}
+			return dashboardData{}, fmt.Errorf("get sync %s: %w", syncID, err)
+		}
+		members, err := s.store.ListSyncMembers(ctx, syncID)
+		if err != nil {
+			return dashboardData{}, fmt.Errorf("list members %s: %w", syncID, err)
+		}
+		b, hasBinding := bindingBySync[syncID]
+		activePrimary := ""
+		conflict := false
+		if hasBinding {
+			activePrimary = b.PrimaryNode
+			conflict = b.ConflictAt != nil
+		}
+		var lines []nodeMtimeLine
+		for _, m := range members {
 			mtime := "no save yet"
-			if m, err := s.store.GetManifest(ctx, g.ID, p.NodeID); err == nil {
-				mtime = fmtMtime(m.Mtime)
+			if me, err := s.store.GetManifest(ctx, syncID, m.NodeID); err == nil {
+				mtime = fmtMtime(me.Mtime)
 			} else if !errors.Is(err, store.ErrNotFound) {
-				return dashboardData{}, fmt.Errorf("get manifest %s/%s: %w", g.ID, p.NodeID, err)
+				return dashboardData{}, fmt.Errorf("get manifest %s/%s: %w", syncID, m.NodeID, err)
 			}
-			// Takeover when the game is active on a DIFFERENT node than this one.
-			takeover := activePrimary != "" && activePrimary != p.NodeID
+			owned := myNodes[m.NodeID]
+			// Takeover when the sync is active on a DIFFERENT node than this one.
+			takeover := owned && activePrimary != "" && activePrimary != m.NodeID
 			lines = append(lines, nodeMtimeLine{
-				NodeID:   p.NodeID,
+				NodeID:   m.NodeID,
 				Mtime:    mtime,
-				Owned:    true,
+				Owned:    owned,
 				Takeover: takeover,
 			})
 		}
-		if len(lines) == 0 {
-			continue
-		}
 		sort.Slice(lines, func(i, j int) bool { return lines[i].NodeID < lines[j].NodeID })
-		data.MyGames = append(data.MyGames, myGameRow{
-			GameID:        g.ID,
-			GameDisplay:   g.Display,
-			System:        g.System,
+		data.MySyncs = append(data.MySyncs, mySyncRow{
+			SyncID:        syncID,
+			SyncName:      sy.Name,
+			GameDisplay:   displayOf(gameByID, sy.GameID),
+			System:        systemOf(gameByID, sy.GameID),
 			Nodes:         lines,
 			ActivePrimary: activePrimary,
-			MultiSource:   len(paths) > 1,
+			Conflict:      conflict,
+			MultiSource:   len(members) > 1,
 		})
 	}
+	// Deterministic order: by game display then sync id.
+	sort.Slice(data.MySyncs, func(i, j int) bool {
+		if data.MySyncs[i].GameDisplay != data.MySyncs[j].GameDisplay {
+			return data.MySyncs[i].GameDisplay < data.MySyncs[j].GameDisplay
+		}
+		return data.MySyncs[i].SyncID < data.MySyncs[j].SyncID
+	})
 
 	// --- Node status ---
 	for _, n := range nodes {

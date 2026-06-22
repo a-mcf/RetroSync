@@ -133,6 +133,9 @@ func TestEngine_PollNoopAfterActivate_PostgresLocalFS(t *testing.T) {
 	if err := st.CreateGame(ctx, store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.CreateSync(ctx, store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+		t.Fatal(err)
+	}
 	mustPGNode(t, st, "primary", primaryRoot)
 	mustPGNode(t, st, "peer", peerRoot)
 	mustPGPath(t, st, "primary", relPath)
@@ -142,7 +145,7 @@ func TestEngine_PollNoopAfterActivate_PostgresLocalFS(t *testing.T) {
 	eng := engine.New(st, resolve.ResolveReach, clock)
 
 	// Activate: fan-out primary -> peer; manifest mtimes recorded through Postgres.
-	if err := eng.Activate(ctx, gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := eng.Activate(ctx, syncID, "primary", "from-primary", false); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 
@@ -156,13 +159,13 @@ func TestEngine_PollNoopAfterActivate_PostgresLocalFS(t *testing.T) {
 
 	// First Poll after activate: MUST be a noop. Pre-fix this flagged a conflict
 	// because manifest(µs) != stat(ns).
-	if err := eng.Poll(ctx, gameID); err != nil {
+	if err := eng.Poll(ctx, syncID); err != nil {
 		t.Fatalf("Poll #1: %v", err)
 	}
 	assertNoConflictNoFanout(t, st, "after Poll #1", okBefore)
 
 	// Second Poll: still a noop.
-	if err := eng.Poll(ctx, gameID); err != nil {
+	if err := eng.Poll(ctx, syncID); err != nil {
 		t.Fatalf("Poll #2: %v", err)
 	}
 	assertNoConflictNoFanout(t, st, "after Poll #2", okBefore)
@@ -172,7 +175,7 @@ func assertNoConflictNoFanout(t *testing.T, st store.Store, when string, okBefor
 	t.Helper()
 	ctx := context.Background()
 
-	b, err := st.GetBinding(ctx, gameID)
+	b, err := st.GetBinding(ctx, syncID)
 	if err != nil {
 		t.Fatalf("%s: get binding: %v", when, err)
 	}
@@ -189,7 +192,7 @@ func assertNoConflictNoFanout(t *testing.T, st store.Store, when string, okBefor
 
 func countOutcome(t *testing.T, st store.Store, outcome store.Outcome) int {
 	t.Helper()
-	entries, err := st.ListLogByGame(context.Background(), gameID, 0)
+	entries, err := st.ListLogBySync(context.Background(), syncID, 0)
 	if err != nil {
 		t.Fatalf("list sync_log: %v", err)
 	}
@@ -217,7 +220,7 @@ func mustPGNode(t *testing.T, st store.Store, id, root string) {
 
 func mustPGPath(t *testing.T, st store.Store, nodeID, path string) {
 	t.Helper()
-	if err := st.SetGamePath(context.Background(), store.GamePath{GameID: gameID, NodeID: nodeID, Path: path}); err != nil {
-		t.Fatalf("SetGamePath %q: %v", nodeID, err)
+	if err := st.SetSyncMember(context.Background(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path}); err != nil {
+		t.Fatalf("SetSyncMember %q: %v", nodeID, err)
 	}
 }
