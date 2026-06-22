@@ -27,6 +27,11 @@ type stubActioner struct {
 	// resolveErr is returned by ResolveConflict; resolved records each call.
 	resolveErr error
 	resolved   []resolveCall
+
+	// restoreErr is returned by RestoreVersion; restored records each (syncID, seq)
+	// call so tests assert the handler passed the PATH syncID it authorized.
+	restoreErr error
+	restored   []restoreCall
 	// nodeStates is the canned slice returned by NodeStates.
 	nodeStates []engine.NodeState
 
@@ -50,11 +55,29 @@ type resolveCall struct {
 	syncID, winnerNodeID string
 }
 
+type restoreCall struct {
+	syncID string
+	seq    int64
+}
+
 func (s *stubActioner) ResolveConflict(_ context.Context, syncID, winnerNodeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resolved = append(s.resolved, resolveCall{syncID, winnerNodeID})
 	return s.resolveErr
+}
+
+func (s *stubActioner) RestoreVersion(_ context.Context, syncID string, seq int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restored = append(s.restored, restoreCall{syncID, seq})
+	return s.restoreErr
+}
+
+func (s *stubActioner) restoreCalls() []restoreCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]restoreCall(nil), s.restored...)
 }
 
 func (s *stubActioner) NodeStates(_ context.Context, _ string) ([]engine.NodeState, error) {

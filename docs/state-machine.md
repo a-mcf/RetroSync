@@ -88,6 +88,16 @@ Two edge cases inside the propagate branch:
 - A write failure during the fan-out aborts the pass **without** advancing the
   failed member's manifest (the manifest trails the write), so the next poll
   re-detects the divergence and retries (self-heal).
+- **Capture before overwrite (the recovery net, slice 20).** Before the engine
+  overwrites a member that currently *has* a file — in the fan-out here **and** in
+  conflict resolution — it snapshots that member's current bytes into the
+  server-side, content-addressed save-version store (`save_blobs` / `save_versions`;
+  see data-model.md). This is a **hard gate, ordered exactly like the write
+  itself**: if the capture fails, that write is **aborted** (the manifest is not
+  advanced) and retried on the next poll — so nothing recoverable is ever
+  destroyed un-captured. A member with no current file has nothing to capture
+  (skip). This **replaces** the old device-side `.retrosync-conflict-<ts>` sibling
+  backups.
 
 The "two or more distinct hashes = conflict" case is the family-sync gotcha: if
 Bob writes *Super Metroid* on the MiSTer and Alice writes **different** bytes on
@@ -108,18 +118,33 @@ When two or more members mutate between polls:
 - UI shows every member's current live state (mtime, size) and a "use this one"
   button per member that holds a file.
 - "Use this one" copies that member's file to all others and clears the conflict.
-- Before any overwrite, write each loser's existing file to
-  `<path>.retrosync-conflict-<ts>` on the same node (cheap insurance).
+- Before any overwrite, each loser's existing bytes are **captured to the
+  server-side save-version store** (reason `conflict-resolve`) — the recovery net,
+  which replaces the old device-side `<path>.retrosync-conflict-<ts>` sibling
+  backups.
 
 There is intentionally no auto-merge. Save files don't merge.
 
 > **Implemented** (`engine.ResolveConflict`, owner-of-a-member-node-or-admin-gated
-> + CSRF-protected `POST /api/syncs/{id}/resolve-conflict`). The `<ts>` is a UTC,
-> filesystem-safe, **nanosecond-precision** stamp
-> (`20060102T150405.000000000Z`), so two resolves in the same second can't
-> collide. Every loser-with-a-file is backed up *before* any overwrite; the
-> sync is marked synced and the conflict flag cleared only after the full fan-out
-> succeeds, so a partial failure leaves the sync re-resolvable.
+> + CSRF-protected `POST /api/syncs/{id}/resolve-conflict`). Every loser-with-a-file
+> is **captured to the central save-version store before any overwrite** — a hard
+> gate: a capture failure aborts that write and leaves the sync re-resolvable, so
+> nothing recoverable is destroyed un-captured. The sync is marked synced and the
+> conflict flag cleared only after the full fan-out succeeds, so a partial failure
+> leaves the sync re-resolvable. The data-loss guarantee is now "captured to the
+> server store before overwrite" instead of "sibling file on device".
+
+### Restore
+
+A captured version can be made authoritative again: **restore** loads a version's
+bytes, writes them back to that `(sync, node)` member, and **propagates** them to
+the rest of the sync (with capture-before-overwrite on the others), clearing any
+`conflict_at` and marking the sync synced. Effectively "this old save is now the
+current save everywhere" — a one-click undo for a bad propagation/resolve.
+
+> **Implemented** (`engine.RestoreVersion`, owner-of-a-member-node-or-admin-gated
+> + CSRF-protected `POST /api/syncs/{id}/versions/{seq}/restore`). A pruned/gone
+> seq returns `ErrNotFound` (a friendly 410 in the UI).
 
 ## Crash safety
 

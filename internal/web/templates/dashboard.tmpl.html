@@ -62,7 +62,9 @@
       {{else}}
         {{range .MySyncs}}
         <div class="card mysync-card" data-filter="{{.GameDisplay}} {{.SyncName}}">
-          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
+          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span>
+            <a class="history-link sub" href="/syncs/{{.SyncID}}/history">History</a>
+          </h3>
           {{if .Conflict}}
             <div class="conflict">
               <strong>Sync paused — more than one node changed.</strong>

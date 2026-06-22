@@ -1,0 +1,63 @@
+{{define "history"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Save history</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // A successful restore returns the refreshed dashboard fragment. Send the
+    // user back to the dashboard once the restore lands so they see the new
+    // synced state.
+    document.addEventListener('htmx:afterRequest', function (e) {
+      if (e.detail.successful && e.target && e.target.matches('form.restore-form')) {
+        window.location = '/';
+      }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap" id="history">
+    <header class="top">
+      <h1>Save history</h1>
+      <span class="who"><a href="/">&larr; Dashboard</a></span>
+    </header>
+
+    <section>
+      <h2>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h2>
+      <p class="sub">Every time RetroSync is about to overwrite a save (a normal
+         propagation or a conflict resolution), it snapshots the about-to-be-
+         overwritten bytes here first. Restore makes a snapshot the current save
+         everywhere — a one-click undo for a bad sync.</p>
+
+      {{if not .Members}}
+        <p class="empty">This sync has no members.</p>
+      {{else}}
+        {{range .Members}}
+        <div class="card">
+          <h3>{{.NodeID}}</h3>
+          {{if not .Versions}}
+            <p class="empty">No saved versions yet.</p>
+          {{else}}
+          <ul class="version-list">
+            {{range .Versions}}
+            <li class="version-row">
+              <span class="version-meta">{{.When}} &middot; {{.Reason}} &middot; {{.Size}}</span>
+              <form class="restore-form"
+                    hx-post="/api/syncs/{{$.SyncID}}/versions/{{.Seq}}/restore"
+                    hx-swap="none">
+                <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+                <button class="btn" type="submit">Restore</button>
+              </form>
+            </li>
+            {{end}}
+          </ul>
+          {{end}}
+        </div>
+        {{end}}
+      {{end}}
+    </section>
+  </div>
+</body>
+</html>{{end}}

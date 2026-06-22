@@ -260,7 +260,7 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 	for _, cm := range changedSet {
 		alreadyHave[cm.sn.node.ID] = true
 	}
-	if err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], srcHash, alreadyHave, now); err != nil {
+	if err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], srcHash, alreadyHave, reasonPropagate, now); err != nil {
 		return err
 	}
 	// Record each changer's own manifest state (each already holds the agreed
@@ -436,9 +436,11 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 }
 
 // ResolveConflict resolves a flagged conflict by making winnerNodeID's current
-// save the authority and fanning it out to every other in-scope node, after
-// first preserving each loser's existing file as a sibling backup. It clears the
-// conflict only on full success (docs/state-machine.md "Conflict handling").
+// save the authority and fanning it out to every other in-scope node. Each other
+// member's pre-resolution bytes are captured into the server-side save-version
+// store BEFORE being overwritten (the recovery net replaces the old device-side
+// .retrosync-conflict-<ts> sibling backups). It clears the conflict only on full
+// success (docs/state-machine.md "Conflict handling").
 //
 // Preconditions:
 //   - The sync MUST be in conflict (conflict_at != nil); otherwise
@@ -448,18 +450,16 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 //     hold a file (ErrSourceMissing otherwise).
 //
 // Ordering / crash-safety:
-//  1. Back up every OTHER in-scope node that currently HAS a file to a sibling
-//     <path>.retrosync-conflict-<ts> on that same node, BEFORE any overwrite.
-//     The ts is the injected Clock in a filesystem-safe, sub-second form
-//     (20060102T150405.000000000Z, UTC, no colons), so two resolves in the same
-//     wall-clock second do not collide. A node with no current file gets no
-//     backup.
-//  2. Fan the winner's bytes+mtime out to every other in-scope node, advancing
-//     the manifest only AFTER each successful write (reuses fanOut/setManifest).
-//  3. Clear conflict_at and set last_synced.
+//  1. Fan the winner's bytes+mtime out to every other in-scope node. Each
+//     destination that currently HAS a file has its bytes captured to the server
+//     save-version store (reason "conflict-resolve") BEFORE the overwrite — a
+//     hard gate: a capture failure aborts that write and leaves the sync
+//     conflicted (re-resolvable). The manifest advances only AFTER each
+//     successful write.
+//  2. Clear conflict_at and set last_synced.
 //
-// If any backup or fan-out write fails, conflict_at is left set (the binding
-// stays conflicted and re-resolvable) and the error is returned.
+// If any capture or fan-out write fails, conflict_at is left set (the sync stays
+// conflicted and re-resolvable) and the error is returned.
 func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error {
 	sy, err := e.store.GetSync(ctx, syncID)
 	if err != nil {
@@ -478,10 +478,10 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrNoPath)
 	}
 	// TODO(slice-daemon): TOCTOU window — the winner is stat'd here, re-read in
-	// fanOut, and the losers are independently re-stat'd in backupLosers, so a
+	// fanOut, and each loser is independently re-stat'd/re-read for capture, so a
 	// file can change between these stats/reads. Harmless today (no concurrent
 	// poll loop drives this path), but when the timer loop lands a file mutated
-	// mid-resolution could be backed up or fanned out inconsistently; revisit to
+	// mid-resolution could be captured or fanned out inconsistently; revisit to
 	// snapshot each node once under the concurrency model then in place.
 	winnerMeta, winnerPresent, err := e.statOpt(ctx, winner)
 	if err != nil {
@@ -499,20 +499,14 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 
 	now := e.clock()
 
-	// Step 1: back up every OTHER in-scope node that currently has a file, BEFORE
-	// any overwrite. A backup failure aborts WITHOUT having touched the saves and
-	// leaves the conflict set (re-resolvable). No loser file is overwritten until
-	// every loser-with-a-file has been backed up.
-	if err := e.backupLosers(ctx, syncID, scoped, winner, now); err != nil {
-		return err
-	}
-
-	// Step 2: fan out the winner to every other in-scope node, advancing the
-	// manifest (carrying the winner's hash) only after each successful write. A
-	// partial fan-out returns the error and (because we have NOT cleared
-	// conflict_at) leaves the sync conflicted for re-resolution. No skip set here:
-	// a resolve deliberately overwrites every loser with the chosen winner.
-	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, winnerHash, nil, now); err != nil {
+	// Fan out the winner to every other in-scope node, advancing the manifest
+	// (carrying the winner's hash) only after each successful write. fanOut
+	// captures each loser-with-a-file's pre-resolution bytes into the server
+	// save-version store (reason "conflict-resolve") BEFORE overwriting them — a
+	// hard gate: a capture or write failure returns the error and (because we have
+	// NOT cleared conflict_at) leaves the sync conflicted for re-resolution. No
+	// skip set here: a resolve deliberately overwrites every loser with the winner.
+	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, winnerHash, nil, reasonConflictResolve, now); err != nil {
 		return err
 	}
 	// Record the winner's own manifest state (it is the authority for this pass),
@@ -534,68 +528,140 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	return nil
 }
 
-// backupLosers writes the CURRENT bytes of every in-scope node other than the
-// winner that currently holds a file to a sibling backup path
-// <path>.retrosync-conflict-<ts> on that same node, via WriteAtomic, and logs an
-// "ok" sync_log row per backup. Nodes with no current file are skipped (nothing
-// to preserve). Called before any overwrite so each loser's pre-resolution save
-// survives. A backup write or read failure is returned (and aborts resolution).
-func (e *Engine) backupLosers(ctx context.Context, syncID string, scoped []scopedNode, winner scopedNode, now time.Time) error {
-	suffix := backupSuffix(now)
-	for _, sn := range scoped {
-		if sn.node.ID == winner.node.ID {
-			continue
-		}
-		meta, present, err := e.statOpt(ctx, sn)
-		if err != nil {
-			return err
-		}
-		if !present {
-			// No current file on this node: nothing to back up. It still RECEIVES
-			// the winner's file during the fan-out below.
-			continue
-		}
-		data, err := sn.r.Read(ctx, sn.path)
-		if err != nil {
-			return fmt.Errorf("engine: read loser %s for backup: %w", sn.node.ID, err)
-		}
-		backupPath := sn.path + suffix
-		// Preserve the loser's existing mtime on its backup (faithful snapshot).
-		if err := sn.r.WriteAtomic(ctx, backupPath, data, meta.Mtime); err != nil {
-			return fmt.Errorf("engine: backup %s: %w", sn.node.ID, err)
-		}
-		bytes := meta.Size
-		if err := e.appendLog(ctx, store.LogEntry{
-			SyncID:   syncID,
-			FromNode: sn.node.ID,
-			ToNode:   sn.node.ID,
-			Bytes:    &bytes,
-			SrcMtime: tptr(meta.Mtime),
-			Outcome:  store.OutcomeOK,
-			Message:  "conflict-resolve backup: " + backupPath,
-			TS:       now,
-		}); err != nil {
-			return err
-		}
+// RestoreVersion makes a previously-captured save version the current
+// authoritative content of its (sync, node) member, and propagates it to the
+// rest of the sync — effectively "this old save is now the current save
+// everywhere" (the recovery net's undo, slice-20).
+//
+// Flow:
+//  1. Load the version + its bytes (ErrNotFound if the seq was pruned/gone).
+//  2. Capture the TARGET member's current bytes (it's an overwrite), then write
+//     the restored bytes to the target's member path atomically; advance its
+//     manifest (mtime/size/hash) so it is the new authoritative content.
+//  3. Fan the restored bytes out to every OTHER member, capturing each one's
+//     pre-restore bytes before overwriting (reason "restore").
+//  4. Clear any conflict_at and mark the sync synced.
+//
+// Capture-before-overwrite is a hard gate throughout (a capture failure aborts
+// the write); a partial restore leaves the manifest trailing the actual writes
+// and is retried/re-driven safely. The restored bytes' mtime is set to the
+// resolution time (the injected clock) so every member converges to one mtime and
+// the next poll is a clean noop.
+//
+// AUTHORIZATION: seq is loaded BOUND to syncID (the caller's authorized sync) via
+// GetSaveVersionData(ctx, syncID, seq). A seq belonging to a DIFFERENT sync is
+// ErrNotFound, so a caller authorized on sync A cannot restore a version of sync
+// B by guessing its (bigserial, guessable) seq. The whole operation runs ONLY on
+// syncID — never on the version's own ver.SyncID — so a restore can only ever
+// mutate the sync the caller was authorized against.
+func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) error {
+	ver, data, err := e.store.GetSaveVersionData(ctx, syncID, seq)
+	if err != nil {
+		return fmt.Errorf("engine: restore load version %d (sync %s): %w", seq, syncID, err)
+	}
+	// By construction GetSaveVersionData binds seq to syncID, so ver.SyncID ==
+	// syncID here. We still operate exclusively on the passed-in syncID (never on
+	// ver.SyncID) so the authorized sync is the only thing this can ever touch.
+
+	scoped, err := e.inScopeNodes(ctx, syncID)
+	if err != nil {
+		return err
+	}
+	target, ok := byID(scoped, ver.NodeID)
+	if !ok {
+		// The captured member is no longer in the sync (removed since capture).
+		return fmt.Errorf("engine: restore target %q: %w", ver.NodeID, ErrNoPath)
+	}
+
+	now := e.clock()
+	// The restored content's hash is the version's hash (content-addressed), used
+	// as the manifest sha256 for the target and every fanned-out member.
+	restoredHash := ver.Hash
+
+	// Step 1: overwrite the TARGET member with the restored bytes, capturing its
+	// current bytes first (it's an overwrite of recoverable content). The restored
+	// content gets the resolution mtime so all members converge.
+	if err := e.captureBeforeOverwrite(ctx, syncID, target, reasonRestore); err != nil {
+		return err
+	}
+	if err := target.r.WriteAtomic(ctx, target.path, data, now); err != nil {
+		return fmt.Errorf("engine: restore write target %s: %w", target.node.ID, err)
+	}
+	restoredMeta := reach.FileMeta{Mtime: now, Size: int64(len(data))}
+	if err := e.setManifest(ctx, syncID, target.node.ID, restoredMeta, restoredHash, now); err != nil {
+		return err
+	}
+	bytes := restoredMeta.Size
+	if err := e.appendLog(ctx, store.LogEntry{
+		SyncID:   syncID,
+		FromNode: target.node.ID,
+		ToNode:   target.node.ID,
+		Bytes:    &bytes,
+		SrcMtime: tptr(now),
+		Outcome:  store.OutcomeOK,
+		Message:  fmt.Sprintf("restore version %d", seq),
+		TS:       now,
+	}); err != nil {
+		return err
+	}
+
+	// Step 2: fan the restored bytes out to every OTHER member, capturing each
+	// one's pre-restore bytes before overwriting. The target is the source; it is
+	// skipped by fanOut (src == dst).
+	if err := e.fanOut(ctx, syncID, target, scoped, restoredMeta, restoredHash, nil, reasonRestore, now); err != nil {
+		return err
+	}
+
+	// Step 3: the restored content is now authoritative everywhere — clear any
+	// conflict and mark synced. Mark synced first, then clear the conflict (a crash
+	// between leaves the sync conflicted/re-resolvable rather than un-paused-unsynced).
+	if err := e.store.MarkSyncSynced(ctx, syncID, now); err != nil {
+		return fmt.Errorf("engine: restore mark synced: %w", err)
+	}
+	if err := e.store.SetSyncConflict(ctx, syncID, nil); err != nil {
+		return fmt.Errorf("engine: restore clear conflict: %w", err)
 	}
 	return nil
 }
 
-// backupSuffix builds the sibling-backup suffix for a conflict resolution at t.
-// The timestamp is filesystem-safe: UTC, the Go reference layout
-// 20060102T150405.000000000Z (basic-ISO-8601 with a Z zone and nanosecond
-// fraction), which contains NO colons, slashes, or spaces — only digits, T, Z,
-// and dots — so it is a legal filename component on every target filesystem and
-// stays a sibling of <path> (no new directory separators).
+// Reasons recorded on captured save versions (docs/state-machine.md). They tag a
+// snapshot with why it was taken, for the history UI.
+const (
+	reasonPropagate       = "propagate"
+	reasonConflictResolve = "conflict-resolve"
+	reasonRestore         = "restore"
+)
+
+// captureBeforeOverwrite snapshots dst's CURRENT bytes into the server-side
+// save-version store (content-addressed by sha256) before they are overwritten,
+// tagging the snapshot with reason. It is the recovery net (slice-20): it
+// REPLACES the old device-side <path>.retrosync-conflict-<ts> sibling backup with
+// a clean central store, so a bad propagation/resolve is always recoverable
+// without cluttering device dirs (or replicating backups via Syncthing).
 //
-// The nanosecond fraction is what makes the suffix collision-resistant: two
-// ResolveConflict calls in the SAME wall-clock second (a double-click, or a
-// quick retry after a partial fan-out) would otherwise compute the IDENTICAL
-// backup path and the second WriteAtomic would clobber the first loser's only
-// preserved snapshot. With sub-second precision, two distinct clock() values
-// yield two distinct backup paths, so the insurance survives.
-func backupSuffix(t time.Time) string {
-	return ".retrosync-conflict-" + t.UTC().Format("20060102T150405.000000000Z")
+// It is a HARD GATE — every caller invokes it immediately before WriteAtomic and
+// returns its error, so a capture failure ABORTS the write (the manifest is not
+// advanced; the next poll retries) and nothing recoverable is destroyed
+// un-captured. A destination with no current file (reach.ErrNotExist) has nothing
+// to capture and is a no-op. The store dedups by content hash and prunes to the
+// retention cap per (sync, node), so repeated identical captures do not churn.
+func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst scopedNode, reason string) error {
+	data, err := dst.r.Read(ctx, dst.path)
+	if err != nil {
+		if errors.Is(err, reach.ErrNotExist) {
+			// No current file: nothing to capture. The dst still receives the write.
+			return nil
+		}
+		return fmt.Errorf("engine: capture read %s: %w", dst.node.ID, err)
+	}
+	hash, err := dst.r.Hash(ctx, dst.path)
+	if err != nil {
+		return fmt.Errorf("engine: capture hash %s: %w", dst.node.ID, err)
+	}
+	if err := e.store.PutSaveVersion(ctx, syncID, dst.node.ID, hash, data, reason); err != nil {
+		return fmt.Errorf("engine: capture %s: %w", dst.node.ID, err)
+	}
+	return nil
 }
 
 // fanOut reads the source file once and WriteAtomic's it to every other
@@ -610,7 +676,15 @@ func backupSuffix(t time.Time) string {
 // changed to the SAME content — and, by construction of the caller, there is
 // never a member in scope that changed to DIFFERENT content (that is the
 // conflict case, where fanOut is not called at all).
-func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, srcHash string, skip map[string]bool, now time.Time) error {
+//
+// Capture-before-overwrite (the recovery net, slice-20): before WriteAtomic
+// overwrites a destination that CURRENTLY HAS a file, fanOut snapshots that
+// destination's current bytes into the server-side save-version store under
+// reason. It is a HARD GATE — if the capture fails, the write is ABORTED and the
+// error surfaced (the manifest is not advanced, the next poll retries), so no
+// recoverable bytes are ever destroyed without a snapshot. A destination with no
+// current file has nothing to capture (skip).
+func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, srcHash string, skip map[string]bool, reason string, now time.Time) error {
 	data, err := src.r.Read(ctx, src.path)
 	if err != nil {
 		return fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
@@ -627,6 +701,14 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		var dstMtimeBefore *time.Time
 		if fm, present, err := e.statOpt(ctx, dst); err == nil && present {
 			dstMtimeBefore = &fm.Mtime
+		}
+
+		// Capture-before-overwrite: snapshot the destination's current bytes into
+		// the server store BEFORE overwriting them. A hard gate — a capture failure
+		// aborts this write (manifest not advanced; next poll retries) so nothing
+		// recoverable is destroyed un-captured.
+		if err := e.captureBeforeOverwrite(ctx, syncID, dst, reason); err != nil {
+			return err
 		}
 
 		if err := dst.r.WriteAtomic(ctx, dst.path, data, srcMeta.Mtime); err != nil {

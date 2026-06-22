@@ -218,6 +218,22 @@ form.logout { display: inline; }
 .source-id { flex: 1; }
 .source-id .you { color: var(--accent); font-size: 0.85rem; }
 .source-mtime { color: var(--muted); font-size: 0.9rem; }
+
+/* Save-history page: per-member version list + the dashboard "History" link. */
+.history-link { margin-left: 0.6rem; font-size: 0.9rem; }
+.version-list { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.4rem;
+  border-radius: var(--radius);
+  min-height: 44px;
+}
+.version-row:hover { background: var(--panel-2); }
+.version-meta { color: var(--muted); font-size: 0.95rem; }
+
 .modal-actions {
   display: flex;
   align-items: center;

@@ -2,6 +2,8 @@ package engine_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -15,6 +17,14 @@ import (
 )
 
 func ctx() context.Context { return context.Background() }
+
+// sha256Hex is the lowercase-hex sha256 of b, matching what fakereach.Hash and
+// the engine's capture path produce, so a test-seeded version's hash lines up
+// with what restore writes into the manifest.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 // These tests exercise the AUTO-MIRROR engine: Poll computes the changed set of
 // a sync's members vs the manifest and propagates (1 changed), no-ops (0), or
@@ -169,6 +179,39 @@ func (h *harness) logCount(outcome store.Outcome) int {
 		}
 	}
 	return n
+}
+
+// versions returns the captured save versions for a member, newest-first.
+func (h *harness) versions(nodeID string) []store.SaveVersion {
+	h.t.Helper()
+	vs, err := h.store.ListSaveVersions(ctx(), syncID, nodeID, 0)
+	if err != nil {
+		h.t.Fatalf("list versions %s: %v", nodeID, err)
+	}
+	return vs
+}
+
+// versionData returns the bytes of the captured version at seq.
+func (h *harness) versionData(seq int64) []byte {
+	h.t.Helper()
+	_, data, err := h.store.GetSaveVersionData(ctx(), syncID, seq)
+	if err != nil {
+		h.t.Fatalf("get version data %d: %v", seq, err)
+	}
+	return data
+}
+
+// assertFileContent asserts a node's current file content (ignoring mtime, e.g.
+// after a restore that stamps the resolution time).
+func (h *harness) assertFileContent(nodeID string, content []byte) {
+	h.t.Helper()
+	data, err := h.fake(nodeID).Read(ctx(), h.paths[nodeID])
+	if err != nil {
+		h.t.Fatalf("read %s: %v", nodeID, err)
+	}
+	if string(data) != string(content) {
+		h.t.Fatalf("%s content = %q want %q", nodeID, data, content)
+	}
 }
 
 // assertFile asserts a node's current file content + mtime.
@@ -740,37 +783,85 @@ func TestPoll_MultiPeer_PartialFanOut_SelfHeals(t *testing.T) {
 	}
 }
 
-// --- ResolveConflict -----------------------------------------------------
+// TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced asserts the
+// capture-before-overwrite hard gate on the NORMAL propagate path (not just
+// resolve): when a single member changes and fan-out tries to overwrite a peer,
+// the peer's pre-overwrite bytes are captured FIRST — and if that capture fails,
+// the WriteAtomic is aborted, the peer's recoverable bytes survive, and the
+// peer's manifest is not advanced (so the next poll retries). This mirrors
+// TestResolveConflict_CaptureFails_AbortsWrite_NothingDestroyed for propagation.
+func TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced(t *testing.T) {
+	h, srcMtime := seedSynced(t)
+	newMtime := t0.Add(time.Hour)
+	// One member changes -> a single distinct hash -> propagate to the peer.
+	h.fake("primary").Mutate("p.srm", []byte("V2"), newMtime)
+	// Force the peer's capture to fail: captureBeforeOverwrite reads then HASHES
+	// the dst before overwriting, so a Hash failure fails the capture.
+	h.fake("peer").FailHash("", errors.New("capture boom"))
 
-// backupSuffix mirrors engine.backupSuffix for test assertions.
-func backupSuffix(t time.Time) string {
-	return ".retrosync-conflict-" + t.UTC().Format("20060102T150405.000000000Z")
+	if err := h.engine.Poll(ctx(), syncID); err == nil {
+		t.Fatal("poll should return the capture error")
+	}
+	// The peer's original bytes survive (the WriteAtomic was aborted by the gate).
+	h.assertFile("peer", []byte("V1"), srcMtime)
+	// The peer's manifest did NOT advance past the aborted write.
+	if m := h.manifest("peer"); m.Mtime == nil || !m.Mtime.Equal(srcMtime) {
+		t.Fatalf("peer manifest advanced past an aborted (capture-failed) write: %v", m.Mtime)
+	}
+	// No version was committed for the peer (the put never ran).
+	if vs := h.versions("peer"); len(vs) != 0 {
+		t.Fatalf("captured %d versions despite capture failure, want 0", len(vs))
+	}
+	// last_synced must not advance on a failed pass.
+	if h.sync().LastSynced != nil {
+		t.Fatalf("last_synced advanced despite an aborted fan-out")
+	}
+
+	// Clear the failure; the next poll re-detects and heals.
+	h.fake("peer").FailHash("", nil)
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("retry poll: %v", err)
+	}
+	h.assertFile("peer", []byte("V2"), newMtime)
 }
 
-func TestResolveConflict_WinnerWins_BacksUpLoserAndFansOut(t *testing.T) {
-	h, primaryMtime, peerMtime := seedConflicted(t)
+// --- ResolveConflict -----------------------------------------------------
+
+func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
+	h, primaryMtime, _ := seedConflicted(t)
+
+	// Capture the loser's pre-resolution content+hash so we can assert the
+	// server-side snapshot is its exact bytes.
+	loserBytes := []byte("PEER-WROTE")
+	loserHash := h.hashOf("peer")
 
 	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	// The <ts> in the backup path is the RESOLUTION time, recorded as last_synced.
 	resolvedAt := h.sync().LastSynced
 	if resolvedAt == nil {
 		t.Fatal("last_synced should be set after resolution")
 	}
-	// The loser's ORIGINAL file was backed up to <path>.retrosync-conflict-<ts>
-	// on the loser's node, with the loser's original bytes + mtime.
-	backupPath := "q.srm" + backupSuffix(*resolvedAt)
-	bf, ok := h.fake("peer").Get(backupPath)
-	if !ok {
-		t.Fatalf("loser backup %q not found; paths=%v", backupPath, h.fake("peer").Paths())
+
+	// The loser's ORIGINAL bytes were captured to the SERVER save-version store
+	// (NOT a device-side sibling file) before being overwritten.
+	vs := h.versions("peer")
+	if len(vs) != 1 {
+		t.Fatalf("loser captured versions = %d, want 1", len(vs))
 	}
-	if string(bf.Data) != "PEER-WROTE" {
-		t.Fatalf("backup content = %q want PEER-WROTE", bf.Data)
+	if vs[0].Hash != loserHash || vs[0].Reason != "conflict-resolve" {
+		t.Fatalf("loser version = %+v, want hash %q reason conflict-resolve", vs[0], loserHash)
 	}
-	if !bf.Mtime.Equal(peerMtime) {
-		t.Fatalf("backup mtime = %v want %v (loser's original)", bf.Mtime, peerMtime)
+	if got := h.versionData(vs[0].Seq); string(got) != string(loserBytes) {
+		t.Fatalf("captured loser bytes = %q, want %q", got, loserBytes)
+	}
+	// The recovery net REPLACES the old device-side sibling backup: no
+	// .retrosync-conflict-* file is written to the device anymore.
+	for _, p := range h.fake("peer").Paths() {
+		if strings.Contains(p, ".retrosync-conflict-") {
+			t.Fatalf("a device-side sibling backup %q was written; expected server-side capture only", p)
+		}
 	}
 
 	// Every other member now holds the WINNER's bytes + mtime.
@@ -792,30 +883,47 @@ func TestResolveConflict_WinnerWins_BacksUpLoserAndFansOut(t *testing.T) {
 		t.Fatalf("conflict_at should be cleared after resolution")
 	}
 
-	// sync_log has the backup row (naming the path) + the fan-out ok row.
+	// sync_log has the fan-out ok row; no device-side "backup" rows anymore.
 	entries, err := h.store.ListLogBySync(ctx(), syncID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var backups, fanouts int
+	var fanouts int
 	for _, e := range entries {
 		if e.Outcome != store.OutcomeOK {
 			continue
 		}
 		if strings.Contains(e.Message, "conflict-resolve backup") {
-			backups++
-			if !strings.Contains(e.Message, backupPath) {
-				t.Fatalf("backup log message should name the backup path, got %q", e.Message)
-			}
-		} else {
-			fanouts++
+			t.Fatalf("device-side backup log row should not exist anymore: %q", e.Message)
 		}
-	}
-	if backups != 1 {
-		t.Fatalf("backup log rows = %d want 1", backups)
+		fanouts++
 	}
 	if fanouts < 1 {
 		t.Fatalf("expected at least one fan-out ok row, got %d", fanouts)
+	}
+}
+
+// TestResolveConflict_CaptureFails_AbortsWrite_NothingDestroyed asserts the
+// capture-before-overwrite hard gate: if the server capture fails, the loser's
+// file is NOT overwritten (its recoverable bytes survive) and the sync stays
+// conflicted (re-resolvable). The capture is forced to fail by making the loser's
+// Hash error (capture reads then hashes).
+func TestResolveConflict_CaptureFails_AbortsWrite_NothingDestroyed(t *testing.T) {
+	h, _, peerMtime := seedConflicted(t)
+	h.fake("peer").FailHash("", errors.New("hash boom"))
+
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err == nil {
+		t.Fatal("resolve should fail when the capture fails")
+	}
+	// The loser's original file is intact (not overwritten with the winner).
+	h.assertFile("peer", []byte("PEER-WROTE"), peerMtime)
+	// Conflict stays set -> re-resolvable.
+	if h.sync().ConflictAt == nil {
+		t.Fatalf("conflict_at should remain set after a capture failure")
+	}
+	// No version was committed for the loser (the put never ran).
+	if vs := h.versions("peer"); len(vs) != 0 {
+		t.Fatalf("captured %d versions despite capture failure, want 0", len(vs))
 	}
 }
 
@@ -911,25 +1019,12 @@ func TestResolveConflict_FanOutFails_LeavesConflictSet_Reresolvable(t *testing.T
 	}
 }
 
-// subSecondClock advances by one nanosecond per call, so two resolves in the
-// same wall-clock second still get distinct backup-suffix timestamps.
-func subSecondClock(start time.Time) engine.Clock {
-	cur := start
-	return func() time.Time {
-		t := cur
-		cur = cur.Add(time.Nanosecond)
-		return t
-	}
-}
-
-// TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber asserts
-// the sub-second backup-suffix: two conflict resolutions in the same wall-clock
-// second must write DISTINCT backup paths, so the second never clobbers the
-// first loser's only preserved snapshot.
-func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *testing.T) {
-	// Build a sync with a sub-second clock so two resolves get nanosecond-distinct
-	// timestamps within the same second.
-	h := newHarness(t, subSecondClock(t0))
+// TestResolveConflict_SuccessiveResolves_BothLosersCaptured asserts the server
+// store preserves the loser's pre-resolution bytes across two successive
+// resolutions: each capture is a distinct content-addressed version (keyed by the
+// monotonic seq), so the second never clobbers the first loser's snapshot.
+func TestResolveConflict_SuccessiveResolves_BothLosersCaptured(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
 	base := t0.Add(-time.Hour)
 	h.addNode("primary", "p.srm", []byte("V1"), base, true)
 	h.addNode("peer", "q.srm", []byte("V1"), base, true)
@@ -945,10 +1040,8 @@ func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *tes
 	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve 1: %v", err)
 	}
-	resolved1 := *h.sync().LastSynced
-	backup1 := "q.srm" + backupSuffix(resolved1)
 
-	// Second fork + resolve in the same second: peer holds LOSER-2.
+	// Second fork + resolve: peer holds LOSER-2.
 	h.fake("primary").Mutate("p.srm", []byte("WIN-2"), base.Add(3*time.Hour))
 	h.fake("peer").Mutate("q.srm", []byte("LOSER-2"), base.Add(4*time.Hour))
 	if err := h.engine.Poll(ctx(), syncID); err != nil {
@@ -957,41 +1050,149 @@ func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *tes
 	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve 2: %v", err)
 	}
-	resolved2 := *h.sync().LastSynced
-	backup2 := "q.srm" + backupSuffix(resolved2)
 
-	if backup1 == backup2 {
-		t.Fatalf("two same-second resolves produced the same backup path %q (clobber)", backup1)
+	// BOTH losers survive as distinct server-side versions (newest-first).
+	vs := h.versions("peer")
+	if len(vs) != 2 {
+		t.Fatalf("peer captured versions = %d, want 2", len(vs))
 	}
-	// BOTH backups survive with their distinct losers.
-	if bf, ok := h.fake("peer").Get(backup1); !ok || string(bf.Data) != "LOSER-1" {
-		t.Fatalf("backup1 missing or wrong: %q ok=%v", backup1, ok)
+	if got := string(h.versionData(vs[0].Seq)); got != "LOSER-2" {
+		t.Fatalf("newest capture = %q, want LOSER-2", got)
 	}
-	if bf, ok := h.fake("peer").Get(backup2); !ok || string(bf.Data) != "LOSER-2" {
-		t.Fatalf("backup2 missing or wrong: %q ok=%v", backup2, ok)
+	if got := string(h.versionData(vs[1].Seq)); got != "LOSER-1" {
+		t.Fatalf("older capture = %q, want LOSER-1", got)
 	}
 }
 
-func TestResolveConflict_NodeWithoutFile_NoBackup_StillReceivesWinner(t *testing.T) {
+func TestResolveConflict_NodeWithoutFile_NoCapture_StillReceivesWinner(t *testing.T) {
 	// Build a conflict where the LOSER has no file: primary + peer both changed,
 	// but then the peer's file is removed before resolution. The peer gets no
-	// backup (nothing to preserve) but still receives the winner.
+	// capture (nothing to preserve) but still receives the winner.
 	h, primaryMtime, _ := seedConflicted(t)
 	h.fake("peer").Remove("q.srm")
 
 	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	resolvedAt := h.sync().LastSynced
-	if resolvedAt == nil {
+	if h.sync().LastSynced == nil {
 		t.Fatal("last_synced should be set")
 	}
-	// No backup file for the empty loser.
-	if _, ok := h.fake("peer").Get("q.srm" + backupSuffix(*resolvedAt)); ok {
-		t.Fatalf("an empty loser should not get a backup")
+	// No captured version for the empty loser (nothing to snapshot).
+	if vs := h.versions("peer"); len(vs) != 0 {
+		t.Fatalf("an empty loser should not be captured: %d versions", len(vs))
 	}
 	// But it still receives the winner's bytes.
 	h.assertFile("peer", []byte("PRIMARY"), primaryMtime)
+}
+
+// --- RestoreVersion ------------------------------------------------------
+
+// captureFor seeds a captured save version for (sync,node) with the given bytes
+// by driving a real overwrite through the engine's capture path: it mutates the
+// node + polls, which captures the OLD bytes of every overwritten member. Rather
+// than rely on poll timing, the tests below capture directly via the store and
+// then restore, asserting the engine writes the bytes back and propagates.
+
+// TestRestoreVersion_WritesBackAndPropagates asserts that restoring a captured
+// version makes those bytes the current content of the target member AND fans
+// them out to every other member, clears any conflict, and marks synced.
+func TestRestoreVersion_WritesBackAndPropagates(t *testing.T) {
+	h, srcMtime := seedSynced(t) // primary + peer both hold "V1"@srcMtime
+
+	// Manually capture a known old version for "primary" in the server store.
+	old := []byte("OLD-SAVE")
+	oldHash := sha256Hex(old)
+	if err := h.store.PutSaveVersion(ctx(), syncID, "primary", oldHash, old, "propagate"); err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+	vs := h.versions("primary")
+	if len(vs) != 1 {
+		t.Fatalf("seeded versions = %d, want 1", len(vs))
+	}
+	seq := vs[0].Seq
+
+	if err := h.engine.RestoreVersion(ctx(), syncID, seq); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	// Both members now hold the restored bytes.
+	now := h.sync().LastSynced
+	if now == nil {
+		t.Fatal("last_synced should be set after restore")
+	}
+	for _, id := range []string{"primary", "peer"} {
+		data, err := h.fake(id).Read(ctx(), h.paths[id])
+		if err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		if string(data) != string(old) {
+			t.Fatalf("%s content = %q, want %q (restored)", id, data, old)
+		}
+		// Manifest carries the restored hash.
+		m := h.manifest(id)
+		if m.SHA256 == nil || *m.SHA256 != oldHash {
+			t.Fatalf("%s manifest hash = %v, want %q", id, m.SHA256, oldHash)
+		}
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("restore should clear conflict_at")
+	}
+	// The peer's pre-restore bytes ("V1") were captured before being overwritten.
+	pv := h.versions("peer")
+	if len(pv) != 1 || pv[0].Reason != "restore" {
+		t.Fatalf("peer pre-restore capture = %+v, want one reason=restore", pv)
+	}
+	if got := string(h.versionData(pv[0].Seq)); got != "V1" {
+		t.Fatalf("peer captured pre-restore bytes = %q, want V1", got)
+	}
+	// The RESTORE TARGET's own pre-restore bytes ("V1") were ALSO captured before
+	// being overwritten, so a mis-click restore is itself reversible. primary's
+	// versions are: the seeded OLD-SAVE (newest, the one we restored) plus a fresh
+	// reason=restore capture of its pre-restore "V1".
+	tv := h.versions("primary") // newest-first
+	var restoreCap *store.SaveVersion
+	for i := range tv {
+		if tv[i].Reason == "restore" {
+			restoreCap = &tv[i]
+			break
+		}
+	}
+	if restoreCap == nil {
+		t.Fatalf("restore target's own pre-restore bytes were not captured (a mis-click would be irreversible): %+v", tv)
+	}
+	if got := string(h.versionData(restoreCap.Seq)); got != "V1" {
+		t.Fatalf("target captured pre-restore bytes = %q, want V1", got)
+	}
+	_ = srcMtime
+}
+
+// TestRestoreVersion_PrunedSeq_NotFound asserts restoring a seq that no longer
+// exists (pruned/gone) returns ErrNotFound.
+func TestRestoreVersion_PrunedSeq_NotFound(t *testing.T) {
+	h, _ := seedSynced(t)
+	if err := h.engine.RestoreVersion(ctx(), syncID, 999999); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("restore unknown seq: want ErrNotFound, got %v", err)
+	}
+}
+
+// TestRestoreVersion_ClearsConflict asserts restore is also a valid recovery from
+// a conflicted sync: it clears conflict_at.
+func TestRestoreVersion_ClearsConflict(t *testing.T) {
+	h, _, _ := seedConflicted(t) // sync is paused (conflict_at set)
+	old := []byte("RECOVER")
+	oldHash := sha256Hex(old)
+	if err := h.store.PutSaveVersion(ctx(), syncID, "primary", oldHash, old, "conflict-resolve"); err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+	seq := h.versions("primary")[0].Seq
+
+	if err := h.engine.RestoreVersion(ctx(), syncID, seq); err != nil {
+		t.Fatalf("restore from conflict: %v", err)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("restore should clear conflict_at")
+	}
+	h.assertFileContent("peer", old)
 }
 
 // --- NodeStates ----------------------------------------------------------

@@ -12,6 +12,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -54,6 +55,14 @@ func Run(t *testing.T, newStore Factory) {
 		{"SyncCascades", testSyncCascades},
 		{"SyncMembersByNode", testSyncMembersByNode},
 		{"RuntimeCascadesOnSyncDelete", testRuntimeCascadesOnSyncDelete},
+		{"SaveVersionRetentionAndOrder", testSaveVersionRetentionAndOrder},
+		{"SaveVersionDedup", testSaveVersionDedup},
+		{"SaveVersionBlobDedupAndGC", testSaveVersionBlobDedupAndGC},
+		{"SaveVersionPerMemberIsolation", testSaveVersionPerMemberIsolation},
+		{"SaveVersionCascadeAndGC", testSaveVersionCascadeAndGC},
+		{"SaveVersionInvalidReference", testSaveVersionInvalidReference},
+		{"SaveVersionGetData", testSaveVersionGetData},
+		{"SaveVersionGetDataCrossSyncBinding", testSaveVersionGetDataCrossSyncBinding},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -1099,6 +1108,306 @@ func testRuntimeCascadesOnSyncDelete(t *testing.T, s store.Store) {
 }
 
 // ---- helpers ----
+
+// ---- SaveVersions (the recovery net) ----
+
+// testSaveVersionRetentionAndOrder asserts that putting N+3 versions keeps only
+// the newest store.SaveVersionRetention, ordered by seq (newest-first), and that
+// retention is by SEQ not by captured_at (a bad clock must never misorder).
+func testSaveVersionRetentionAndOrder(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+
+	n := store.SaveVersionRetention + 3
+	hashes := make([]string, n)
+	for i := 0; i < n; i++ {
+		// Distinct content (and hash) per version so none dedups.
+		h := fmt.Sprintf("h%02d", i)
+		hashes[i] = h
+		must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", h, []byte(h+"-data"), "propagate"))
+	}
+
+	got, err := s.ListSaveVersions(c, "sm-bob", "bob-deck", 0)
+	if err != nil {
+		t.Fatalf("ListSaveVersions: %v", err)
+	}
+	if len(got) != store.SaveVersionRetention {
+		t.Fatalf("kept %d versions, want %d", len(got), store.SaveVersionRetention)
+	}
+	// Newest-first by seq, descending and strictly monotonic.
+	for i := 1; i < len(got); i++ {
+		if got[i-1].Seq <= got[i].Seq {
+			t.Fatalf("versions not strictly seq-descending: %d then %d", got[i-1].Seq, got[i].Seq)
+		}
+	}
+	// The newest store.SaveVersionRetention hashes survived; the oldest 3 were pruned.
+	wantNewest := hashes[n-1]
+	if got[0].Hash != wantNewest {
+		t.Fatalf("newest version hash = %q want %q", got[0].Hash, wantNewest)
+	}
+	survivors := make(map[string]bool, len(got))
+	for _, v := range got {
+		survivors[v.Hash] = true
+	}
+	for _, oldH := range hashes[:3] {
+		if survivors[oldH] {
+			t.Fatalf("pruned hash %q should not have survived", oldH)
+		}
+	}
+
+	// Size is carried from the blob.
+	for _, v := range got {
+		if v.Size != int64(len(v.Hash+"-data")) {
+			t.Fatalf("version %q size = %d, want %d", v.Hash, v.Size, len(v.Hash+"-data"))
+		}
+		if v.Reason != "propagate" {
+			t.Fatalf("version %q reason = %q, want propagate", v.Hash, v.Reason)
+		}
+	}
+
+	// limit caps the result newest-first.
+	lim, err := s.ListSaveVersions(c, "sm-bob", "bob-deck", 2)
+	if err != nil {
+		t.Fatalf("ListSaveVersions(limit): %v", err)
+	}
+	if len(lim) != 2 || lim[0].Hash != wantNewest {
+		t.Fatalf("limit-2 list = %+v, want newest two", lim)
+	}
+}
+
+// testSaveVersionDedup asserts that an identical consecutive hash does NOT add a
+// new version (no churn on a no-op/identical re-save), but a different hash in
+// between lets the same hash be captured again.
+func testSaveVersionDedup(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "A", []byte("a"), "propagate"))
+	// Identical consecutive hash: no new row.
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "A", []byte("a"), "propagate"))
+	got, _ := s.ListSaveVersions(c, "sm-bob", "bob-deck", 0)
+	if len(got) != 1 {
+		t.Fatalf("identical consecutive put added a row: %d, want 1", len(got))
+	}
+
+	// A different hash, then A again: both A captures exist (not consecutive).
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "B", []byte("b"), "propagate"))
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "A", []byte("a"), "propagate"))
+	got, _ = s.ListSaveVersions(c, "sm-bob", "bob-deck", 0)
+	if len(got) != 3 {
+		t.Fatalf("non-consecutive A should re-capture: %d versions, want 3", len(got))
+	}
+	if got[0].Hash != "A" || got[1].Hash != "B" || got[2].Hash != "A" {
+		t.Fatalf("unexpected version order: %q %q %q", got[0].Hash, got[1].Hash, got[2].Hash)
+	}
+}
+
+// testSaveVersionBlobDedupAndGC asserts content-addressed dedup (a hash shared
+// by two versions stores its bytes once and survives while either version does)
+// and orphan-blob GC (a hash used only by a pruned version is removed, a shared
+// hash is kept).
+func testSaveVersionBlobDedupAndGC(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "carol-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "carol-deck", Path: "q"}))
+
+	// SHARED hash across two different members: stored once, referenced twice.
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "SHARED", []byte("shared"), "propagate"))
+	must(t, s.PutSaveVersion(c, "sm-bob", "carol-deck", "SHARED", []byte("shared"), "propagate"))
+
+	// A UNIQUE hash on bob-deck that we will then push out of retention.
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "UNIQUE", []byte("unique"), "propagate"))
+	uniqueSeq := findSeq(t, s, "sm-bob", "bob-deck", "UNIQUE")
+
+	// Churn bob-deck past retention so UNIQUE (and bob's SHARED) are pruned, but
+	// carol-deck still references SHARED -> SHARED's blob must survive.
+	for i := 0; i < store.SaveVersionRetention+1; i++ {
+		h := fmt.Sprintf("churn%02d", i)
+		must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", h, []byte(h), "propagate"))
+	}
+
+	// UNIQUE's version is gone (pruned) -> GetSaveVersionData -> ErrNotFound, and
+	// its orphan blob was GC'd (no other version references "UNIQUE").
+	if _, _, err := s.GetSaveVersionData(c, "sm-bob", uniqueSeq); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("pruned UNIQUE version: want ErrNotFound, got %v", err)
+	}
+
+	// SHARED still has carol-deck's live version -> its blob survives and is
+	// readable.
+	sharedSeq := findSeq(t, s, "sm-bob", "carol-deck", "SHARED")
+	v, data, err := s.GetSaveVersionData(c, "sm-bob", sharedSeq)
+	if err != nil {
+		t.Fatalf("GetSaveVersionData(SHARED): %v", err)
+	}
+	if v.Hash != "SHARED" || string(data) != "shared" {
+		t.Fatalf("SHARED data = %q (hash %q), want shared", data, v.Hash)
+	}
+}
+
+// testSaveVersionPerMemberIsolation asserts retention is per (sync,node): heavy
+// churn on one member does not evict another member's versions.
+func testSaveVersionPerMemberIsolation(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "carol-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "carol-deck", Path: "q"}))
+
+	// One version for carol-deck.
+	must(t, s.PutSaveVersion(c, "sm-bob", "carol-deck", "carol-v", []byte("c"), "propagate"))
+
+	// Heavy churn on bob-deck (well past retention).
+	for i := 0; i < store.SaveVersionRetention+5; i++ {
+		h := fmt.Sprintf("bob%02d", i)
+		must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", h, []byte(h), "propagate"))
+	}
+
+	carol, _ := s.ListSaveVersions(c, "sm-bob", "carol-deck", 0)
+	if len(carol) != 1 || carol[0].Hash != "carol-v" {
+		t.Fatalf("carol-deck version evicted by bob-deck churn: %+v", carol)
+	}
+	bob, _ := s.ListSaveVersions(c, "sm-bob", "bob-deck", 0)
+	if len(bob) != store.SaveVersionRetention {
+		t.Fatalf("bob-deck kept %d, want %d", len(bob), store.SaveVersionRetention)
+	}
+}
+
+// testSaveVersionCascadeAndGC asserts versions cascade when their sync (or node)
+// is deleted, and that the orphaned blobs are GC'd.
+func testSaveVersionCascadeAndGC(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "X", []byte("x"), "propagate"))
+	seq := findSeq(t, s, "sm-bob", "bob-deck", "X")
+
+	// Delete the sync: its versions cascade away and the orphan blob is GC'd.
+	must(t, s.DeleteSync(c, "sm-bob"))
+	got, err := s.ListSaveVersions(c, "sm-bob", "bob-deck", 0)
+	if err != nil {
+		t.Fatalf("ListSaveVersions after sync delete: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("versions survived sync delete: %d", len(got))
+	}
+	if _, _, err := s.GetSaveVersionData(c, "sm-bob", seq); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("version after sync delete: want ErrNotFound, got %v", err)
+	}
+
+	// Re-create and verify NODE delete cascades too.
+	mustSync(t, s, "sm-bob2", "super-metroid")
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob2", NodeID: "bob-deck", Path: "p"}))
+	must(t, s.PutSaveVersion(c, "sm-bob2", "bob-deck", "Y", []byte("y"), "propagate"))
+	must(t, s.DeleteNode(c, "bob-deck"))
+	got, _ = s.ListSaveVersions(c, "sm-bob2", "bob-deck", 0)
+	if len(got) != 0 {
+		t.Fatalf("versions survived node delete: %d", len(got))
+	}
+}
+
+// testSaveVersionInvalidReference asserts a put against a missing sync or node
+// is rejected with ErrInvalidReference.
+func testSaveVersionInvalidReference(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+
+	if err := s.PutSaveVersion(c, "ghost", "bob-deck", "h", []byte("d"), "r"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("put missing sync: want ErrInvalidReference, got %v", err)
+	}
+	if err := s.PutSaveVersion(c, "sm-bob", "ghost", "h", []byte("d"), "r"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("put missing node: want ErrInvalidReference, got %v", err)
+	}
+}
+
+// testSaveVersionGetData asserts GetSaveVersionData returns the version metadata
+// plus its blob bytes, and ErrNotFound for an unknown seq.
+func testSaveVersionGetData(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "p"}))
+	must(t, s.PutSaveVersion(c, "sm-bob", "bob-deck", "Z", []byte("zebra"), "conflict-resolve"))
+	seq := findSeq(t, s, "sm-bob", "bob-deck", "Z")
+
+	v, data, err := s.GetSaveVersionData(c, "sm-bob", seq)
+	if err != nil {
+		t.Fatalf("GetSaveVersionData: %v", err)
+	}
+	if v.SyncID != "sm-bob" || v.NodeID != "bob-deck" || v.Hash != "Z" || v.Reason != "conflict-resolve" {
+		t.Fatalf("version metadata mismatch: %+v", v)
+	}
+	if string(data) != "zebra" {
+		t.Fatalf("blob data = %q, want zebra", data)
+	}
+	if v.Size != int64(len("zebra")) {
+		t.Fatalf("size = %d, want %d", v.Size, len("zebra"))
+	}
+	if _, _, err := s.GetSaveVersionData(c, "sm-bob", seq+9999); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetSaveVersionData(unknown): want ErrNotFound, got %v", err)
+	}
+}
+
+// testSaveVersionGetDataCrossSyncBinding pins the store-enforced authz floor for
+// restore: GetSaveVersionData binds the seq to the requested sync. A seq that
+// belongs to sync B is ErrNotFound when asked for under sync A (so a member of A
+// who guesses B's bigserial seq can never load — let alone restore — B's bytes),
+// while the SAME seq under its OWN sync loads normally.
+func testSaveVersionGetDataCrossSyncBinding(t *testing.T, s store.Store) {
+	c := ctx()
+	// Two independent syncs of the same game, each with its own member + version.
+	mustSync(t, s, "sync-a", "super-metroid")
+	mustSync(t, s, "sync-b", "super-metroid")
+	mustNode(t, s, "node-a", nil)
+	mustNode(t, s, "node-b", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-a", NodeID: "node-a", Path: "a"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-b", NodeID: "node-b", Path: "b"}))
+
+	must(t, s.PutSaveVersion(c, "sync-b", "node-b", "B", []byte("b-secret"), "propagate"))
+	seqB := findSeq(t, s, "sync-b", "node-b", "B")
+
+	// B's seq under A (the cross-sync attempt): not found, NOT B's data.
+	if _, _, err := s.GetSaveVersionData(c, "sync-a", seqB); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-sync GetSaveVersionData(sync-a, seqOfB): want ErrNotFound, got %v", err)
+	}
+	// B's seq under its OWN sync: loads normally (proving the seq itself is valid;
+	// the rejection above is purely the sync binding, not a bad seq).
+	v, data, err := s.GetSaveVersionData(c, "sync-b", seqB)
+	if err != nil {
+		t.Fatalf("GetSaveVersionData(sync-b, seqOfB): %v", err)
+	}
+	if v.SyncID != "sync-b" || string(data) != "b-secret" {
+		t.Fatalf("own-sync load mismatch: sync=%q data=%q", v.SyncID, data)
+	}
+}
+
+// findSeq returns the seq of the version for (sync,node) with the given hash, or
+// fails the test. Used so cascade/GC assertions can reference a specific version
+// by seq without depending on bigserial numbering across stores.
+func findSeq(t *testing.T, s store.Store, syncID, nodeID, hash string) int64 {
+	t.Helper()
+	vs, err := s.ListSaveVersions(ctx(), syncID, nodeID, 0)
+	if err != nil {
+		t.Fatalf("ListSaveVersions: %v", err)
+	}
+	for _, v := range vs {
+		if v.Hash == hash {
+			return v.Seq
+		}
+	}
+	t.Fatalf("no version with hash %q for %s/%s", hash, syncID, nodeID)
+	return 0
+}
 
 func must(t *testing.T, err error) {
 	t.Helper()

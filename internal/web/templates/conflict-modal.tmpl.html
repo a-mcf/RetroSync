@@ -10,7 +10,8 @@
     <p>More than one node changed since the last sync.
        <strong>retrosync won't choose for you.</strong> Pick a winner:</p>
     <p class="sub">The winner's save is copied to every other node. Each other
-       node's current save is backed up alongside it first.</p>
+       node's current save is snapshotted to RetroSync's save history first, so
+       you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if needed.</p>
     <ul class="source-list">
       {{range .Nodes}}
       <li>
