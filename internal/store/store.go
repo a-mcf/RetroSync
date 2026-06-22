@@ -16,13 +16,13 @@ var (
 	// ErrNotFound is returned when a requested entity does not exist.
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is returned on a uniqueness violation: a duplicate primary
-	// key (id) or a duplicate (game_id, node_id) game_path / (sync_id, node_id)
-	// manifest / (node_id, path) sync_member.
+	// key (id) or a duplicate (sync_id, node_id) manifest / (node_id, path)
+	// sync_member.
 	ErrConflict = errors.New("store: conflict")
 	// ErrInvalidReference is returned when a write references a parent row that
 	// does not exist: e.g. a node with an owner_user_id for a missing user, a
-	// game_path naming a missing game or node, or a binding/manifest/log naming a
-	// missing sync (a foreign-key violation).
+	// sync naming a missing game, a sync_member naming a missing sync or node, or
+	// a binding/manifest/log naming a missing sync (a foreign-key violation).
 	ErrInvalidReference = errors.New("store: invalid reference")
 	// ErrInvalidValue is returned when a field fails a domain/enum constraint:
 	// e.g. a bad role, kind, or reach (a CHECK violation).
@@ -118,20 +118,13 @@ type Node struct {
 	LastSeenAt *time.Time
 }
 
-// Game is a title in the registry. Paths live in GamePath, not here.
+// Game is a title in the registry. A game's playable members live in its Syncs'
+// SyncMembers (see Sync/SyncMember), not here.
 type Game struct {
 	ID      string
 	Display string
 	System  string
 	Notes   string
-}
-
-// GamePath maps a (game, node) pair to a path on that node. The path is
-// relative to a node-defined save root (see docs/data-model.md).
-type GamePath struct {
-	GameID string
-	NodeID string
-	Path   string
 }
 
 // Outcome is the result of a single directional sync copy, recorded in
@@ -283,13 +276,6 @@ type Store interface {
 	ListGames(ctx context.Context, f GameFilter) ([]Game, error)
 	UpdateGame(ctx context.Context, g Game) error
 	DeleteGame(ctx context.Context, id string) error
-
-	// GamePaths.
-	SetGamePath(ctx context.Context, gp GamePath) error // upsert on (game_id, node_id)
-	GetGamePath(ctx context.Context, gameID, nodeID string) (GamePath, error)
-	ListGamePathsByGame(ctx context.Context, gameID string) ([]GamePath, error)
-	ListGamePathsByNode(ctx context.Context, nodeID string) ([]GamePath, error)
-	DeleteGamePath(ctx context.Context, gameID, nodeID string) error
 
 	// ActiveBindings. The sync_id PK enforces one active session per sync.
 	// CreateBinding: duplicate sync_id -> ErrConflict; missing sync/node ->

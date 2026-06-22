@@ -21,8 +21,6 @@ type Store struct {
 	users map[string]store.User
 	nodes map[string]store.Node
 	games map[string]store.Game
-	// paths keyed by game_id then node_id.
-	paths map[gpKey]store.GamePath
 	// bindings keyed by sync_id (the PK / one-active-session invariant).
 	bindings map[string]store.ActiveBinding
 	// manifest keyed by (sync_id, node_id).
@@ -37,11 +35,6 @@ type Store struct {
 	syncMembers map[smKey]store.SyncMember
 }
 
-type gpKey struct {
-	gameID string
-	nodeID string
-}
-
 type smKey struct {
 	syncID string
 	nodeID string
@@ -53,7 +46,6 @@ func New() *Store {
 		users:       make(map[string]store.User),
 		nodes:       make(map[string]store.Node),
 		games:       make(map[string]store.Game),
-		paths:       make(map[gpKey]store.GamePath),
 		bindings:    make(map[string]store.ActiveBinding),
 		manifest:    make(map[smKey]store.ManifestEntry),
 		nextLogID:   1,
@@ -208,12 +200,7 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 		}
 	}
 	delete(s.nodes, id)
-	// Cascade: delete game_paths and manifest rows referencing this node.
-	for k := range s.paths {
-		if k.nodeID == id {
-			delete(s.paths, k)
-		}
-	}
+	// Cascade: delete manifest rows referencing this node.
 	for k := range s.manifest {
 		if k.nodeID == id {
 			delete(s.manifest, k)
@@ -302,13 +289,6 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 		}
 	}
 	delete(s.games, id)
-	// Cascade: delete game_paths referencing this game (game_paths is kept for the
-	// registry; it still cascades on game delete).
-	for k := range s.paths {
-		if k.gameID == id {
-			delete(s.paths, k)
-		}
-	}
 	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE. Each deleted sync
 	// in turn cascades its members, manifest, sync_log, and (none, since none are
 	// active here) any binding.
@@ -344,68 +324,6 @@ func (s *Store) deleteSyncCascade(syncID string) {
 	}
 	s.log = kept
 	delete(s.bindings, syncID)
-}
-
-// ---- GamePaths ----
-
-func (s *Store) SetGamePath(_ context.Context, gp store.GamePath) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.games[gp.GameID]; !ok {
-		return store.ErrInvalidReference
-	}
-	if _, ok := s.nodes[gp.NodeID]; !ok {
-		return store.ErrInvalidReference
-	}
-	s.paths[gpKey{gp.GameID, gp.NodeID}] = gp
-	return nil
-}
-
-func (s *Store) GetGamePath(_ context.Context, gameID, nodeID string) (store.GamePath, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	gp, ok := s.paths[gpKey{gameID, nodeID}]
-	if !ok {
-		return store.GamePath{}, store.ErrNotFound
-	}
-	return gp, nil
-}
-
-func (s *Store) ListGamePathsByGame(_ context.Context, gameID string) ([]store.GamePath, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]store.GamePath, 0)
-	for k, gp := range s.paths {
-		if k.gameID == gameID {
-			out = append(out, gp)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
-	return out, nil
-}
-
-func (s *Store) ListGamePathsByNode(_ context.Context, nodeID string) ([]store.GamePath, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]store.GamePath, 0)
-	for k, gp := range s.paths {
-		if k.nodeID == nodeID {
-			out = append(out, gp)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].GameID < out[j].GameID })
-	return out, nil
-}
-
-func (s *Store) DeleteGamePath(_ context.Context, gameID, nodeID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	k := gpKey{gameID, nodeID}
-	if _, ok := s.paths[k]; !ok {
-		return store.ErrNotFound
-	}
-	delete(s.paths, k)
-	return nil
 }
 
 // ---- ActiveBindings ----

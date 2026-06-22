@@ -232,11 +232,11 @@ func (s *Server) handleEditNode(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/nodes/{id}/delete -----------------------------------------
 
-// handleDeleteNode handles POST /api/nodes/{id}/delete. game_paths referencing
-// the node cascade on delete, so only an active binding whose primary is this
-// node blocks it: that comes back from the Store as ErrInvalidReference (the
-// active_bindings.primary_node FK), which we surface as a friendly "node is in
-// use" 409 rather than a 500.
+// handleDeleteNode handles POST /api/nodes/{id}/delete. sync_members and
+// manifest rows referencing the node cascade on delete, so only an active
+// binding whose primary is this node blocks it: that comes back from the Store
+// as ErrInvalidReference (the active_bindings.primary_node FK), which we surface
+// as a friendly "node is in use" 409 rather than a 500.
 func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -251,8 +251,8 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		http.Error(w, "no such node", http.StatusNotFound)
 	case errors.Is(err, store.ErrInvalidReference) || errors.Is(err, store.ErrConflict):
-		// The node is the primary of an active binding (game_paths cascade, so
-		// only an active session blocks). Friendly, non-500 message so the admin
+		// The node is the primary of an active binding (members/manifest cascade,
+		// so only an active session blocks). Friendly, non-500 message so the admin
 		// knows to stop the session first.
 		http.Error(w, "node is in use by an active session — stop it first", http.StatusConflict)
 	default:

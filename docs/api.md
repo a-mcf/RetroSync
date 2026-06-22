@@ -140,20 +140,49 @@ Edit (path id authoritative). Unknown game → `404`, else same mapping as creat
 
 ### `POST /api/games/{id}/delete`
 
-Delete. `game_paths` / `manifest` / `sync_log` cascade; only an active binding
-blocks it → `409` ("being played right now"). Unknown game → `404`.
+Delete. The game's `syncs` (and their `sync_members` / `manifest` / `sync_log`)
+cascade; only an active binding on any of those syncs blocks it → `409` ("being
+played right now"). Unknown game → `404`.
 
-### `POST /api/games/{id}/paths/{node_id}`
+## Registry — Syncs (admin-only)
 
-Add or update a (game, node) path mapping. Form field: `path`. **This is the
-authoritative route** — the client-side HTMX path-rewrite that splices the chosen
-`node_id` into the URL is progressive enhancement only. Empty path → `400`; missing
-game or node (FK) → `422`.
+A *sync* is the unit of mirroring: a set of `(node, save-file path)` members that
+sync together. A game may have many independent syncs. These routes edit the
+registry (distinct from the play-side `/api/syncs/{id}/activate|deactivate|
+resolve-conflict` routes, which drive the engine and are owner/admin-gated).
 
-### `POST /api/games/{id}/paths/{node_id}/delete`
+### `POST /api/syncs`
 
-Remove a path mapping. Refused with `409` if that node is the active primary for
-the game (checked against the binding before delete). Unknown mapping → `404`.
+Create. Form fields: `game_id` (required), `name` (required), `id?`. When `id` is
+omitted it is auto-generated as a slug from `game_id` + `name`; a manual id
+overrides. Bad/empty fields or an invalid derived slug → `400`; missing game (FK)
+→ `422`; duplicate id → `409`.
+
+### `POST /api/syncs/{id}` (rename)
+
+Rename. Form field: `name` (required). The id and game are immutable here. Empty
+name → `400`; unknown sync → `404`.
+
+### `POST /api/syncs/{id}/delete`
+
+Delete. Refused with `409` if the sync has an active binding (don't tear down a
+live session; checked against the binding before delete). Otherwise deletes;
+`sync_members` / `manifest` / `sync_log` cascade. Unknown sync → `404`.
+
+### `POST /api/syncs/{id}/members/{node_id}`
+
+Add or update a sync member. Form field: `path`. **This is the authoritative
+route** — the client-side HTMX path-rewrite that splices the chosen `node_id`
+into the URL is progressive enhancement only. Empty path → `400`; missing sync or
+node (FK) → `422`; the `(node, path)` already a member of ANOTHER sync (the global
+`UNIQUE (node_id, path)` invariant) → `409` ("that save file is already in another
+sync"). The file picker / save-file discovery is deferred (slice 17); for now the
+path is typed by hand.
+
+### `POST /api/syncs/{id}/members/{node_id}/delete`
+
+Remove a member. Refused with `409` if that node is the active primary of this
+sync (checked against the binding before delete). Unknown member → `404`.
 
 ## Read-only JSON
 
@@ -177,7 +206,32 @@ These three emit JSON today (the seed of a future agent-facing API). Auth requir
 
 ### `GET /api/games`
 
-List games with their path mappings and active state (JSON).
+List games with their syncs (JSON). Each sync carries its members (node + path +
+last-known manifest mtime) and active-binding state:
+
+```json
+[
+  {
+    "id": "super-metroid",
+    "display": "Super Metroid",
+    "system": "snes",
+    "syncs": [
+      {
+        "id": "sm-bob",
+        "name": "Bob's stream",
+        "active": { "primary_node": "bob-deck", "since": "...", "conflict": false },
+        "members": [
+          { "node_id": "bob-deck", "path": "sm.srm", "mtime": "2026-06-21T11:30:00Z" },
+          { "node_id": "carol-deck", "path": "sm.srm", "mtime": null }
+        ]
+      }
+    ]
+  }
+]
+```
+
+`active` is `null` for an idle sync. Each member's `mtime` is always present
+(a value or `null`).
 
 ### `GET /api/nodes`
 

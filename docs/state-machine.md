@@ -28,7 +28,7 @@ A game with no row in `active_bindings` is **idle**. A row makes it **active**. 
 User opens the UI, finds *Super Metroid*, clicks "Play on my Deck."
 
 1. Server checks `active_bindings.game_id`. If a row exists with a *different* primary → return 409, show "Currently bound to alice-deck since 14:02. Force takeover?" Force = delete the existing row, create new.
-2. Server stats every node that has a `game_paths` row for this game.
+2. Server stats every member node of the sync (each `sync_members` row).
 3. None of them have the file → bail; user needs to create one first.
 4. Only one node has the file → log it; auto-pick that as the source for the first sync pass; no prompt.
 5. Multiple nodes have the file → prompt "Which save do you want to start from?" Default: **the node you're binding from** ("Use my save"), since the human just sat down with that device and knows what's on it.

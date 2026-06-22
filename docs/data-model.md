@@ -2,10 +2,17 @@
 
 > **Implemented.** All tables below exist as embedded migrations applied at
 > startup, behind the storage-agnostic `internal/store.Store` (Postgres + in-memory
-> fake, one conformance suite). The registry (users, nodes, games, game_paths) is
-> edited through the admin UI; game/node ids are slugs, auto-generated from the
-> display when omitted (manual id overrides). `active_bindings`, `manifest`, and
-> `sync_log` are written by the engine/daemon. See the "Storage choice" note below.
+> fake, one conformance suite). The registry (users, nodes, games, syncs,
+> sync_members) is edited through the admin UI; game/node/sync ids are slugs,
+> auto-generated from the display/name when omitted (manual id overrides).
+> `active_bindings`, `manifest`, and `sync_log` are written by the engine/daemon.
+> See the "Storage choice" note below.
+>
+> **Note:** `game_paths` (one row per `(game, node)`) was the original
+> registry-of-paths table. It has been **retired** (migration 0005): a game's
+> playable members now live in `sync_members` (a `(node, path)` member of a
+> `sync`), which is the unit of mirroring. The section below documents the
+> current `syncs` / `sync_members` shape.
 
 Two stores: a **registry** (slow-changing, human-edited) and a **runtime state** (fast-changing, machine-edited). They live in the same Postgres database (see "Storage choice"); the conceptual split matters more than the physical.
 
@@ -48,21 +55,45 @@ A node is any device that holds save files. Decks, MiSTers, Anbernics, the house
 | system   | text | `snes`, `n64`, etc. — informational  |
 | notes    | text | free-form                            |
 
-Note: no `mister_path` or canonical path here. Paths live in `game_paths`.
+Note: no `mister_path` or canonical path here. A game's playable members live in
+its `syncs`' `sync_members`.
 
-### `game_paths`
+### `syncs`
 
-The replacement for SGM-Helper's per-system layout assumptions. One row per (game, node) pair you want playable.
+A *sync* is a mirror group: a specific set of `(node, save-file)` members that
+sync together. It belongs to one game, but a game may have MANY independent syncs
+(e.g. two unrelated streams of the same title) so long as they do not share a
+`(node, path)` member.
 
-| field        | type | notes                                                                    |
-|--------------|------|--------------------------------------------------------------------------|
-| game_id      | text | FK → games                                                               |
-| node_id      | text | FK → nodes                                                               |
-| path         | text | path on that node — relative to a node-defined root, see below           |
+| field    | type | notes                                |
+|----------|------|--------------------------------------|
+| id       | text | slug, e.g. `sm-bob`                  |
+| game_id  | text | FK → games, `ON DELETE CASCADE`      |
+| name     | text | free-form label, e.g. "Bob's stream" |
 
-PK: (game_id, node_id).
+The runtime tables (`active_bindings`, `manifest`, `sync_log`) key off `sync_id`;
+the engine, daemon, and web play side all operate on a `sync` and its members.
 
-`path` is **relative to a node-defined save root** (kept in `reach_config` or a separate `save_roots` field) so that:
+### `sync_members`
+
+The replacement for `game_paths` (and SGM-Helper's per-system layout
+assumptions). One row per `(node, save-file)` member of a sync — the thing you
+want playable.
+
+| field    | type | notes                                                          |
+|----------|------|----------------------------------------------------------------|
+| sync_id  | text | FK → syncs, `ON DELETE CASCADE`                                |
+| node_id  | text | FK → nodes, `ON DELETE CASCADE`                                |
+| path     | text | path on that node — relative to a node-defined root, see below |
+
+- **PK `(sync_id, node_id)`** — a node appears at most once per sync.
+- **`UNIQUE (node_id, path)`** across all members — a given `(device, file)` lives
+  in at most one sync. This is the core invariant: it permits multi-slot (same
+  node, different path → different sync) while forbidding the same file from being
+  claimed by two syncs.
+
+`path` is **relative to a node-defined save root** (kept in `reach_config` or a
+separate `save_roots` field) so that:
 
 - For `syncthing-share` nodes, retrosync resolves to `<reach_config.path>/<save_root>/<path>` on the local filesystem.
 - For `ssh` nodes, retrosync resolves to `<save_root>/<path>` on the remote.
@@ -74,10 +105,12 @@ Example:
 ```
 games:
   super-metroid:
-    paths:
-      bob-deck:           retroarch/saves/Super Metroid.srm
-      alice-deck:         Emulation/saves/snes9x/Super Metroid.srm
-      living-room-mister: SNES/Super Metroid.sav
+    syncs:
+      sm-bob (Bob's stream):
+        bob-deck:           retroarch/saves/Super Metroid.srm
+        living-room-mister: SNES/Super Metroid.sav
+      sm-alice (Alice's stream):
+        alice-deck:         Emulation/saves/snes9x/Super Metroid.srm
 ```
 
 ## Runtime state
@@ -132,7 +165,7 @@ PK: (game_id, node_id). The poll loop updates this; conflict detection compares 
 
 ## Storage choice
 
-- **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the unique constraint on `active_bindings`, JSONB for `reach_config`, `ON DELETE CASCADE` for `game_paths`, and a managed/HA operator in k8s.
+- **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the unique constraint on `active_bindings`, JSONB for `reach_config`, `ON DELETE CASCADE` for `syncs` / `sync_members`, and a managed/HA operator in k8s.
 - All business logic depends on a Go **`Store` interface** (`internal/store`), never on the driver. There are two implementations: a thread-safe in-memory store (used by fast unit tests) and a pgx v5 Postgres store. Both run an identical **conformance suite** (`internal/store/storetest`) so they cannot drift in behavior.
 - Access is via **pgx v5** with hand-written parameterized queries — no ORM, no sqlc. Migrations are embedded (`embed.FS`) and applied programmatically at startup and in tests (`internal/migrate`).
 - Integration tests run against a real Postgres started with **podman** (gated by a build tag / `DATABASE_URL`); plain `go test ./...` needs no database.

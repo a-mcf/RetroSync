@@ -314,69 +314,6 @@ func (s *Store) DeleteGame(ctx context.Context, id string) error {
 	return nil
 }
 
-// ---- GamePaths ----
-
-func (s *Store) SetGamePath(ctx context.Context, gp store.GamePath) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO game_paths (game_id, node_id, path) VALUES ($1, $2, $3)
-		 ON CONFLICT (game_id, node_id) DO UPDATE SET path = EXCLUDED.path`,
-		gp.GameID, gp.NodeID, gp.Path)
-	return mapErr(err)
-}
-
-func (s *Store) GetGamePath(ctx context.Context, gameID, nodeID string) (store.GamePath, error) {
-	var gp store.GamePath
-	err := s.db.QueryRow(ctx,
-		`SELECT game_id, node_id, path FROM game_paths WHERE game_id = $1 AND node_id = $2`,
-		gameID, nodeID,
-	).Scan(&gp.GameID, &gp.NodeID, &gp.Path)
-	if err != nil {
-		return store.GamePath{}, mapErr(err)
-	}
-	return gp, nil
-}
-
-func (s *Store) ListGamePathsByGame(ctx context.Context, gameID string) ([]store.GamePath, error) {
-	return s.listGamePaths(ctx,
-		`SELECT game_id, node_id, path FROM game_paths WHERE game_id = $1 ORDER BY node_id`,
-		gameID)
-}
-
-func (s *Store) ListGamePathsByNode(ctx context.Context, nodeID string) ([]store.GamePath, error) {
-	return s.listGamePaths(ctx,
-		`SELECT game_id, node_id, path FROM game_paths WHERE node_id = $1 ORDER BY game_id`,
-		nodeID)
-}
-
-func (s *Store) listGamePaths(ctx context.Context, sql, arg string) ([]store.GamePath, error) {
-	rows, err := s.db.Query(ctx, sql, arg)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	defer rows.Close()
-	out := make([]store.GamePath, 0)
-	for rows.Next() {
-		var gp store.GamePath
-		if err := rows.Scan(&gp.GameID, &gp.NodeID, &gp.Path); err != nil {
-			return nil, mapErr(err)
-		}
-		out = append(out, gp)
-	}
-	return out, mapErr(rows.Err())
-}
-
-func (s *Store) DeleteGamePath(ctx context.Context, gameID, nodeID string) error {
-	tag, err := s.db.Exec(ctx,
-		`DELETE FROM game_paths WHERE game_id = $1 AND node_id = $2`, gameID, nodeID)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	return nil
-}
-
 // ---- ActiveBindings ----
 //
 // The active_bindings.sync_id PRIMARY KEY enforces one active session per sync

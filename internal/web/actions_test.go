@@ -162,11 +162,6 @@ func newActionFixture(t *testing.T) *actionFixture {
 		if err := st.SetManifest(ctx, store.ManifestEntry{SyncID: "sm-bob", NodeID: n, Mtime: &mtime}); err != nil {
 			t.Fatalf("set manifest %s: %v", n, err)
 		}
-		// Also seed the registry game_path (the /games admin UI still manages
-		// game_paths, orphaned from the engine — TODO(slice-registry-sync)).
-		if err := st.SetGamePath(ctx, store.GamePath{GameID: "super-metroid", NodeID: n, Path: "sm.srm"}); err != nil {
-			t.Fatalf("set path %s: %v", n, err)
-		}
 	}
 
 	act := &stubActioner{}
