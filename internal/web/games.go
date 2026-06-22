@@ -28,8 +28,14 @@ import (
 //   - Removing a MEMBER whose node is the active primary of the sync is refused
 //     — checked here against the sync's binding before the Store delete.
 //
-// TODO(slice-picker): member paths are typed by hand here (a text field), the
-// same as game_paths was. The save-file discovery / file picker is slice 17.
+// Member paths can now be filled by the save-file PICKER (slice-17): the
+// "Add member" form's "Browse…" button hits GET /api/nodes/{id}/browse
+// (handleBrowseNode) to list the selected node's mounted save dir; clicking a
+// file fills the path input. The manual text field stays as a fallback.
+// TODO(slice-discovery): filename-match suggestions ("the same-name save on
+// other devices") to pre-fill peer members from one pick.
+// TODO(slice-ssh): ssh nodes return "browsing not supported yet" until the
+// ssh/sftp adapter lands; today only syncthing-share nodes are browsable.
 
 // --- view-models ---------------------------------------------------------
 
@@ -404,7 +410,8 @@ func (s *Server) handleDeleteSync(w http.ResponseWriter, r *http.Request) {
 //   - (node, path) already a member of ANOTHER sync       -> 409
 //     (the global UNIQUE (node_id, path) invariant)
 //
-// TODO(slice-picker): the path is typed by hand; the file picker lands later.
+// The path may be typed OR filled by the slice-17 save-file picker (the picker
+// just sets this same field); either way it arrives as the `path` form value.
 func (s *Server) handleSetSyncMember(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {

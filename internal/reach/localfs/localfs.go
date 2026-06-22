@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/reach"
@@ -78,6 +79,80 @@ func (l *LocalFS) Read(_ context.Context, path string) ([]byte, error) {
 		return nil, fmt.Errorf("localfs: read %q: %w", path, err)
 	}
 	return data, nil
+}
+
+// List implements reach.Reach. It resolves relPath through safepath (so a
+// traversal/absolute/escape path is rejected exactly as Stat/Read are), then
+// os.ReadDir's the resolved directory and maps each entry to a reach.DirEntry.
+//
+// An empty relPath (or ".") names the node's save root. The returned entries are
+// metadata ONLY — name, type, size, mtime — never file contents: os.ReadDir
+// reads directory entries, and each entry's Info() is a stat, so no save bytes
+// are ever read here. Entries are sorted directories-first, then alphabetically,
+// for a deterministic picker render. A missing directory maps to
+// reach.ErrNotExist; a path that exists but is not a directory is a clear error.
+func (l *LocalFS) List(_ context.Context, relPath string) ([]reach.DirEntry, error) {
+	// safepath rejects an empty rel; "" and "." both mean "the node root", so
+	// normalize "" to "." before resolving. Resolve(root, ".") yields the root.
+	rel := relPath
+	if rel == "" {
+		rel = "."
+	}
+	abs, err := safepath.Resolve(l.root, rel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Stat first so we can map "absent" to ErrNotExist and reject a non-directory
+	// with a clear error (os.ReadDir on a file returns a less obvious error).
+	fi, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("localfs: list %q: %w", relPath, reach.ErrNotExist)
+		}
+		return nil, fmt.Errorf("localfs: list %q: %w", relPath, err)
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("localfs: list %q: not a directory", relPath)
+	}
+
+	dirents, err := os.ReadDir(abs)
+	if err != nil {
+		return nil, fmt.Errorf("localfs: read dir %q: %w", relPath, err)
+	}
+
+	out := make([]reach.DirEntry, 0, len(dirents))
+	for _, de := range dirents {
+		// Info() is a stat of the entry: it yields size + mtime, NOT contents.
+		info, err := de.Info()
+		if err != nil {
+			// The entry vanished between ReadDir and Info (a transient race); skip
+			// it rather than failing the whole listing.
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("localfs: stat entry %q in %q: %w", de.Name(), relPath, err)
+		}
+		out = append(out, reach.DirEntry{
+			Name:  de.Name(),
+			IsDir: de.IsDir(),
+			Size:  info.Size(),
+			Mtime: info.ModTime(),
+		})
+	}
+	sortDirEntries(out)
+	return out, nil
+}
+
+// sortDirEntries orders entries directories-first, then alphabetically by name,
+// so the picker render is deterministic regardless of filesystem order.
+func sortDirEntries(entries []reach.DirEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir // dirs before files
+		}
+		return entries[i].Name < entries[j].Name
+	})
 }
 
 // WriteAtomic implements reach.Reach honoring the crash-safety contract: write

@@ -36,6 +36,17 @@ type stubActioner struct {
 	// smokeErr is returned by SmokeTest; smokeTested records each probed node id.
 	smokeErr    error
 	smokeTested []string
+
+	// browseErr / browseEntries program BrowseNode; browsed records each
+	// (node,path) call so picker tests assert the handler reached the engine with
+	// the right relative path.
+	browseErr     error
+	browseEntries []engine.DirEntry
+	browsed       []browseCall
+}
+
+type browseCall struct {
+	nodeID, relPath string
 }
 
 type activateCall struct {
@@ -85,6 +96,22 @@ func (s *stubActioner) smokeTestedNodes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.smokeTested...)
+}
+
+func (s *stubActioner) BrowseNode(_ context.Context, nodeID, relPath string) ([]engine.DirEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.browsed = append(s.browsed, browseCall{nodeID, relPath})
+	if s.browseErr != nil {
+		return nil, s.browseErr
+	}
+	return append([]engine.DirEntry(nil), s.browseEntries...), nil
+}
+
+func (s *stubActioner) browseCalls() []browseCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]browseCall(nil), s.browsed...)
 }
 
 func (s *stubActioner) resolveCalls() []resolveCall {

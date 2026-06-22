@@ -8,6 +8,7 @@ package localfs_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/a-mcf/retrosync/internal/engine"
 	"github.com/a-mcf/retrosync/internal/reach"
 	"github.com/a-mcf/retrosync/internal/reach/resolve"
+	"github.com/a-mcf/retrosync/internal/reach/safepath"
 	"github.com/a-mcf/retrosync/internal/store"
 	"github.com/a-mcf/retrosync/internal/store/memory"
 )
@@ -150,6 +152,57 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 		t.Fatalf("resolved peer reach Stat: %v", err)
 	}
 	_ = reach.ErrNotExist // documents the sentinel exercised above
+}
+
+// TestEngineBrowseNode_RealLocalFS drives engine.BrowseNode through the real
+// resolver + localfs adapter over a temp-dir node root, asserting it lists real
+// directory entries (metadata only) and that a traversal path is rejected and
+// surfaces as engine.ErrBrowseUnsafePath (the web layer's 400 trigger).
+func TestEngineBrowseNode_RealLocalFS(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	// Seed a small tree on disk.
+	for _, f := range []struct{ rel, data string }{
+		{"alpha.srm", "a"},
+		{"saves/game.srm", "bytes"},
+	} {
+		abs := filepath.Join(root, f.rel)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, []byte(f.data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st := memory.New()
+	mustNode(t, st, "bob-deck", root)
+	eng := engine.New(st, resolve.ResolveReach, steppingClock(time.Unix(0, 0).UTC(), time.Second))
+
+	// Root listing: saves/ (dir) first, then alpha.srm (file) — metadata only.
+	entries, err := eng.BrowseNode(ctx, "bob-deck", "")
+	if err != nil {
+		t.Fatalf("BrowseNode root: %v", err)
+	}
+	if len(entries) != 2 || !entries[0].IsDir || entries[0].Name != "saves" || entries[1].Name != "alpha.srm" {
+		t.Fatalf("BrowseNode root = %+v, want saves/ then alpha.srm", entries)
+	}
+	if entries[1].Size != 1 {
+		t.Errorf("alpha.srm size = %d, want 1", entries[1].Size)
+	}
+
+	// Traversal is rejected by safepath inside the adapter and surfaces as the
+	// engine's ErrBrowseUnsafePath sentinel (and still wraps safepath.ErrUnsafePath).
+	for _, bad := range []string{"../escape", "/etc", "a/../../b"} {
+		_, err := eng.BrowseNode(ctx, "bob-deck", bad)
+		if !errors.Is(err, engine.ErrBrowseUnsafePath) {
+			t.Fatalf("BrowseNode(%q) err = %v, want ErrBrowseUnsafePath", bad, err)
+		}
+		if !errors.Is(err, safepath.ErrUnsafePath) {
+			t.Fatalf("BrowseNode(%q) err = %v should also wrap safepath.ErrUnsafePath", bad, err)
+		}
+	}
 }
 
 func mustNode(t *testing.T, st store.Store, id, root string) {
