@@ -13,8 +13,9 @@
 // Conflict RESOLUTION: the dashboard conflict banner, the conflict modal
 // (GET /syncs/{id}/conflict) that surfaces every member's live state, and the
 // owner/admin-gated, CSRF-protected POST /api/syncs/{id}/resolve-conflict that
-// drives the engine's ResolveConflict. The /games /nodes registry editing UI
-// still manages game_paths (TODO(slice-registry-sync) moves it onto syncs).
+// drives the engine's ResolveConflict. The /games registry editing UI manages a
+// game's syncs and each sync's members (node + path) directly (game_paths is
+// retired).
 package web
 
 import (
@@ -200,17 +201,26 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/nodes/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteNode)))))
 	mux.Handle("POST /api/nodes/{id}/smoke-test", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSmokeTest)))))
 
-	// Games registry (slice-11). Admin-only per docs/auth.md, same wrapping as
-	// /nodes: every page and mutation behind requireAuth+requireAdmin (mutations
-	// also behind requireCSRF), so a non-admin never reaches the Store. Path
-	// mappings are managed per (game, node) via POST (not PUT/DELETE) to stay
-	// consistent with the existing form/HTMX style.
+	// Games registry (slice-11 + slice-16). Admin-only per docs/auth.md, same
+	// wrapping as /nodes: every page and mutation behind requireAuth+requireAdmin
+	// (mutations also behind requireCSRF), so a non-admin never reaches the Store.
+	// A game's playable scope is managed through its SYNCS and each sync's MEMBERS
+	// (node + path), all via POST (not PUT/DELETE) to stay consistent with the
+	// existing form/HTMX style.
 	mux.Handle("GET /games", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleGamesPage))))
 	mux.Handle("POST /api/games", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateGame)))))
 	mux.Handle("POST /api/games/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditGame)))))
 	mux.Handle("POST /api/games/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGame)))))
-	mux.Handle("POST /api/games/{id}/paths/{node_id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSetGamePath)))))
-	mux.Handle("POST /api/games/{id}/paths/{node_id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGamePath)))))
+
+	// Sync registry mutations (slice-16). Same admin + CSRF wrapping. Note these
+	// are distinct from the PLAY-side /api/syncs/{id}/activate|deactivate|
+	// resolve-conflict routes above: those drive the engine and are owner/admin-
+	// gated; these edit the registry and are admin-only.
+	mux.Handle("POST /api/syncs", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateSync)))))
+	mux.Handle("POST /api/syncs/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleRenameSync)))))
+	mux.Handle("POST /api/syncs/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSync)))))
+	mux.Handle("POST /api/syncs/{id}/members/{node_id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSetSyncMember)))))
+	mux.Handle("POST /api/syncs/{id}/members/{node_id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSyncMember)))))
 
 	return mux
 }

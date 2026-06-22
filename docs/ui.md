@@ -58,7 +58,9 @@ Default radio: **the node you're binding from** (see state-machine.md for why). 
 
 ### `/games` — registry
 
-Admin-ish. Add a game, edit paths, add a node mapping. Power-user surface. Most users live on `/`.
+Admin-ish. Add a game; under each game, create syncs; under each sync, add
+members (a node + the save-file path on it). Power-user surface. Most users live
+on `/`.
 
 ### `/nodes` — devices
 

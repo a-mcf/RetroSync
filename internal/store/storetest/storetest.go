@@ -32,10 +32,6 @@ func Run(t *testing.T, newStore Factory) {
 		{"Nodes", testNodes},
 		{"Games", testGames},
 		{"GamesFilter", testGamesFilter},
-		{"GamePaths", testGamePaths},
-		{"GamePathUpsert", testGamePathUpsert},
-		{"CascadeDeleteGame", testCascadeDeleteGame},
-		{"CascadeDeleteNode", testCascadeDeleteNode},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
 		{"Bindings", testBindings},
@@ -314,126 +310,6 @@ func testGamesFilter(t *testing.T, s store.Store) {
 	}
 }
 
-func testGamePaths(t *testing.T, s store.Store) {
-	c := ctx()
-	mustUser(t, s, "bob")
-	mustGame(t, s, "super-metroid")
-	mustNode(t, s, "bob-deck", ptr("bob"))
-	mustNode(t, s, "mister", nil)
-
-	gp := store.GamePath{GameID: "super-metroid", NodeID: "bob-deck", Path: "retroarch/saves/Super Metroid.srm"}
-	if err := s.SetGamePath(c, gp); err != nil {
-		t.Fatalf("SetGamePath: %v", err)
-	}
-	got, err := s.GetGamePath(c, "super-metroid", "bob-deck")
-	if err != nil {
-		t.Fatalf("GetGamePath: %v", err)
-	}
-	if got != gp {
-		t.Fatalf("GetGamePath = %+v, want %+v", got, gp)
-	}
-	if _, err := s.GetGamePath(c, "super-metroid", "nope"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("GetGamePath(missing): want ErrNotFound, got %v", err)
-	}
-
-	gp2 := store.GamePath{GameID: "super-metroid", NodeID: "mister", Path: "SNES/Super Metroid.sav"}
-	if err := s.SetGamePath(c, gp2); err != nil {
-		t.Fatalf("SetGamePath 2: %v", err)
-	}
-
-	byGame, err := s.ListGamePathsByGame(c, "super-metroid")
-	if err != nil {
-		t.Fatalf("ListGamePathsByGame: %v", err)
-	}
-	if len(byGame) != 2 {
-		t.Fatalf("ListGamePathsByGame len = %d, want 2", len(byGame))
-	}
-
-	byNode, err := s.ListGamePathsByNode(c, "bob-deck")
-	if err != nil {
-		t.Fatalf("ListGamePathsByNode: %v", err)
-	}
-	if len(byNode) != 1 || byNode[0].NodeID != "bob-deck" {
-		t.Fatalf("ListGamePathsByNode = %+v, want one bob-deck row", byNode)
-	}
-
-	if err := s.DeleteGamePath(c, "super-metroid", "bob-deck"); err != nil {
-		t.Fatalf("DeleteGamePath: %v", err)
-	}
-	if err := s.DeleteGamePath(c, "super-metroid", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("DeleteGamePath(missing): want ErrNotFound, got %v", err)
-	}
-}
-
-func testGamePathUpsert(t *testing.T, s store.Store) {
-	c := ctx()
-	mustGame(t, s, "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-
-	gp := store.GamePath{GameID: "super-metroid", NodeID: "bob-deck", Path: "old/path.srm"}
-	if err := s.SetGamePath(c, gp); err != nil {
-		t.Fatalf("SetGamePath: %v", err)
-	}
-	// Upsert: same PK, new path. Must not conflict; must overwrite.
-	gp.Path = "new/path.srm"
-	if err := s.SetGamePath(c, gp); err != nil {
-		t.Fatalf("SetGamePath(upsert): %v", err)
-	}
-	got, _ := s.GetGamePath(c, "super-metroid", "bob-deck")
-	if got.Path != "new/path.srm" {
-		t.Fatalf("upsert path = %q, want new/path.srm", got.Path)
-	}
-	// Still exactly one row.
-	rows, _ := s.ListGamePathsByGame(c, "super-metroid")
-	if len(rows) != 1 {
-		t.Fatalf("after upsert len = %d, want 1", len(rows))
-	}
-}
-
-func testCascadeDeleteGame(t *testing.T, s store.Store) {
-	c := ctx()
-	mustGame(t, s, "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	mustNode(t, s, "mister", nil)
-	must(t, s.SetGamePath(c, store.GamePath{GameID: "super-metroid", NodeID: "bob-deck", Path: "a"}))
-	must(t, s.SetGamePath(c, store.GamePath{GameID: "super-metroid", NodeID: "mister", Path: "b"}))
-
-	if err := s.DeleteGame(c, "super-metroid"); err != nil {
-		t.Fatalf("DeleteGame: %v", err)
-	}
-	rows, _ := s.ListGamePathsByGame(c, "super-metroid")
-	if len(rows) != 0 {
-		t.Fatalf("game_paths after game delete = %d, want 0 (cascade)", len(rows))
-	}
-	// Node-side listing also empty for those.
-	bn, _ := s.ListGamePathsByNode(c, "bob-deck")
-	if len(bn) != 0 {
-		t.Fatalf("ListGamePathsByNode after cascade = %d, want 0", len(bn))
-	}
-}
-
-func testCascadeDeleteNode(t *testing.T, s store.Store) {
-	c := ctx()
-	mustGame(t, s, "super-metroid")
-	mustGame(t, s, "zelda")
-	mustNode(t, s, "bob-deck", nil)
-	must(t, s.SetGamePath(c, store.GamePath{GameID: "super-metroid", NodeID: "bob-deck", Path: "a"}))
-	must(t, s.SetGamePath(c, store.GamePath{GameID: "zelda", NodeID: "bob-deck", Path: "b"}))
-
-	if err := s.DeleteNode(c, "bob-deck"); err != nil {
-		t.Fatalf("DeleteNode: %v", err)
-	}
-	rows, _ := s.ListGamePathsByNode(c, "bob-deck")
-	if len(rows) != 0 {
-		t.Fatalf("game_paths after node delete = %d, want 0 (cascade)", len(rows))
-	}
-	// Game-side listing also empty.
-	g, _ := s.ListGamePathsByGame(c, "super-metroid")
-	if len(g) != 0 {
-		t.Fatalf("ListGamePathsByGame after node cascade = %d, want 0", len(g))
-	}
-}
-
 // testInvalidReference asserts both stores reject writes that name a missing
 // parent row with ErrInvalidReference (FK enforcement).
 func testInvalidReference(t *testing.T, s store.Store) {
@@ -449,18 +325,25 @@ func testInvalidReference(t *testing.T, s store.Store) {
 		t.Fatalf("CreateNode(bad owner): want ErrInvalidReference, got %v", err)
 	}
 
-	// SetGamePath with a missing game (node exists).
-	mustNode(t, s, "real-node", nil)
-	err = s.SetGamePath(c, store.GamePath{GameID: "ghost-game", NodeID: "real-node", Path: "p"})
+	// CreateSync naming a missing game.
+	err = s.CreateSync(c, store.Sync{ID: "ghost-sync", GameID: "ghost-game"})
 	if !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("SetGamePath(missing game): want ErrInvalidReference, got %v", err)
+		t.Fatalf("CreateSync(missing game): want ErrInvalidReference, got %v", err)
 	}
 
-	// SetGamePath with a missing node (game exists).
-	mustGame(t, s, "real-game")
-	err = s.SetGamePath(c, store.GamePath{GameID: "real-game", NodeID: "ghost-node", Path: "p"})
+	// SetSyncMember naming a missing sync (node exists).
+	mustNode(t, s, "real-node", nil)
+	err = s.SetSyncMember(c, store.SyncMember{SyncID: "ghost-sync", NodeID: "real-node", Path: "p"})
 	if !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("SetGamePath(missing node): want ErrInvalidReference, got %v", err)
+		t.Fatalf("SetSyncMember(missing sync): want ErrInvalidReference, got %v", err)
+	}
+
+	// SetSyncMember naming a missing node (sync exists).
+	mustGame(t, s, "real-game")
+	must(t, s.CreateSync(c, store.Sync{ID: "real-sync", GameID: "real-game"}))
+	err = s.SetSyncMember(c, store.SyncMember{SyncID: "real-sync", NodeID: "ghost-node", Path: "p"})
+	if !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetSyncMember(missing node): want ErrInvalidReference, got %v", err)
 	}
 }
 

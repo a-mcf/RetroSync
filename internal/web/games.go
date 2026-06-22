@@ -10,28 +10,26 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// The /games registry UI (slice-11): admin-gated game CRUD plus per-game,
-// per-node path-mapping management. Every handler in this file is mounted behind
-// requireAuth + requireAdmin (and the mutations behind requireCSRF) in
-// Server.Handler, so a non-admin never reaches the Store here (mirrors the
-// slice-10 /nodes registry).
+// The /games registry UI (slice-16): admin-gated game CRUD, plus per-game sync
+// management and per-sync member (node + path) management. Every handler in this
+// file is mounted behind requireAuth + requireAdmin (and the mutations behind
+// requireCSRF) in Server.Handler, so a non-admin never reaches the Store here
+// (mirrors the slice-10 /nodes registry).
 //
-// No secrets are involved in games or game_paths (a path is not a credential),
-// but we keep the same discipline: nothing sensitive is logged.
+// A sync is the unit of mirroring; its members (node + save-file path) are its
+// scope. The registry edits syncs + sync_members directly; game_paths is gone.
 //
-// TODO(slice-registry-sync): the /games registry still manages game_paths, which
-// are now orphaned from the engine (the engine syncs via sync_members). The full
-// registry→syncs UI move + dropping game_paths + the file picker is slice 16.
-// This slice only re-points the binding-touching guards onto the sync-keyed
-// binding API so they compile and stay friendly.
+// No secrets are involved in syncs or members (a path is not a credential), but
+// we keep the same discipline: nothing sensitive is logged.
 //
 // Two delete/remove guards, both surfaced as a friendly 409 rather than a 500:
-//   - Deleting a game that has any ACTIVE sync is refused — the Store's
-//     DeleteGame returns ErrConflict (the FK graph would otherwise cascade a live
-//     binding away).
-//   - Removing the path of a node that is the active primary of ANY sync of this
-//     game is refused — checked here against the game's syncs' bindings before
-//     the Store delete.
+//   - Deleting a SYNC that has an active binding is refused — tearing it down
+//     would cascade a live session away. Checked here against GetBinding(syncID).
+//   - Removing a MEMBER whose node is the active primary of the sync is refused
+//     — checked here against the sync's binding before the Store delete.
+//
+// TODO(slice-picker): member paths are typed by hand here (a text field), the
+// same as game_paths was. The save-file discovery / file picker is slice 17.
 
 // --- view-models ---------------------------------------------------------
 
@@ -39,7 +37,7 @@ import (
 type gamesPageData struct {
 	User  userView
 	Games []gameAdminRow
-	// Nodes is the set of node ids the "add a path mapping" <select> offers.
+	// Nodes is the set of node ids the "add a member" <select> offers.
 	Nodes []string
 	// Q / System echo the active search filter back into the search box.
 	Q      string
@@ -47,22 +45,32 @@ type gamesPageData struct {
 	CSRF   string
 }
 
-// gameAdminRow is one game in the admin list, with its path mappings and (if
-// active) the primary node currently playing it.
+// gameAdminRow is one game in the admin list, with its syncs (each with their
+// members) and, if any sync is active, the primary node currently playing it.
 type gameAdminRow struct {
 	ID      string
 	Display string
 	System  string
 	Notes   string
-	// Active is non-empty (the primary node id) when a binding makes this game
-	// active; "" when idle.
+	// Active is non-empty (the primary node id of the first active sync) when a
+	// binding makes this game active; "" when idle.
 	Active string
-	Paths  []gamePathRow
+	Syncs  []syncAdminRow
 }
 
-// gamePathRow is one (node, path) mapping for a game, plus whether that node is
-// the active primary (so the row's Remove control can warn / be guarded).
-type gamePathRow struct {
+// syncAdminRow is one sync of a game, with its members and active state.
+type syncAdminRow struct {
+	ID      string
+	Name    string
+	Members []syncMemberRow
+	// ActivePrimary is the node currently bound as primary for this sync, or ""
+	// if the sync is idle. Used to badge the primary member and guard removal.
+	ActivePrimary string
+}
+
+// syncMemberRow is one (node, path) member of a sync, plus whether that node is
+// the sync's active primary (so the Remove control can warn / be guarded).
+type syncMemberRow struct {
 	NodeID    string
 	Path      string
 	IsPrimary bool
@@ -70,7 +78,7 @@ type gamePathRow struct {
 
 // gameRowContext is the per-row template context: one game plus the shared
 // page-level node option set and CSRF token, so the "game-row" template can
-// render its add-path form without re-deriving them.
+// render its forms without re-deriving them.
 type gameRowContext struct {
 	Game  gameAdminRow
 	Nodes []string
@@ -87,9 +95,9 @@ func gameRowCtx(page gamesPageData, row gameAdminRow) gameRowContext {
 // --- GET /games ----------------------------------------------------------
 
 // handleGamesPage renders the admin game registry: a search box, the filtered
-// game list (each with its path mappings + active state), an add-game form, and
-// per-game edit/delete + add/remove-path controls. Admin-gating is enforced by
-// the requireAdmin wrapper.
+// game list (each with its syncs + members + active state), an add-game form,
+// and per-game/per-sync controls. Admin-gating is enforced by the requireAdmin
+// wrapper.
 func (s *Server) handleGamesPage(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -142,34 +150,30 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 	for _, g := range games {
 		row := gameAdminRow{ID: g.ID, Display: g.Display, System: g.System, Notes: g.Notes}
 
-		// A game is "active" when any of its syncs has an active binding. We
-		// collect the set of active-primary node ids across the game's syncs so a
-		// game_path row on any of those nodes is flagged IsPrimary (guarded against
-		// removal). TODO(slice-registry-sync): the registry view moves onto syncs.
-		activePrimaries := make(map[string]bool)
 		syncs, err := s.store.ListSyncsByGame(ctx, g.ID)
 		if err != nil {
 			return gamesPageData{}, err
 		}
 		for _, sy := range syncs {
+			sr := syncAdminRow{ID: sy.ID, Name: sy.Name}
 			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
+				sr.ActivePrimary = b.PrimaryNode
 				row.Active = b.PrimaryNode
-				activePrimaries[b.PrimaryNode] = true
 			} else if !errors.Is(err, store.ErrNotFound) {
 				return gamesPageData{}, err
 			}
-		}
-
-		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
-		if err != nil {
-			return gamesPageData{}, err
-		}
-		for _, p := range paths {
-			row.Paths = append(row.Paths, gamePathRow{
-				NodeID:    p.NodeID,
-				Path:      p.Path,
-				IsPrimary: activePrimaries[p.NodeID],
-			})
+			members, err := s.store.ListSyncMembers(ctx, sy.ID)
+			if err != nil {
+				return gamesPageData{}, err
+			}
+			for _, m := range members {
+				sr.Members = append(sr.Members, syncMemberRow{
+					NodeID:    m.NodeID,
+					Path:      m.Path,
+					IsPrimary: sr.ActivePrimary == m.NodeID,
+				})
+			}
+			row.Syncs = append(row.Syncs, sr)
 		}
 		data.Games = append(data.Games, row)
 	}
@@ -180,9 +184,8 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 // --- POST /api/games (create) --------------------------------------------
 
 // handleCreateGame handles POST /api/games. Form fields: id (optional), display,
-// system, notes (optional). Per docs/open-questions.md, when id is omitted it is
-// auto-generated as a slug from display; a manual id overrides. The final id is
-// validated against the shared slug shape. Error mapping:
+// system, notes (optional). When id is omitted it is auto-generated as a slug
+// from display; a manual id overrides. Error mapping:
 //   - bad/empty fields or invalid slug (local)  -> 400
 //   - duplicate id (ErrConflict)                -> 409
 func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
@@ -233,11 +236,10 @@ func (s *Server) handleEditGame(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/games/{id}/delete -----------------------------------------
 
-// handleDeleteGame handles POST /api/games/{id}/delete. game_paths cascade on
-// delete, and the game's syncs (and their runtime rows) cascade too — but only
-// if NONE of those syncs is active. The Store refuses to delete a game with any
-// active sync, returning ErrConflict (or ErrInvalidReference) — surfaced as a
-// friendly 409 "being played right now" rather than a 500.
+// handleDeleteGame handles POST /api/games/{id}/delete. The game's syncs (and
+// their members + runtime rows) cascade — but only if NONE of those syncs is
+// active. The Store refuses to delete a game with any active sync, returning
+// ErrConflict — surfaced as a friendly 409 "being played right now".
 func (s *Server) handleDeleteGame(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -259,18 +261,157 @@ func (s *Server) handleDeleteGame(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- POST /api/games/{id}/paths/{node_id} (add/update) -------------------
+// --- POST /api/syncs (create) --------------------------------------------
 
-// handleSetGamePath handles POST /api/games/{id}/paths/{node_id}. Body field:
-// path. SetGamePath upserts on (game_id, node_id). A missing game or node comes
-// back as ErrInvalidReference -> 422. An empty path -> 400.
-func (s *Server) handleSetGamePath(w http.ResponseWriter, r *http.Request) {
+// handleCreateSync handles POST /api/syncs. Form fields: game_id (required),
+// name (required), id (optional — auto-generated as a slug from game+name when
+// omitted). Error mapping:
+//   - bad/empty fields or invalid derived slug (local) -> 400
+//   - missing game (ErrInvalidReference)               -> 422
+//   - duplicate id (ErrConflict)                       -> 409
+func (s *Server) handleCreateSync(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	gameID := r.PathValue("id")
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	gameID := strings.TrimSpace(r.PostFormValue("game_id"))
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	if gameID == "" {
+		http.Error(w, "game_id is required", http.StatusBadRequest)
+		return
+	}
+	if name == "" {
+		http.Error(w, "a sync name is required", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	if id == "" {
+		// Auto-id from game + name (e.g. super-metroid + "Bob's stream" ->
+		// super-metroid-bob-s-stream).
+		id = slugify(gameID + "-" + name)
+	}
+	if !validSlug(id) {
+		http.Error(w, "id must be a slug: lowercase letters, digits, and hyphens", http.StatusBadRequest)
+		return
+	}
+	err := s.store.CreateSync(r.Context(), store.Sync{ID: id, GameID: gameID, Name: name})
+	switch {
+	case err == nil:
+		s.refreshGamesList(w, r, u)
+	case errors.Is(err, store.ErrConflict):
+		http.Error(w, "a sync with that id already exists", http.StatusConflict)
+	case errors.Is(err, store.ErrInvalidReference):
+		http.Error(w, "no such game", http.StatusUnprocessableEntity)
+	default:
+		s.logger.ErrorContext(r.Context(), "create sync failed", "sync", id, "err", err.Error())
+		http.Error(w, "could not create sync", http.StatusInternalServerError)
+	}
+}
+
+// --- POST /api/syncs/{id} (rename) ---------------------------------------
+
+// handleRenameSync handles POST /api/syncs/{id}. Body field: name. The sync id
+// and game_id are immutable here (the path id is authoritative); only the name
+// changes. Empty name -> 400; missing sync -> 404.
+func (s *Server) handleRenameSync(w http.ResponseWriter, r *http.Request) {
+	u, ok := userFromContext(r.Context())
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.PathValue("id")
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	if name == "" {
+		http.Error(w, "a sync name is required", http.StatusBadRequest)
+		return
+	}
+	// Read the existing sync to preserve its game_id (immutable via this route).
+	sy, err := s.store.GetSync(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "no such sync", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "rename sync: get failed", "sync", id, "err", err.Error())
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	sy.Name = name
+	err = s.store.UpdateSync(r.Context(), sy)
+	switch {
+	case err == nil:
+		s.refreshGamesList(w, r, u)
+	case errors.Is(err, store.ErrNotFound):
+		http.Error(w, "no such sync", http.StatusNotFound)
+	default:
+		s.logger.ErrorContext(r.Context(), "rename sync failed", "sync", id, "err", err.Error())
+		http.Error(w, "could not rename sync", http.StatusInternalServerError)
+	}
+}
+
+// --- POST /api/syncs/{id}/delete -----------------------------------------
+
+// handleDeleteSync handles POST /api/syncs/{id}/delete. A sync with an active
+// binding is refused with a friendly 409 (deleting it would cascade away a live
+// session). Otherwise we delete; its members cascade. Missing sync -> 404.
+func (s *Server) handleDeleteSync(w http.ResponseWriter, r *http.Request) {
+	u, ok := userFromContext(r.Context())
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	id := r.PathValue("id")
+
+	// Guard: refuse deleting an active sync (don't tear down a live session).
+	// NOTE: GetBinding-then-DeleteSync is a benign TOCTOU — admin-only, not driven
+	// concurrently, so the window cannot be raced in practice.
+	if _, err := s.store.GetBinding(r.Context(), id); err == nil {
+		http.Error(w, "this sync is being played right now — stop the session first", http.StatusConflict)
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.logger.ErrorContext(r.Context(), "delete sync: get binding failed", "sync", id, "err", err.Error())
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	err := s.store.DeleteSync(r.Context(), id)
+	switch {
+	case err == nil:
+		s.refreshGamesList(w, r, u)
+	case errors.Is(err, store.ErrNotFound):
+		http.Error(w, "no such sync", http.StatusNotFound)
+	default:
+		s.logger.ErrorContext(r.Context(), "delete sync failed", "sync", id, "err", err.Error())
+		http.Error(w, "could not delete sync", http.StatusInternalServerError)
+	}
+}
+
+// --- POST /api/syncs/{id}/members/{node_id} (set member) -----------------
+
+// handleSetSyncMember handles POST /api/syncs/{id}/members/{node_id}. Body field:
+// path. SetSyncMember upserts on (sync_id, node_id). Error mapping:
+//   - empty path (local)                                  -> 400
+//   - missing sync or node (ErrInvalidReference)          -> 422
+//   - (node, path) already a member of ANOTHER sync       -> 409
+//     (the global UNIQUE (node_id, path) invariant)
+//
+// TODO(slice-picker): the path is typed by hand; the file picker lands later.
+func (s *Server) handleSetSyncMember(w http.ResponseWriter, r *http.Request) {
+	u, ok := userFromContext(r.Context())
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	syncID := r.PathValue("id")
 	nodeID := r.PathValue("node_id")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -281,73 +422,57 @@ func (s *Server) handleSetGamePath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	err := s.store.SetGamePath(r.Context(), store.GamePath{GameID: gameID, NodeID: nodeID, Path: path})
+	err := s.store.SetSyncMember(r.Context(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path})
 	switch {
 	case err == nil:
 		s.refreshGamesList(w, r, u)
+	case errors.Is(err, store.ErrConflict):
+		http.Error(w, "that save file is already in another sync", http.StatusConflict)
 	case errors.Is(err, store.ErrInvalidReference):
-		http.Error(w, "no such game or node", http.StatusUnprocessableEntity)
+		http.Error(w, "no such sync or node", http.StatusUnprocessableEntity)
 	default:
-		s.logger.ErrorContext(r.Context(), "set game path failed", "game", gameID, "node", nodeID, "err", err.Error())
-		http.Error(w, "could not save path mapping", http.StatusInternalServerError)
+		s.logger.ErrorContext(r.Context(), "set sync member failed", "sync", syncID, "node", nodeID, "err", err.Error())
+		http.Error(w, "could not save member", http.StatusInternalServerError)
 	}
 }
 
-// --- POST /api/games/{id}/paths/{node_id}/delete (remove) ----------------
+// --- POST /api/syncs/{id}/members/{node_id}/delete (remove member) -------
 
-// handleDeleteGamePath handles POST /api/games/{id}/paths/{node_id}/delete.
-// Per docs/api.md it is forbidden if this node is the active primary for the
-// game: we check the game's syncs' bindings first and return a friendly 409 in
-// that case (the Store FK would otherwise let the delete through, since
-// game_paths are not what a binding references). Otherwise we delete; a missing
-// mapping is a 404.
-//
-// TODO(slice-registry-sync): re-pointed onto the sync-keyed binding API — the
-// node is "the active primary" if it is the primary of ANY active sync of this
-// game. The whole game_paths registry moves onto sync_members in slice 16.
-func (s *Server) handleDeleteGamePath(w http.ResponseWriter, r *http.Request) {
+// handleDeleteSyncMember handles POST /api/syncs/{id}/members/{node_id}/delete.
+// Refused with a friendly 409 if that node is the active primary of this sync
+// (checked against the binding before delete). Otherwise we delete; a missing
+// member is a 404.
+func (s *Server) handleDeleteSyncMember(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 	nodeID := r.PathValue("node_id")
 
-	// Guard: refuse removing the path of a node that is the active primary of any
-	// sync of this game.
-	// NOTE: ListSyncsByGame/GetBinding-then-DeleteGamePath is a benign TOCTOU — a
-	// binding could in principle appear between the reads and the delete. Harmless
-	// here: this route is admin-only and not driven concurrently, so the window
-	// cannot be raced in practice.
-	syncs, err := s.store.ListSyncsByGame(r.Context(), gameID)
-	if err != nil {
-		s.logger.ErrorContext(r.Context(), "delete game path: list syncs failed", "game", gameID, "err", err.Error())
+	// Guard: refuse removing the member whose node is the active primary of this
+	// sync (benign TOCTOU — admin-only, not raced in practice).
+	if b, err := s.store.GetBinding(r.Context(), syncID); err == nil {
+		if b.PrimaryNode == nodeID {
+			http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)
+			return
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.logger.ErrorContext(r.Context(), "delete member: get binding failed", "sync", syncID, "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	for _, sy := range syncs {
-		if b, err := s.store.GetBinding(r.Context(), sy.ID); err == nil {
-			if b.PrimaryNode == nodeID {
-				http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)
-				return
-			}
-		} else if !errors.Is(err, store.ErrNotFound) {
-			s.logger.ErrorContext(r.Context(), "delete game path: get binding failed", "sync", sy.ID, "err", err.Error())
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-	}
 
-	err = s.store.DeleteGamePath(r.Context(), gameID, nodeID)
+	err := s.store.DeleteSyncMember(r.Context(), syncID, nodeID)
 	switch {
 	case err == nil:
 		s.refreshGamesList(w, r, u)
 	case errors.Is(err, store.ErrNotFound):
-		http.Error(w, "no such path mapping", http.StatusNotFound)
+		http.Error(w, "no such member", http.StatusNotFound)
 	default:
-		s.logger.ErrorContext(r.Context(), "delete game path failed", "game", gameID, "node", nodeID, "err", err.Error())
-		http.Error(w, "could not remove path mapping", http.StatusInternalServerError)
+		s.logger.ErrorContext(r.Context(), "delete sync member failed", "sync", syncID, "node", nodeID, "err", err.Error())
+		http.Error(w, "could not remove member", http.StatusInternalServerError)
 	}
 }
 
@@ -356,8 +481,8 @@ func (s *Server) handleDeleteGamePath(w http.ResponseWriter, r *http.Request) {
 // parseGameForm reads and validates the game create/edit form. idOverride, when
 // non-empty (edit), is the authoritative game id (the path id); for create it is
 // "" and the id comes from the form — or, if the form's id is blank, is
-// auto-generated as a slug from display (docs/open-questions.md). It returns the
-// assembled Game and a non-empty human message on a validation failure.
+// auto-generated as a slug from display. It returns the assembled Game and a
+// non-empty human message on a validation failure.
 func parseGameForm(r *http.Request, idOverride string) (store.Game, string) {
 	if err := r.ParseForm(); err != nil {
 		return store.Game{}, "bad request"

@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,21 +65,35 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	return out, nil
 }
 
-// gameResponse is one element of GET /api/games.
+// gameResponse is one element of GET /api/games. With syncs now first-class,
+// each game lists its syncs (id, name, members with node + path + last-known
+// manifest mtime, and active-binding state) — the registry view re-pointed onto
+// syncs (slice 16).
 type gameResponse struct {
-	ID      string           `json:"id"`
-	Display string           `json:"display"`
-	System  string           `json:"system"`
-	Active  *gameActive      `json:"active"`
-	Paths   []gamePathOutput `json:"paths"`
+	ID      string         `json:"id"`
+	Display string         `json:"display"`
+	System  string         `json:"system"`
+	Syncs   []syncResponse `json:"syncs"`
+}
+
+// syncResponse is one sync of a game. Active is non-null when the sync has a live
+// binding (a play session in progress).
+type syncResponse struct {
+	ID      string             `json:"id"`
+	Name    string             `json:"name"`
+	Active  *gameActive        `json:"active"`
+	Members []syncMemberOutput `json:"members"`
 }
 
 type gameActive struct {
 	PrimaryNode string `json:"primary_node"`
 	Since       string `json:"since"`
+	Conflict    bool   `json:"conflict"`
 }
 
-type gamePathOutput struct {
+// syncMemberOutput is one member of a sync: its node, the save-file path, and
+// the last-known manifest mtime (present-or-null) for that (sync, node).
+type syncMemberOutput struct {
 	NodeID string  `json:"node_id"`
 	Path   string  `json:"path"`
 	Mtime  *string `json:"mtime"`
@@ -94,37 +109,39 @@ func (s *Server) buildGames(ctx context.Context, f store.GameFilter) ([]gameResp
 	for _, g := range games {
 		gr := gameResponse{ID: g.ID, Display: g.Display, System: g.System}
 
-		// A game is "active" when any of its syncs has an active binding. The
-		// binding is sync-keyed now, so we surface the primary of the first active
-		// sync (TODO(slice-registry-sync): the /api/games registry view moves onto
-		// per-sync state; for now this preserves the "is this title in play" hint).
 		syncs, err := s.store.ListSyncsByGame(ctx, g.ID)
 		if err != nil {
 			return nil, fmt.Errorf("list syncs %s: %w", g.ID, err)
 		}
+		gr.Syncs = make([]syncResponse, 0, len(syncs))
 		for _, sy := range syncs {
+			sr := syncResponse{ID: sy.ID, Name: sy.Name}
+
 			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
-				gr.Active = &gameActive{
+				sr.Active = &gameActive{
 					PrimaryNode: b.PrimaryNode,
 					Since:       b.StartedAt.UTC().Format(time.RFC3339),
+					Conflict:    b.ConflictAt != nil,
 				}
-				break
-			} else if err != store.ErrNotFound {
+			} else if !errors.Is(err, store.ErrNotFound) {
 				return nil, fmt.Errorf("get binding %s: %w", sy.ID, err)
 			}
-		}
 
-		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
-		if err != nil {
-			return nil, fmt.Errorf("list paths %s: %w", g.ID, err)
-		}
-		gr.Paths = make([]gamePathOutput, 0, len(paths))
-		for _, p := range paths {
-			// TODO(slice-registry-sync): the manifest is now sync-keyed, so there is
-			// no per-(game,node) mtime to surface here. The registry game-paths JSON
-			// keeps the mtime FIELD (always present, per the api.md contract) but it
-			// is null until the registry view is re-pointed onto syncs.
-			gr.Paths = append(gr.Paths, gamePathOutput{NodeID: p.NodeID, Path: p.Path})
+			members, err := s.store.ListSyncMembers(ctx, sy.ID)
+			if err != nil {
+				return nil, fmt.Errorf("list members %s: %w", sy.ID, err)
+			}
+			sr.Members = make([]syncMemberOutput, 0, len(members))
+			for _, m := range members {
+				out := syncMemberOutput{NodeID: m.NodeID, Path: m.Path}
+				if me, err := s.store.GetManifest(ctx, sy.ID, m.NodeID); err == nil {
+					out.Mtime = rfc3339Ptr(me.Mtime)
+				} else if !errors.Is(err, store.ErrNotFound) {
+					return nil, fmt.Errorf("get manifest %s/%s: %w", sy.ID, m.NodeID, err)
+				}
+				sr.Members = append(sr.Members, out)
+			}
+			gr.Syncs = append(gr.Syncs, sr)
 		}
 		out = append(out, gr)
 	}
