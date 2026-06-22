@@ -1,11 +1,13 @@
 package engine
 
-// Internal (white-box) tests for the change-detection mtime comparison. These
-// live in `package engine` (not engine_test) because changed/mtimeEqual are
-// package-private. They pin the slice-13 regression: a file whose stat mtime
-// differs from the manifest mtime ONLY in sub-microsecond nanoseconds — the
-// digits Postgres timestamptz truncates — must NOT be flagged as changed, while
-// a genuine change (mtime ≥1µs apart, or a size delta) must still be detected.
+// Internal (white-box) tests for the TIER-1 stat gate of change detection.
+// These live in `package engine` (not engine_test) because statDiffers /
+// mtimeEqual are package-private. They pin the slice-13 regression: a file whose
+// stat mtime differs from the manifest mtime ONLY in sub-microsecond nanoseconds
+// — the digits Postgres timestamptz truncates — must NOT trip the stat gate,
+// while a genuine stat change (mtime ≥1µs apart, or a size delta) must. The
+// hash-backed tier 2 (touch vs real change) is exercised in engine_test's Poll
+// tests against the fakereach content hashes.
 
 import (
 	"testing"
@@ -50,7 +52,7 @@ func TestMtimeEqual_DifferentZonesSameInstant(t *testing.T) {
 	}
 }
 
-func TestChanged_MtimePrecisionAndSize(t *testing.T) {
+func TestStatDiffers_MtimePrecisionAndSize(t *testing.T) {
 	manifestMtime := time.Date(2026, 6, 21, 12, 0, 0, 252204000, time.UTC) // µs-truncated (as Postgres would store)
 	const manifestSize int64 = 4096
 
@@ -97,20 +99,20 @@ func TestChanged_MtimePrecisionAndSize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := changed(me, tt.cur, tt.present); got != tt.want {
-				t.Fatalf("changed(%+v, present=%v) = %v, want %v", tt.cur, tt.present, got, tt.want)
+			if got := statDiffers(me, tt.cur, tt.present); got != tt.want {
+				t.Fatalf("statDiffers(%+v, present=%v) = %v, want %v", tt.cur, tt.present, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestChanged_AppearedAndBothAbsent(t *testing.T) {
+func TestStatDiffers_AppearedAndBothAbsent(t *testing.T) {
 	empty := store.ManifestEntry{} // no mtime/size recorded
 	cur := reach.FileMeta{Mtime: time.Now(), Size: 10}
-	if !changed(empty, cur, true) {
-		t.Fatalf("a present file with no manifest row must be changed (appeared)")
+	if !statDiffers(empty, cur, true) {
+		t.Fatalf("a present file with no manifest row must differ (appeared)")
 	}
-	if changed(empty, reach.FileMeta{}, false) {
-		t.Fatalf("both-absent must be not-changed")
+	if statDiffers(empty, reach.FileMeta{}, false) {
+		t.Fatalf("both-absent must not differ")
 	}
 }

@@ -109,6 +109,33 @@ func (h *harness) seedManifest(nodeID string, mtime time.Time, size int64) {
 	}
 }
 
+// seedManifestHash is seedManifest plus a recorded content sha256, so a
+// subsequent Poll's tier-2 compare has a hash to match against (needed to
+// exercise the touch path: stat differs but hash equals the manifest).
+func (h *harness) seedManifestHash(nodeID string, mtime time.Time, size int64, sha string) {
+	h.t.Helper()
+	mt := mtime.UTC()
+	sz := size
+	checked := mtime.UTC()
+	s := sha
+	if err := h.store.SetManifest(ctx(), store.ManifestEntry{
+		SyncID: syncID, NodeID: nodeID, Mtime: &mt, Size: &sz, SHA256: &s, LastChecked: &checked,
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// hashOf returns the fakereach content hash a node currently reports for its
+// member path (the lowercase-hex sha256 of the stored bytes).
+func (h *harness) hashOf(nodeID string) string {
+	h.t.Helper()
+	hh, err := h.fake(nodeID).Hash(ctx(), h.paths[nodeID])
+	if err != nil {
+		h.t.Fatalf("hash %s: %v", nodeID, err)
+	}
+	return hh
+}
+
 func (h *harness) fake(id string) *fakereach.Fake { return h.fakes[id] }
 
 func (h *harness) sync() store.Sync {
@@ -269,6 +296,145 @@ func TestPoll_OneChanged_Propagates(t *testing.T) {
 	}
 }
 
+// TestPoll_Touch_NotChanged_ReconcilesManifest pins the tier-2 touch path: a
+// member whose mtime moved but whose BYTES are identical (a `touch`) is NOT a
+// change — nothing propagates, no conflict, and the manifest's mtime/size is
+// reconciled to the new stat so the next poll fast-paths it (stat-equal, no
+// hash). This is the false-positive that bare mtime+size produced.
+func TestPoll_Touch_NotChanged_ReconcilesManifest(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("V1"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), base, true)
+	// Seed the manifest WITH the correct content hash so tier 2 can recognize the
+	// touch.
+	v1hash := h.hashOf("primary")
+	h.seedManifestHash("primary", base, int64(len("V1")), v1hash)
+	h.seedManifestHash("peer", base, int64(len("V1")), v1hash)
+
+	// Touch the primary: same bytes, NEW mtime (and a manifest mtime ≥1µs away so
+	// the stat gate trips).
+	touchedMtime := base.Add(time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("V1"), touchedMtime)
+
+	writesBefore := len(h.fake("peer").Writes())
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	// No propagation (a touch is not a change), no conflict, no last_synced.
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("touch poll wrote to peer: %d -> %d", writesBefore, got)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("a touch must not conflict")
+	}
+	if h.sync().LastSynced != nil {
+		t.Fatalf("a touch must not advance last_synced")
+	}
+	// The primary's manifest mtime was reconciled to the touched mtime (so the next
+	// poll fast-paths it) while the hash stayed the same.
+	m := h.manifest("primary")
+	if m.Mtime == nil || !m.Mtime.Equal(touchedMtime.UTC().Truncate(time.Microsecond)) {
+		t.Fatalf("primary manifest mtime not reconciled: %v want %v", m.Mtime, touchedMtime)
+	}
+	if m.SHA256 == nil || *m.SHA256 != v1hash {
+		t.Fatalf("primary manifest hash = %v want %q (unchanged)", m.SHA256, v1hash)
+	}
+
+	// The peer's file is untouched.
+	h.assertFile("peer", []byte("V1"), base)
+
+	// And a follow-up poll is now a pure stat-equal noop.
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("follow-up poll: %v", err)
+	}
+	if h.sync().ConflictAt != nil || h.sync().LastSynced != nil {
+		t.Fatalf("follow-up poll must be a clean noop")
+	}
+}
+
+// TestPoll_TwoChangedSameContent_NotConflict_Propagates is the KEY new test:
+// two members changed to the SAME bytes (e.g. both already received your save
+// via the backup channel). With hash-backed detection that is ONE distinct hash
+// — an agreed content, NOT a fork — so it propagates to the lagging member and
+// does NOT conflict.
+func TestPoll_TwoChangedSameContent_NotConflict_Propagates(t *testing.T) {
+	h, _ := seedSyncedMulti(t) // primary, peer-a, peer-b all at V1
+	// primary and peer-a both change to the SAME new content; peer-b lags at V1.
+	newMtime := t0.Add(time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("V2-SAME"), newMtime)
+	h.fake("peer-a").Mutate("a.srm", []byte("V2-SAME"), newMtime.Add(time.Minute))
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	// NOT a conflict — the two changers agree on content.
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("two members at the SAME content must NOT conflict")
+	}
+	// peer-b (the lagging member) receives the agreed content. The source is the
+	// first changer by sorted node id (peer-a < primary), so peer-b inherits
+	// peer-a's mtime.
+	h.assertFile("peer-b", []byte("V2-SAME"), newMtime.Add(time.Minute))
+	if h.sync().LastSynced == nil {
+		t.Fatalf("an agreed-content propagate should advance last_synced")
+	}
+	// The two co-changers were NOT re-written (they already held the content): only
+	// peer-b got a write.
+	if n := len(h.fake("primary").Writes()); n != 0 {
+		t.Fatalf("primary (a co-changer) was re-written %d times, want 0", n)
+	}
+	if n := len(h.fake("peer-a").Writes()); n != 0 {
+		t.Fatalf("peer-a (a co-changer) was re-written %d times, want 0", n)
+	}
+	// Manifest carries the agreed hash for every member.
+	wantHash := h.hashOf("primary")
+	for _, id := range []string{"primary", "peer-a", "peer-b"} {
+		m := h.manifest(id)
+		if m.SHA256 == nil || *m.SHA256 != wantHash {
+			t.Fatalf("%s manifest hash = %v want %q", id, m.SHA256, wantHash)
+		}
+	}
+}
+
+// TestPoll_NewSyncTwoMembersIdenticalSaves_NotConflict is the onboarding case
+// the slice-18 brief flagged: a brand-new sync (empty manifest) where two
+// members already hold the SAME save. Pre-hash this conflicted (2 changed);
+// hash-backed detection sees one distinct hash and treats it as agreed content —
+// no conflict, no spurious overwrite (both already match).
+func TestPoll_NewSyncTwoMembersIdenticalSaves_NotConflict(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	aMtime := t0.Add(-2 * time.Hour)
+	bMtime := t0.Add(-time.Hour)
+	// Same bytes on both, NO seeded manifest.
+	h.addNode("primary", "p.srm", []byte("SAME-SAVE"), aMtime, true)
+	h.addNode("peer", "q.srm", []byte("SAME-SAVE"), bMtime, true)
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("a fresh sync with two IDENTICAL saves must NOT conflict")
+	}
+	// Neither member needed an overwrite (both already hold the agreed content).
+	if n := len(h.fake("primary").Writes()); n != 0 {
+		t.Fatalf("primary written %d times, want 0", n)
+	}
+	if n := len(h.fake("peer").Writes()); n != 0 {
+		t.Fatalf("peer written %d times, want 0", n)
+	}
+	// Manifest now records the agreed hash for both, so the next poll is a noop.
+	wantHash := h.hashOf("primary")
+	for _, id := range []string{"primary", "peer"} {
+		if m := h.manifest(id); m.SHA256 == nil || *m.SHA256 != wantHash {
+			t.Fatalf("%s manifest hash = %v want %q", id, m.SHA256, wantHash)
+		}
+	}
+	if h.sync().LastSynced == nil {
+		t.Fatalf("an agreed-content onboarding poll should advance last_synced")
+	}
+}
+
 func TestPoll_TwoChanged_Conflict(t *testing.T) {
 	h, _ := seedSynced(t)
 	// Both members change between polls -> a genuine fork.
@@ -318,6 +484,70 @@ func TestPoll_NewSyncTwoMembersWithSaves_Conflict(t *testing.T) {
 	// No propagation happened and last_synced did not advance.
 	if h.sync().LastSynced != nil {
 		t.Fatalf("a conflicting first poll must not advance last_synced")
+	}
+}
+
+// TestPoll_DistinctHashFork_NeverOverwrites is the data-loss guarantee: a
+// genuine fork (changed members with DIFFERENT content hashes) must flag a
+// conflict and write NOTHING — every diverged member keeps its exact bytes. This
+// pins the "never silently overwrite a distinct-hash changer" guarantee.
+func TestPoll_DistinctHashFork_NeverOverwrites(t *testing.T) {
+	h, srcMtime := seedSyncedMulti(t) // primary, peer-a, peer-b at V1
+	// primary and peer-a fork to DIFFERENT content; peer-b is innocent (still V1).
+	pMtime := t0.Add(time.Hour)
+	aMtime := t0.Add(2 * time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("FORK-PRIMARY"), pMtime)
+	h.fake("peer-a").Mutate("a.srm", []byte("FORK-PEER-A"), aMtime)
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if h.sync().ConflictAt == nil {
+		t.Fatalf("distinct-content changers must conflict")
+	}
+	// NOT ONE byte written anywhere: each diverged member keeps its own content,
+	// and the innocent member keeps V1.
+	for _, id := range []string{"primary", "peer-a", "peer-b"} {
+		if n := len(h.fake(id).Writes()); n != 0 {
+			t.Fatalf("%s was written %d times during a fork; want 0 (no overwrite)", id, n)
+		}
+	}
+	h.assertFile("primary", []byte("FORK-PRIMARY"), pMtime)
+	h.assertFile("peer-a", []byte("FORK-PEER-A"), aMtime)
+	h.assertFile("peer-b", []byte("V1"), srcMtime)
+	if h.sync().LastSynced != nil {
+		t.Fatalf("a fork must not advance last_synced")
+	}
+}
+
+// TestPoll_OneChanged_RecordsHashOnPeers asserts the single-changed propagate
+// path records the source's content hash on the source AND every peer it fans
+// out to, so a re-poll is a clean noop (stat- and hash-stable).
+func TestPoll_OneChanged_RecordsHashOnPeers(t *testing.T) {
+	h, _ := seedSynced(t)
+	newMtime := t0.Add(time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("V2-NEW"), newMtime)
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	wantHash := h.hashOf("primary")
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.SHA256 == nil || *m.SHA256 != wantHash {
+			t.Fatalf("%s manifest hash = %v want %q", id, m.SHA256, wantHash)
+		}
+	}
+	// A re-poll is a pure noop: stat-equal everywhere (no spurious change).
+	writesBefore := len(h.fake("peer").Writes())
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("re-poll: %v", err)
+	}
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("re-poll wrote: %d -> %d (want noop)", writesBefore, got)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("re-poll must not conflict")
 	}
 }
 
@@ -388,6 +618,63 @@ func TestPoll_MultiPeer_TwoChanged_Conflict_InnocentUntouched(t *testing.T) {
 	// And the two changed members keep their divergent files (no overwrite).
 	h.assertFile("primary", []byte("PRIMARY"), t0.Add(time.Hour))
 	h.assertFile("peer-a", []byte("PEER-A"), t0.Add(2*time.Hour))
+}
+
+// TestPoll_HashFails_AbortsNoMutation pins the fail-SAFE property the auditor
+// flagged unpinned: a Reach.Hash error mid-poll (tier-2 content compare) aborts
+// the WHOLE pass before any write, manifest advance, or conflict flag. A hash
+// error is NOT defaulted to "unchanged", NOT propagated, and does NOT become a
+// false conflict — the engine returns the error and mutates nothing.
+func TestPoll_HashFails_AbortsNoMutation(t *testing.T) {
+	h, srcMtime := seedSynced(t) // primary + peer both at V1, in sync
+	// Move the primary's stat so the engine reaches the tier-2 hash step for it
+	// (stat differs from the manifest -> it must hash to decide change vs touch).
+	newMtime := t0.Add(time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("V2-CHANGED"), newMtime)
+	// Inject a Hash failure for the primary: the content compare can't run.
+	hashErr := errors.New("hash io error")
+	h.fake("primary").FailHash("", hashErr)
+
+	peerWritesBefore := len(h.fake("peer").Writes())
+	primWritesBefore := len(h.fake("primary").Writes())
+
+	// Poll must surface the hash error.
+	if err := h.engine.Poll(ctx(), syncID); !errors.Is(err, hashErr) {
+		t.Fatalf("Poll should return the hash error, got %v", err)
+	}
+
+	// Fail-safe: NOTHING was written to any member.
+	if got := len(h.fake("peer").Writes()); got != peerWritesBefore {
+		t.Fatalf("peer was written despite a hash failure: %d -> %d", peerWritesBefore, got)
+	}
+	if got := len(h.fake("primary").Writes()); got != primWritesBefore {
+		t.Fatalf("primary was written despite a hash failure: %d -> %d", primWritesBefore, got)
+	}
+	// The peer's file is untouched (no propagation).
+	h.assertFile("peer", []byte("V1"), srcMtime)
+
+	// No manifest advanced: both stay at the pre-poll V1 state (no SHA256 carried).
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.Mtime == nil || !m.Mtime.Equal(srcMtime) {
+			t.Fatalf("%s manifest advanced past a hash failure: mtime=%v want %v", id, m.Mtime, srcMtime)
+		}
+		if m.SHA256 != nil {
+			t.Fatalf("%s manifest recorded a hash despite the hash failure: %q", id, *m.SHA256)
+		}
+	}
+
+	// No false conflict: conflict_at stays nil and no conflict was logged.
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("a hash failure must NOT flag a conflict")
+	}
+	if n := h.logCount(store.OutcomeConflict); n != 0 {
+		t.Fatalf("a hash failure logged %d conflict rows, want 0", n)
+	}
+	// last_synced did not advance.
+	if h.sync().LastSynced != nil {
+		t.Fatalf("a hash failure must NOT advance last_synced")
+	}
 }
 
 // --- crash-safety: manifest trails the write ----------------------------
@@ -529,6 +816,30 @@ func TestResolveConflict_WinnerWins_BacksUpLoserAndFansOut(t *testing.T) {
 	}
 	if fanouts < 1 {
 		t.Fatalf("expected at least one fan-out ok row, got %d", fanouts)
+	}
+}
+
+// TestResolveConflict_RecordsWinnerHash asserts the resolve path records the
+// winner's content hash on the winner and every fanned-out member, so a poll
+// after resolution is a clean (stat- and hash-stable) noop.
+func TestResolveConflict_RecordsWinnerHash(t *testing.T) {
+	h, _, _ := seedConflicted(t)
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wantHash := h.hashOf("primary")
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.SHA256 == nil || *m.SHA256 != wantHash {
+			t.Fatalf("%s manifest hash = %v want %q (winner's)", id, m.SHA256, wantHash)
+		}
+	}
+	// A poll after resolution is a noop (no spurious change).
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("post-resolve poll: %v", err)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("post-resolve poll must not re-conflict")
 	}
 }
 

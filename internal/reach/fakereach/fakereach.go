@@ -10,6 +10,8 @@ package fakereach
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"sort"
@@ -44,10 +46,11 @@ type Fake struct {
 	// (empty key "" matches any path). Used to simulate a write failure and
 	// assert that the manifest is not advanced (crash-safety intent).
 	failWrite map[string]error
-	// failStat / failRead behave likewise for Stat / Read; they let tests inject
-	// transient I/O errors distinct from ErrNotExist.
+	// failStat / failRead / failHash behave likewise for Stat / Read / Hash; they
+	// let tests inject transient I/O errors distinct from ErrNotExist.
 	failStat map[string]error
 	failRead map[string]error
+	failHash map[string]error
 }
 
 // New returns an empty Fake.
@@ -57,6 +60,7 @@ func New() *Fake {
 		failWrite: make(map[string]error),
 		failStat:  make(map[string]error),
 		failRead:  make(map[string]error),
+		failHash:  make(map[string]error),
 	}
 }
 
@@ -117,6 +121,17 @@ func (f *Fake) FailRead(path string, err error) {
 		return
 	}
 	f.failRead[path] = err
+}
+
+// FailHash makes Hash return err for path ("" matches any). Pass nil to clear.
+func (f *Fake) FailHash(path string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err == nil {
+		delete(f.failHash, path)
+		return
+	}
+	f.failHash[path] = err
 }
 
 // Writes returns a copy of the recorded WriteAtomic calls, in order.
@@ -180,6 +195,23 @@ func (f *Fake) Read(_ context.Context, path string) ([]byte, error) {
 	cp := make([]byte, len(file.Data))
 	copy(cp, file.Data)
 	return cp, nil
+}
+
+// Hash implements reach.Reach: the lowercase-hex sha256 over the stored bytes,
+// or reach.ErrNotExist when absent. It honors an injected failHash so tests can
+// simulate a transient hash I/O error distinct from ErrNotExist.
+func (f *Fake) Hash(_ context.Context, path string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.injected(f.failHash, path); err != nil {
+		return "", err
+	}
+	file, ok := f.files[path]
+	if !ok {
+		return "", fmt.Errorf("hash %q: %w", path, reach.ErrNotExist)
+	}
+	sum := sha256.Sum256(file.Data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // List implements reach.Reach over the flat in-memory file map. The map is keyed

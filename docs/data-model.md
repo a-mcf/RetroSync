@@ -155,12 +155,31 @@ Used for the UI history panel and conflict diagnostics. One row per directional 
 |--------------|------|----------------------------------------------------|
 | sync_id      | text |                                                    |
 | node_id      | text |                                                    |
-| mtime        | ts   |                                                    |
-| size         | int  |                                                    |
-| sha256       | text | computed lazily; size+mtime is the fast path       |
+| mtime        | ts   | fast-path gate (with size)                         |
+| size         | int  | fast-path gate (with mtime)                        |
+| sha256       | text | content truth; recorded on every manifest write    |
 | last_checked | ts   |                                                    |
 
-PK: (sync_id, node_id). The poll loop updates this; conflict detection compares each member's last-known mtime/size with its current stat — the **changed set** drives the mirror (0 = noop, 1 = propagate, 2+ = conflict).
+PK: (sync_id, node_id). The poll loop updates this on every write, recording the
+member's content `sha256` alongside mtime/size.
+
+**Hash-backed change detection.** Detection is two-tier:
+
+1. **mtime+size fast gate.** `Stat` vs the manifest. Equal → unchanged, *no hash
+   computed* (a noop poll stays hash-free).
+2. **sha256 truth, only when the stat differs.** The member's current content hash
+   vs the manifest's stored `sha256`:
+   - **equal** → a *touch* (mtime moved, bytes identical): reconcile the manifest's
+     mtime/size, do **not** count it as changed.
+   - **differs** → a real content change.
+
+The **changed set** then drives the mirror by the **distinct content hashes** of
+the changed members: 0 changed = noop; exactly **one** distinct hash = agreed
+content → propagate to any member lacking it; **two or more** distinct hashes = a
+genuine fork → conflict. (mtime+size alone false-positives on a touch and flags a
+fork when two devices coincidentally reach the *same* bytes; the hash makes both
+calls accurate without weakening any data-loss guarantee — a distinct-hash changer
+is never silently overwritten.)
 
 ## Storage choice
 

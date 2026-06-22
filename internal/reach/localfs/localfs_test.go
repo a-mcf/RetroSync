@@ -2,6 +2,8 @@ package localfs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -133,6 +135,42 @@ func TestRead_NotExist(t *testing.T) {
 	_, err := l.Read(context.Background(), "nope.srm")
 	if !errors.Is(err, reach.ErrNotExist) {
 		t.Fatalf("Read missing = %v, want ErrNotExist", err)
+	}
+}
+
+func TestHash_HexSha256OfFileBytes(t *testing.T) {
+	l, _ := newRooted(t)
+	ctx := context.Background()
+	data := []byte("hello save bytes")
+	if err := l.WriteAtomic(ctx, "saves/game.srm", data, time.Unix(10, 0)); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	got, err := l.Hash(ctx, "saves/game.srm")
+	if err != nil {
+		t.Fatalf("Hash: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	want := hex.EncodeToString(sum[:])
+	if got != want {
+		t.Fatalf("Hash = %q, want %q", got, want)
+	}
+}
+
+func TestHash_NotExist(t *testing.T) {
+	l, _ := newRooted(t)
+	_, err := l.Hash(context.Background(), "nope.srm")
+	if !errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("Hash missing = %v, want ErrNotExist", err)
+	}
+}
+
+func TestHash_TraversalRejected(t *testing.T) {
+	l, _ := newRooted(t)
+	ctx := context.Background()
+	for _, bad := range []string{"../escape", "/etc/passwd", "a/../../b"} {
+		if _, err := l.Hash(ctx, bad); err == nil {
+			t.Fatalf("Hash(%q) = nil err, want rejection", bad)
+		}
 	}
 }
 

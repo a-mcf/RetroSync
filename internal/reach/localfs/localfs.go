@@ -18,7 +18,10 @@ package localfs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -79,6 +82,30 @@ func (l *LocalFS) Read(_ context.Context, path string) ([]byte, error) {
 		return nil, fmt.Errorf("localfs: read %q: %w", path, err)
 	}
 	return data, nil
+}
+
+// Hash implements reach.Reach. It resolves path through the same safepath
+// containment as Read/Stat, then STREAMS the file through sha256 (open +
+// io.Copy) so a large save is never loaded whole into memory, and returns the
+// lowercase-hex digest. A missing file maps to reach.ErrNotExist.
+func (l *LocalFS) Hash(_ context.Context, path string) (string, error) {
+	abs, err := safepath.Resolve(l.root, path)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("localfs: hash %q: %w", path, reach.ErrNotExist)
+		}
+		return "", fmt.Errorf("localfs: hash %q: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("localfs: hash %q: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // List implements reach.Reach. It resolves relPath through safepath (so a
