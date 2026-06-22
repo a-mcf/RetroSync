@@ -76,6 +76,18 @@ type Reach interface {
 	// Read returns the full file contents, or ErrNotExist when absent.
 	Read(ctx context.Context, path string) ([]byte, error)
 
+	// Hash returns the lowercase-hex SHA-256 of the file's bytes, or ErrNotExist
+	// when the path is absent on the node. It is the CONTENT-TRUTH used by
+	// change-detection: size+mtime (Stat) is the cheap fast-path gate, and Hash is
+	// the authoritative comparison consulted only when the stat differs — so a
+	// "touch" (mtime moved, bytes identical) is recognized as not-a-change, and two
+	// devices that changed to the SAME content are recognized as not-a-fork.
+	//
+	// Adapters MUST stream the file through the hash (open + io.Copy), never load
+	// the whole file into memory, and apply the SAME containment check as Read/Stat
+	// (an escaping/absolute path is rejected before any I/O).
+	Hash(ctx context.Context, path string) (string, error)
+
 	// List returns the directory entries directly under relPath, which is a
 	// node-relative path (same semantics as every other method: relative to the
 	// node's save root, resolved by the ADAPTER, never the engine). An empty

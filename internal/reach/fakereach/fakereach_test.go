@@ -2,6 +2,8 @@ package fakereach_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -59,6 +61,37 @@ func TestWriteAtomicStoresMtimeFaithfully(t *testing.T) {
 	writes := f.Writes()
 	if len(writes) != 1 || writes[0].Path != "b.srm" {
 		t.Fatalf("writes = %+v", writes)
+	}
+}
+
+func TestHash_HexSha256OfStoredBytes(t *testing.T) {
+	f := fakereach.New().Put("a.srm", []byte("hello save"), time.Now())
+	got, err := f.Hash(ctx(), "a.srm")
+	if err != nil {
+		t.Fatalf("Hash: %v", err)
+	}
+	// sha256("hello save") computed independently.
+	sum := sha256.Sum256([]byte("hello save"))
+	want := hex.EncodeToString(sum[:])
+	if got != want {
+		t.Fatalf("Hash = %q, want %q", got, want)
+	}
+}
+
+func TestHash_NotExist(t *testing.T) {
+	f := fakereach.New()
+	_, err := f.Hash(ctx(), "missing")
+	if !errors.Is(err, reach.ErrNotExist) {
+		t.Fatalf("Hash missing = %v, want ErrNotExist", err)
+	}
+}
+
+func TestHash_InjectedError(t *testing.T) {
+	boom := errors.New("io error")
+	f := fakereach.New().Put("a.srm", []byte("x"), time.Now())
+	f.FailHash("a.srm", boom)
+	if _, err := f.Hash(ctx(), "a.srm"); !errors.Is(err, boom) {
+		t.Fatalf("Hash with injected failure = %v, want boom", err)
 	}
 }
 

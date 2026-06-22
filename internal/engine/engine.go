@@ -1,11 +1,13 @@
 // Package engine is the heart of RetroSync's play-sync: it AUTO-MIRRORS every
-// sync. Each Poll stats a sync's members, finds which member changed vs the
-// manifest, and — when exactly one changed — fans that member's save out to the
-// others. Zero changed is a noop; two or more changed is a genuine fork, which
-// it flags as a conflict and pauses (mirroring stays paused until a human
-// resolves it). There is no primary, no binding, no activate/deactivate/
-// take-over: the only human action is resolving a conflict. It implements
-// docs/state-machine.md.
+// sync. Each Poll runs HASH-BACKED change detection on a sync's members (a cheap
+// mtime+size stat gate, then a sha256 content compare only when the stat moved)
+// and decides by the distinct content hashes of the changed members: zero
+// changed is a noop; a single distinct hash (one changer, OR several that reached
+// the same bytes) is the agreed-latest content, fanned out to every member that
+// lacks it; two or more distinct hashes is a genuine fork, flagged as a conflict
+// and paused (mirroring stays paused until a human resolves it). There is no
+// primary, no binding, no activate/deactivate/take-over: the only human action is
+// resolving a conflict. It implements docs/state-machine.md.
 //
 // A *sync* is the unit of mirroring: a specific set of (node, save-file)
 // members that sync together (one game may have many independent syncs). The
@@ -99,20 +101,42 @@ type scopedNode struct {
 	r    reach.Reach
 }
 
+// changedMember is a member that genuinely changed content this pass (per the
+// two-tier detection in Poll): its current content hash is carried so the
+// decision can group changers by distinct hash (a true fork is 2+ distinct
+// hashes; one distinct hash — however many members share it — is an agreed
+// content to propagate).
+type changedMember struct {
+	sn   scopedNode
+	hash string // current content hash (empty only when the member vanished)
+}
+
 // Poll runs ONE auto-mirror pass for syncID. It loads the sync; if the sync is
 // already in conflict (conflict_at != nil) it does nothing (paused, awaiting
-// human resolution). Otherwise it stats every member, computes the CHANGED SET
-// (each member's current stat vs its manifest, via changed()), and applies:
+// human resolution). Otherwise it runs HASH-BACKED two-tier change detection on
+// every member and decides by the CONTENT HASHES of the changed members:
 //
-//	members changed | action
-//	0               | noop
-//	1               | fan-out that member -> the others; update manifest; mark synced
-//	2+              | conflict (set conflict_at, log, stop — paused until resolved)
+//	distinct hashes among changed members | action
+//	0 members changed                     | noop
+//	exactly ONE distinct hash             | that is the agreed-latest content -> fan it out to every member lacking it; mark synced
+//	TWO OR MORE distinct hashes           | a genuine fork -> set conflict_at, log, stop (paused until resolved)
 //
-// There is no primary: any single changed member is the source. The manifest
-// and last_synced advance only after a successful write (crash-safety: the
-// manifest trails the actual write). A sync with fewer than two members can
-// never fork, so it simply propagates (1 changed) or no-ops (0 changed).
+// Two-tier detection per member (keeps a noop poll hash-free):
+//  1. Stat (mtime+size). If it equals the manifest -> UNCHANGED; do NOT hash.
+//  2. Only when the stat differs: compute the current Hash and compare to the
+//     manifest's stored sha256.
+//     - hash EQUAL -> a "touch" (mtime moved, bytes identical): reconcile the
+//     manifest mtime/size to current so the next poll fast-paths it, and do NOT
+//     count it as changed.
+//     - hash DIFFERS -> a real content change.
+//
+// There is no primary: when a single distinct hash exists among the changers,
+// any one of them is the source (they are byte-identical). Crucially, every
+// OTHER member is then unchanged-since-manifest, so the fan-out only overwrites
+// members that did NOT change — a member that changed to DIFFERENT content is by
+// construction a second distinct hash, which is the conflict case where NOTHING
+// is written. The manifest and last_synced advance only after a successful write
+// (crash-safety: the manifest trails the actual write).
 func (e *Engine) Poll(ctx context.Context, syncID string) error {
 	sy, err := e.store.GetSync(ctx, syncID)
 	if err != nil {
@@ -132,12 +156,15 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 		return err
 	}
 
-	// Stat every member and collect those that changed vs the manifest. Each
-	// member is stat'd once; a non-ErrNotExist Stat error aborts the pass (the
-	// next poll re-stats and resumes).
+	now := e.clock()
+
+	// Two-tier detection: stat every member (cheap), and only hash the ones whose
+	// stat differs from the manifest. A "touch" (stat moved, bytes identical)
+	// reconciles the manifest and is NOT a change. A vanished member (was in the
+	// manifest, now absent) is a change with an empty hash.
 	metas := make(map[string]reach.FileMeta, len(scoped))
 	present := make(map[string]bool, len(scoped))
-	var changedSet []scopedNode
+	var changedSet []changedMember
 	for _, sn := range scoped {
 		meta, ok, err := e.statOpt(ctx, sn)
 		if err != nil {
@@ -145,44 +172,105 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 		}
 		metas[sn.node.ID] = meta
 		present[sn.node.ID] = ok
-		if changed(manifest[sn.node.ID], meta, ok) {
-			changedSet = append(changedSet, sn)
+
+		me := manifest[sn.node.ID]
+		// Tier 1: fast stat gate. Equal stat => unchanged, no hash.
+		if !statDiffers(me, meta, ok) {
+			continue
+		}
+		// A member that vanished (manifest had a file, now absent) is a change with
+		// no current content. Surface it (handled below as the vanished case).
+		if !ok {
+			changedSet = append(changedSet, changedMember{sn: sn})
+			continue
+		}
+		// Tier 2: hash truth. Compute the current content hash and compare to the
+		// manifest's stored sha256.
+		curHash, err := sn.r.Hash(ctx, sn.path)
+		if err != nil {
+			return fmt.Errorf("engine: hash %s: %w", sn.node.ID, err)
+		}
+		if me.SHA256 != nil && *me.SHA256 == curHash {
+			// A touch: mtime/size moved but the bytes are identical. Reconcile the
+			// manifest's mtime/size to current (keeping the SAME hash) so the next
+			// poll fast-paths it. NOT counted as changed; nothing propagates.
+			if err := e.setManifest(ctx, syncID, sn.node.ID, meta, curHash, now); err != nil {
+				return err
+			}
+			continue
+		}
+		// A real content change.
+		changedSet = append(changedSet, changedMember{sn: sn, hash: curHash})
+	}
+
+	if len(changedSet) == 0 {
+		// Nothing genuinely changed (covers an all-noop poll and a touch-only poll):
+		// noop.
+		return nil
+	}
+
+	// A vanished changed member (manifest had a file, now absent) is treated as a
+	// conflict rather than propagating the deletion to the others. Surfacing beats
+	// destruction. Check this BEFORE the distinct-hash decision so a lone deletion
+	// pauses the sync instead of (with no current content) being mistaken for an
+	// agreed propagation.
+	for _, cm := range changedSet {
+		if !present[cm.sn.node.ID] {
+			return e.flagConflict(ctx, syncID, now,
+				fmt.Sprintf("member %s vanished (manifest had a file); sync paused", cm.sn.node.ID))
 		}
 	}
 
-	now := e.clock()
+	// Group the changed members by their current content hash. A genuine fork is
+	// 2+ DISTINCT hashes; a single distinct hash (however many members share it) is
+	// an agreed content to propagate. (Sized to changedSet; it only ever holds 1
+	// before the >=2 branch below short-circuits, so the capacity is a loose upper
+	// bound, not a tight one.)
+	distinct := make(map[string]struct{}, len(changedSet))
+	for _, cm := range changedSet {
+		distinct[cm.hash] = struct{}{}
+	}
 
-	switch len(changedSet) {
-	case 0:
-		// Nothing changed: noop.
-		return nil
-	case 1:
-		// Exactly one member changed — it is the source. If it is now ABSENT but
-		// the manifest had it (a deletion), treat as a conflict rather than
-		// propagating the delete to the others: surfacing beats destruction.
-		src := changedSet[0]
-		if !present[src.node.ID] {
-			return e.flagConflict(ctx, syncID, now,
-				fmt.Sprintf("member %s vanished (manifest had a file); sync paused", src.node.ID))
-		}
-		if err := e.fanOut(ctx, syncID, src, scoped, metas[src.node.ID], now); err != nil {
-			return err
-		}
-		// Record the source's own manifest state (it is the authority this pass).
-		if err := e.setManifest(ctx, syncID, src.node.ID, metas[src.node.ID], now); err != nil {
-			return err
-		}
-		return e.markSynced(ctx, syncID, now)
-	default:
-		// Two or more members changed — a genuine fork. Flag and pause.
+	if len(distinct) >= 2 {
+		// A genuine fork: the changed members hold DIFFERENT content. Flag and pause.
+		// Nothing is written — every distinct-hash changer keeps its file.
 		ids := make([]string, 0, len(changedSet))
-		for _, sn := range changedSet {
-			ids = append(ids, sn.node.ID)
+		for _, cm := range changedSet {
+			ids = append(ids, cm.sn.node.ID)
 		}
 		return e.flagConflict(ctx, syncID, now,
-			fmt.Sprintf("%d members changed (%s); retrosync won't choose — sync paused",
-				len(changedSet), strings.Join(ids, ", ")))
+			fmt.Sprintf("%d members changed to %d distinct contents (%s); retrosync won't choose — sync paused",
+				len(changedSet), len(distinct), strings.Join(ids, ", ")))
 	}
+
+	// Exactly one distinct hash among the changers: the agreed-latest content. Pick
+	// any changer as the source (they are byte-identical) and fan it out to every
+	// member that does not already hold it. Every NON-changer is unchanged since the
+	// manifest, so overwriting it is safe propagation; there is no distinct-hash
+	// changer to clobber (that would be the conflict case above).
+	//
+	// Safe to index [0]: the len(changedSet)==0 case returned earlier, so changedSet
+	// is non-empty by construction here.
+	src := changedSet[0]
+	srcHash := src.hash
+	// Every changer holds the agreed content already (one distinct hash), so they
+	// must NOT be re-written — fan out only to members that don't already have it.
+	// This also makes the multi-changer-same-content case write nothing spurious.
+	alreadyHave := make(map[string]bool, len(changedSet))
+	for _, cm := range changedSet {
+		alreadyHave[cm.sn.node.ID] = true
+	}
+	if err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], srcHash, alreadyHave, now); err != nil {
+		return err
+	}
+	// Record each changer's own manifest state (each already holds the agreed
+	// content), carrying the agreed hash. The source is included here.
+	for _, cm := range changedSet {
+		if err := e.setManifest(ctx, syncID, cm.sn.node.ID, metas[cm.sn.node.ID], srcHash, now); err != nil {
+			return err
+		}
+	}
+	return e.markSynced(ctx, syncID, now)
 }
 
 // NodeState is a single in-scope node's CURRENT live file state, as read by a
@@ -402,6 +490,12 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	if !winnerPresent {
 		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrSourceMissing)
 	}
+	// The winner's content hash is the authority recorded in the manifest for the
+	// winner and every node it is fanned out to.
+	winnerHash, err := winner.r.Hash(ctx, winner.path)
+	if err != nil {
+		return fmt.Errorf("engine: hash winner %s: %w", winner.node.ID, err)
+	}
 
 	now := e.clock()
 
@@ -414,14 +508,16 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	}
 
 	// Step 2: fan out the winner to every other in-scope node, advancing the
-	// manifest only after each successful write. A partial fan-out returns the
-	// error and (because we have NOT cleared conflict_at) leaves the sync
-	// conflicted for re-resolution.
-	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, now); err != nil {
+	// manifest (carrying the winner's hash) only after each successful write. A
+	// partial fan-out returns the error and (because we have NOT cleared
+	// conflict_at) leaves the sync conflicted for re-resolution. No skip set here:
+	// a resolve deliberately overwrites every loser with the chosen winner.
+	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, winnerHash, nil, now); err != nil {
 		return err
 	}
-	// Record the winner's own manifest state (it is the authority for this pass).
-	if err := e.setManifest(ctx, syncID, winner.node.ID, winnerMeta, now); err != nil {
+	// Record the winner's own manifest state (it is the authority for this pass),
+	// carrying its content hash.
+	if err := e.setManifest(ctx, syncID, winner.node.ID, winnerMeta, winnerHash, now); err != nil {
 		return err
 	}
 
@@ -503,16 +599,27 @@ func backupSuffix(t time.Time) string {
 }
 
 // fanOut reads the source file once and WriteAtomic's it to every other
-// in-scope node, advancing each written node's manifest and appending a
+// in-scope node (except those in skip, which already hold the agreed content),
+// advancing each written node's manifest — carrying srcHash — and appending a
 // sync_log "ok" row per copy. The destination mtime is the source's mtime so
 // the next poll sees source == peer.
-func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, now time.Time) error {
+//
+// skip names members that must NOT be overwritten because they already hold the
+// agreed content (the byte-identical co-changers in the one-distinct-hash case).
+// It is the guard that keeps the propagate path from re-writing a member that
+// changed to the SAME content — and, by construction of the caller, there is
+// never a member in scope that changed to DIFFERENT content (that is the
+// conflict case, where fanOut is not called at all).
+func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, srcHash string, skip map[string]bool, now time.Time) error {
 	data, err := src.r.Read(ctx, src.path)
 	if err != nil {
 		return fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
 	}
 	for _, dst := range scoped {
 		if dst.node.ID == src.node.ID {
+			continue
+		}
+		if skip[dst.node.ID] {
 			continue
 		}
 		// dst mtime *before* overwrite, for the log (nil if dst absent or
@@ -540,9 +647,10 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		}
 
 		// Advance the written node's manifest to the post-write state (mtime ==
-		// source mtime, size == source size).
+		// source mtime, size == source size, sha256 == source hash). The destination
+		// now holds the source's exact bytes, so it inherits the source's hash.
 		written := reach.FileMeta{Mtime: srcMeta.Mtime, Size: srcMeta.Size}
-		if err := e.setManifest(ctx, syncID, dst.node.ID, written, now); err != nil {
+		if err := e.setManifest(ctx, syncID, dst.node.ID, written, srcHash, now); err != nil {
 			return err
 		}
 		bytes := srcMeta.Size
@@ -637,11 +745,16 @@ func (e *Engine) manifestMap(ctx context.Context, syncID string) (map[string]sto
 	return m, nil
 }
 
-func (e *Engine) setManifest(ctx context.Context, syncID, nodeID string, meta reach.FileMeta, now time.Time) error {
+// setManifest records a member's last-known file state: mtime, size, AND the
+// content sha256. The hash is the content-truth consulted by the next poll's
+// tier-2 compare (a touch reconciles mtime/size while keeping the same hash; a
+// real change records the new hash). sha256 must be the lowercase-hex digest of
+// the member's CURRENT content; pass "" only where a hash is genuinely unknown.
+func (e *Engine) setManifest(ctx context.Context, syncID, nodeID string, meta reach.FileMeta, sha256 string, now time.Time) error {
 	size := meta.Size
 	// Truncate to the comparison resolution before storing so the manifest value
-	// matches what a later changed() compare will use, regardless of where it is
-	// persisted. This is belt-and-suspenders: changed() truncates both sides too,
+	// matches what a later statDiffers compare will use, regardless of where it is
+	// persisted. This is belt-and-suspenders: statDiffers truncates both sides too,
 	// so correctness does not depend on it — but storing the truncated value keeps
 	// stored and compared mtimes at the same precision (and matches what Postgres
 	// timestamptz would store anyway).
@@ -652,6 +765,10 @@ func (e *Engine) setManifest(ctx context.Context, syncID, nodeID string, meta re
 		Mtime:       &mtime,
 		Size:        &size,
 		LastChecked: &now,
+	}
+	if sha256 != "" {
+		h := sha256
+		m.SHA256 = &h
 	}
 	if err := e.store.SetManifest(ctx, m); err != nil {
 		return fmt.Errorf("engine: set manifest %s: %w", nodeID, err)
@@ -688,21 +805,25 @@ func mtimeEqual(a, b time.Time) bool {
 	return a.UTC().Truncate(mtimeResolution).Equal(b.UTC().Truncate(mtimeResolution))
 }
 
-// changed reports whether the current stat (cur, present) differs from the
-// manifest entry me. Rules:
-//   - present on disk but no manifest row, or manifest has no mtime/size => changed
+// statDiffers reports whether the current stat (cur, present) differs from the
+// manifest entry me. It is the TIER-1 fast gate of the hash-backed detection:
+// when it returns false the member is unchanged and the (expensive) content hash
+// is never computed, keeping a noop poll hash-free. When it returns true, the
+// caller computes the content Hash and consults it (tier 2) to tell a real
+// content change from a mere touch (mtime moved, bytes identical). Rules:
+//   - present on disk but no manifest row, or manifest has no mtime/size => differs
 //     (a newly-appeared file).
-//   - absent on disk but the manifest recorded it as present => changed (deleted).
-//   - both absent => not changed.
-//   - present on both => changed iff mtime (at microsecond resolution) or size
+//   - absent on disk but the manifest recorded it as present => differs (deleted).
+//   - both absent => same.
+//   - present on both => differs iff mtime (at microsecond resolution) or size
 //     differs.
 //
 // The mtime comparison uses mtimeEqual rather than time.Equal: a file's stat
 // mtime carries nanosecond precision the manifest's Postgres-backed timestamptz
-// cannot store, so exact equality would spuriously flag an unchanged file as
-// changed after every manifest round-trip. Size stays an exact integer compare
+// cannot store, so exact equality would spuriously gate an unchanged file as
+// differing after every manifest round-trip. Size stays an exact integer compare
 // (no precision issue).
-func changed(me store.ManifestEntry, cur reach.FileMeta, present bool) bool {
+func statDiffers(me store.ManifestEntry, cur reach.FileMeta, present bool) bool {
 	hadFile := me.Mtime != nil && me.Size != nil
 	if !present {
 		return hadFile // disappeared

@@ -21,6 +21,8 @@ package engine_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -172,6 +174,40 @@ func TestEngine_PollNoopAfterFanOut_PostgresLocalFS(t *testing.T) {
 		t.Fatalf("Poll #3: %v", err)
 	}
 	assertNoConflictNoFanout(t, st, "after Poll #3", okBefore)
+
+	// Hash-stability: the fan-out recorded a content sha256 on both members
+	// (through Postgres), and it is the real sha256 of the bytes.
+	wantSum := sha256.Sum256(saveData)
+	wantHash := hex.EncodeToString(wantSum[:])
+	for _, id := range []string{"primary", "peer"} {
+		m, err := st.GetManifest(ctx, syncID, id)
+		if err != nil {
+			t.Fatalf("get manifest %s: %v", id, err)
+		}
+		if m.SHA256 == nil || *m.SHA256 != wantHash {
+			t.Fatalf("%s manifest sha256 = %v, want %q", id, m.SHA256, wantHash)
+		}
+	}
+
+	// TOUCH-stability: move the primary's mtime WITHOUT changing its bytes. The
+	// stat gate trips (mtime moved) but tier 2 sees the SAME hash -> it is a touch,
+	// not a change: no fan-out, no conflict, and the manifest mtime reconciles so
+	// the FOLLOWING poll fast-paths it. This is the false-positive bare mtime+size
+	// produced; the hash kills it.
+	touchMtime := saveMtime.Add(time.Hour)
+	if err := os.Chtimes(primaryAbs, touchMtime, touchMtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Poll(ctx, syncID); err != nil {
+		t.Fatalf("Poll after touch: %v", err)
+	}
+	// A touch must not fan out or conflict (ok-row count unchanged from okBefore).
+	assertNoConflictNoFanout(t, st, "after touch poll", okBefore)
+	// And the next poll is a clean noop too (manifest mtime was reconciled).
+	if err := eng.Poll(ctx, syncID); err != nil {
+		t.Fatalf("Poll after touch reconcile: %v", err)
+	}
+	assertNoConflictNoFanout(t, st, "after touch reconcile poll", okBefore)
 }
 
 func assertNoConflictNoFanout(t *testing.T, st store.Store, when string, okBefore int) {
