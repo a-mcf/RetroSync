@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/a-mcf/retrosync/internal/engine"
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
@@ -14,16 +15,17 @@ import (
 
 // activateModalData drives the "use my save" activation modal fragment.
 type activateModalData struct {
-	GameID      string
+	SyncID      string
+	SyncName    string
 	GameDisplay string
 	System      string
 	// PrimaryNode is the node the user is binding FROM (the node they clicked
 	// "Play on"). It becomes active_bindings.primary_node.
 	PrimaryNode string
-	// Sources is every node that has a game_paths row for this game, with its
-	// last-known mtime — surfaced BEFORE binding so the user sees what each
-	// "start from" choice would overwrite (docs/state-machine.md "surface, don't
-	// hide"). Default-selected is PrimaryNode ("use my save").
+	// Sources is every member of this sync, with its last-known mtime — surfaced
+	// BEFORE binding so the user sees what each "start from" choice would
+	// overwrite (docs/state-machine.md "surface, don't hide"). Default-selected is
+	// PrimaryNode ("use my save").
 	Sources []modalSource
 	CSRF    string
 }
@@ -40,21 +42,21 @@ type modalSource struct {
 	IsPrimary bool
 }
 
-// handleActivateModal serves GET /games/{id}/activate?node=<nodeID> as an HTML
-// modal fragment. It lists every node that has a path for this game with that
-// node's last-known mtime (from the manifest), defaulting the radio to the
-// binding node (the `node` query param — "use my save").
+// handleActivateModal serves GET /syncs/{id}/activate?node=<nodeID> as an HTML
+// modal fragment. It lists every member of this sync with that node's last-known
+// mtime (from the manifest), defaulting the radio to the binding node (the
+// `node` query param — "use my save").
 //
 // This is a read-only GET (no CSRF needed); the POST it submits to is
 // CSRF-protected and re-checks node ownership.
 func (s *Server) handleActivateModal(w http.ResponseWriter, r *http.Request) {
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 	bindingNode := r.URL.Query().Get("node")
 
-	data, err := s.buildActivateModal(r.Context(), gameID, bindingNode)
+	data, err := s.buildActivateModal(r.Context(), syncID, bindingNode)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "no such game", http.StatusNotFound)
+			http.Error(w, "no such sync", http.StatusNotFound)
 			return
 		}
 		s.logger.ErrorContext(r.Context(), "activate modal build failed", "err", err.Error())
@@ -69,35 +71,40 @@ func (s *Server) handleActivateModal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// buildActivateModal assembles the modal view-model. It surfaces EVERY node's
+// buildActivateModal assembles the modal view-model. It surfaces EVERY member's
 // last-known mtime (per the slice-3 audit contract), defaulting selection to
 // bindingNode. When only one node has a save, that node is pre-selected instead
 // (still showing all mtimes), per docs/ui.md.
-func (s *Server) buildActivateModal(ctx context.Context, gameID, bindingNode string) (activateModalData, error) {
-	g, err := s.store.GetGame(ctx, gameID)
+func (s *Server) buildActivateModal(ctx context.Context, syncID, bindingNode string) (activateModalData, error) {
+	sy, err := s.store.GetSync(ctx, syncID)
+	if err != nil {
+		return activateModalData{}, err
+	}
+	g, err := s.store.GetGame(ctx, sy.GameID)
 	if err != nil {
 		return activateModalData{}, err
 	}
 
-	paths, err := s.store.ListGamePathsByGame(ctx, gameID)
+	members, err := s.store.ListSyncMembers(ctx, syncID)
 	if err != nil {
 		return activateModalData{}, err
 	}
 
 	data := activateModalData{
-		GameID:      g.ID,
+		SyncID:      sy.ID,
+		SyncName:    sy.Name,
 		GameDisplay: g.Display,
 		System:      g.System,
 		PrimaryNode: bindingNode,
 	}
 
 	savesCount := 0
-	for _, p := range paths {
+	for _, m := range members {
 		mtime := "no save yet"
 		hasSave := false
-		if m, err := s.store.GetManifest(ctx, gameID, p.NodeID); err == nil {
-			if m.Mtime != nil {
-				mtime = fmtMtime(m.Mtime)
+		if me, err := s.store.GetManifest(ctx, syncID, m.NodeID); err == nil {
+			if me.Mtime != nil {
+				mtime = fmtMtime(me.Mtime)
 				hasSave = true
 			}
 		} else if !errors.Is(err, store.ErrNotFound) {
@@ -106,16 +113,16 @@ func (s *Server) buildActivateModal(ctx context.Context, gameID, bindingNode str
 		if hasSave {
 			savesCount++
 		}
-		dir := "from-peer-" + p.NodeID
-		if p.NodeID == bindingNode {
+		dir := "from-peer-" + m.NodeID
+		if m.NodeID == bindingNode {
 			dir = "from-primary"
 		}
 		data.Sources = append(data.Sources, modalSource{
-			NodeID:    p.NodeID,
+			NodeID:    m.NodeID,
 			Direction: dir,
 			Mtime:     mtime,
 			HasSave:   hasSave,
-			IsPrimary: p.NodeID == bindingNode,
+			IsPrimary: m.NodeID == bindingNode,
 		})
 	}
 	sort.Slice(data.Sources, func(i, j int) bool { return data.Sources[i].NodeID < data.Sources[j].NodeID })
@@ -156,14 +163,13 @@ func selectDefault(sources []modalSource, bindingNode string, savesCount int) {
 	}
 }
 
-// --- POST /api/games/{id}/activate ---------------------------------------
+// --- POST /api/syncs/{id}/activate ---------------------------------------
 
-// handleActivate handles POST /api/games/{id}/activate. Form fields:
+// handleActivate handles POST /api/syncs/{id}/activate. Form fields:
 //
 //	primary_node  the node to bind as primary (must be owned by the user, or
 //	              the user must be admin — docs/auth.md)
 //	direction     "from-primary" or "from-peer-<nodeID>"
-//	peer_scope    optional; defaults to "all-configured"
 //	force         optional; "true"/"1"/"on" => force-takeover
 //
 // On store.ErrConflict without force it returns 409 plus a "take over" fragment
@@ -184,13 +190,9 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 	primaryNode := strings.TrimSpace(r.PostFormValue("primary_node"))
 	direction := strings.TrimSpace(r.PostFormValue("direction"))
-	peerScope := strings.TrimSpace(r.PostFormValue("peer_scope"))
-	if peerScope == "" {
-		peerScope = "all-configured"
-	}
 	force := isTrue(r.PostFormValue("force"))
 
 	if primaryNode == "" {
@@ -202,7 +204,7 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		direction = "from-primary"
 	}
 
-	// Authorization (docs/auth.md): a user may only bind a game onto a node they
+	// Authorization (docs/auth.md): a user may only bind a sync onto a node they
 	// OWN; admin may bind any. Enforced BEFORE calling the Actioner so an
 	// unauthorized request never reaches the engine.
 	owns, err := s.userOwnsNode(r.Context(), u, primaryNode)
@@ -220,16 +222,22 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.actioner.Activate(r.Context(), gameID, primaryNode, direction, peerScope, force)
+	err = s.actioner.Activate(r.Context(), syncID, primaryNode, direction, force)
 	switch {
 	case err == nil:
 		s.refreshDashboard(w, r, u)
 	case errors.Is(err, store.ErrConflict):
 		// Already bound to a different primary and force was not set: 409 + a
 		// fragment offering "Take over from <other>" which re-POSTs force=true.
-		s.renderTakeover(w, r, gameID, primaryNode, direction, peerScope)
+		s.renderTakeover(w, r, syncID, primaryNode, direction)
+	case errors.Is(err, engine.ErrPrimaryNotMember):
+		// The caller owns primaryNode but it is NOT a member of this sync, so it
+		// has no claim to the sync's play authority. Ownership passed the check
+		// above; the engine's member gate is what rejects it. 422: the request is
+		// well-formed but names a primary that is not a valid member.
+		http.Error(w, "that node is not a member of this sync", http.StatusUnprocessableEntity)
 	default:
-		s.logger.ErrorContext(r.Context(), "activate failed", "game", gameID, "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "activate failed", "sync", syncID, "err", err.Error())
 		http.Error(w, "could not start session", http.StatusInternalServerError)
 	}
 }
@@ -237,23 +245,21 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 // renderTakeover writes a 409 with the take-over fragment. It looks up the
 // current primary (the "<other>" node) for the button label; if that lookup
 // fails it still renders with a generic label rather than erroring.
-func (s *Server) renderTakeover(w http.ResponseWriter, r *http.Request, gameID, primaryNode, direction, peerScope string) {
+func (s *Server) renderTakeover(w http.ResponseWriter, r *http.Request, syncID, primaryNode, direction string) {
 	other := ""
-	if b, err := s.store.GetBinding(r.Context(), gameID); err == nil {
+	if b, err := s.store.GetBinding(r.Context(), syncID); err == nil {
 		other = b.PrimaryNode
 	}
 	data := struct {
-		GameID      string
+		SyncID      string
 		PrimaryNode string
 		Direction   string
-		PeerScope   string
 		Other       string
 		CSRF        string
 	}{
-		GameID:      gameID,
+		SyncID:      syncID,
 		PrimaryNode: primaryNode,
 		Direction:   direction,
-		PeerScope:   peerScope,
 		Other:       other,
 		CSRF:        s.csrfFor(r),
 	}
@@ -268,17 +274,17 @@ func (s *Server) renderTakeover(w http.ResponseWriter, r *http.Request, gameID, 
 	}
 }
 
-// --- POST /api/games/{id}/deactivate -------------------------------------
+// --- POST /api/syncs/{id}/deactivate -------------------------------------
 
-// handleDeactivate handles POST /api/games/{id}/deactivate. Idempotent
-// (deactivating an idle game is a no-op). Refreshes the dashboard on success.
+// handleDeactivate handles POST /api/syncs/{id}/deactivate. Idempotent
+// (deactivating an idle sync is a no-op). Refreshes the dashboard on success.
 //
 // Authorization (docs/auth.md): a user "can see other users' active sessions
 // but not modify them." Deactivate MODIFIES a session, so it requires that the
 // user own the binding's primary node (or be admin). The check happens BEFORE
 // the Actioner is called, so an unauthorized request never reaches the engine.
-// If the game is already idle (no binding), there is nothing to protect:
-// deactivating an idle game is a harmless idempotent no-op (per api.md), so we
+// If the sync is already idle (no binding), there is nothing to protect:
+// deactivating an idle sync is a harmless idempotent no-op (per api.md), so we
 // allow it through rather than 403.
 func (s *Server) handleDeactivate(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
@@ -291,12 +297,12 @@ func (s *Server) handleDeactivate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	gameID := r.PathValue("id")
+	syncID := r.PathValue("id")
 
 	// Ownership: look up the current binding. If one exists, only the owner of
-	// its primary node (or an admin) may stop it. If the game is idle, fall
+	// its primary node (or an admin) may stop it. If the sync is idle, fall
 	// through to the idempotent no-op.
-	if b, err := s.store.GetBinding(r.Context(), gameID); err == nil {
+	if b, err := s.store.GetBinding(r.Context(), syncID); err == nil {
 		owns, err := s.userOwnsNode(r.Context(), u, b.PrimaryNode)
 		if err != nil {
 			s.logger.ErrorContext(r.Context(), "deactivate: ownership check failed", "err", err.Error())
@@ -313,8 +319,8 @@ func (s *Server) handleDeactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.actioner.Deactivate(r.Context(), gameID); err != nil {
-		s.logger.ErrorContext(r.Context(), "deactivate failed", "game", gameID, "err", err.Error())
+	if err := s.actioner.Deactivate(r.Context(), syncID); err != nil {
+		s.logger.ErrorContext(r.Context(), "deactivate failed", "sync", syncID, "err", err.Error())
 		http.Error(w, "could not stop session", http.StatusInternalServerError)
 		return
 	}

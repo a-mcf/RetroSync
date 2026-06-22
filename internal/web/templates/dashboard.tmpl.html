@@ -42,14 +42,14 @@
       {{else}}
         {{range .Active}}
         <div class="card">
-          <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
+          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
           <div class="sub">Bound on <strong>{{.PrimaryNode}}</strong> since {{.Since}}</div>
           {{if .Conflict}}
             <div class="conflict">
               <strong>Sync paused — more than one node changed.</strong>
               retrosync won't choose for you.
               <button class="btn conflict-btn"
-                      hx-get="/games/{{.GameID}}/conflict"
+                      hx-get="/syncs/{{.SyncID}}/conflict"
                       hx-target="#modal" hx-swap="innerHTML">
                 Resolve conflict
               </button>
@@ -61,10 +61,8 @@
           </ul>
           {{end}}
           <div class="sub">Last sync: {{.LastSync}}</div>
-          <!-- TODO(slice-actions): a "Sync now" action; this slice wires
-               "Done playing" and (when conflicted) "Resolve conflict". -->
           <p>
-            <form hx-post="/api/games/{{.GameID}}/deactivate"
+            <form hx-post="/api/syncs/{{.SyncID}}/deactivate"
                   hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
               <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
               <button class="btn" type="submit">Done playing</button>
@@ -75,44 +73,54 @@
       {{end}}
     </section>
 
-    <!-- MY GAMES ------------------------------------------------------- -->
+    <!-- MY SYNCS ------------------------------------------------------- -->
     <section>
-      <h2>My games</h2>
-      <!-- TODO(slice-actions): wire search box (non-functional this slice). -->
-      <input class="search" type="search" placeholder="Search my games…" disabled>
-      {{if not .MyGames}}
-        <p class="empty">No games map to your nodes yet.</p>
+      <h2>My syncs</h2>
+      <input class="search" type="search" placeholder="Search my syncs…" disabled>
+      {{if not .MySyncs}}
+        <p class="empty">No syncs map to your nodes yet.</p>
       {{else}}
-        {{range .MyGames}}
-        {{$game := .}}
+        {{range .MySyncs}}
+        {{$sync := .}}
         <div class="card">
-          <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
+          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
+          {{if .Conflict}}
+            <div class="conflict">
+              <strong>Sync paused — more than one node changed.</strong>
+              retrosync won't choose for you.
+              <button class="btn conflict-btn"
+                      hx-get="/syncs/{{.SyncID}}/conflict"
+                      hx-target="#modal" hx-swap="innerHTML">
+                Resolve conflict
+              </button>
+            </div>
+          {{end}}
           <ul class="node-lines">
             {{range .Nodes}}<li>{{.NodeID}}: {{.Mtime}}</li>{{end}}
           </ul>
-          <!-- One action per OWNED node (largest tap target). A direct activate
-               POST is allowed ONLY for the non-takeover, single-source case (one
-               node has the save and the game is idle). EVERYTHING else — multiple
-               configured sources OR a takeover of a session bound elsewhere —
-               opens the "use my save" activation modal (hx-get), which lists
-               every node's mtime BEFORE binding. A takeover must NEVER be a
-               one-click force POST: the user has to see what each save holds
-               first (docs/state-machine.md "surface, don't hide"). The modal's
-               activate POST 409s when already-bound and returns the takeover
-               fragment that carries force=true, so force still happens — but only
-               after the mtimes were surfaced. -->
+          <!-- One action per OWNED member node (largest tap target). A direct
+               activate POST is allowed ONLY for the non-takeover, single-source
+               case (one member, sync idle). EVERYTHING else — a multi-member sync
+               OR a takeover of a session bound elsewhere — opens the "use my save"
+               activation modal (hx-get), which lists every member's mtime BEFORE
+               binding. A takeover must NEVER be a one-click force POST: the user
+               has to see what each save holds first (docs/state-machine.md
+               "surface, don't hide"). The modal's activate POST 409s when
+               already-bound and returns the takeover fragment that carries
+               force=true, so force still happens — but only after the mtimes were
+               surfaced. -->
           {{range .Nodes}}
             {{if .Owned}}
             <p>
-              {{if or $game.MultiSource .Takeover}}
+              {{if or $sync.MultiSource .Takeover}}
                 <button class="btn big"
-                        hx-get="/games/{{$game.GameID}}/activate?node={{.NodeID}}"
+                        hx-get="/syncs/{{$sync.SyncID}}/activate?node={{.NodeID}}"
                         hx-target="#modal" hx-swap="innerHTML">
-                  {{if .Takeover}}Take over from {{$game.ActivePrimary}} ({{.NodeID}}){{else}}Play on {{.NodeID}}{{end}}
+                  {{if .Takeover}}Take over from {{$sync.ActivePrimary}} ({{.NodeID}}){{else}}Play on {{.NodeID}}{{end}}
                 </button>
               {{else}}
                 <button class="btn big"
-                        hx-post="/api/games/{{$game.GameID}}/activate"
+                        hx-post="/api/syncs/{{$sync.SyncID}}/activate"
                         hx-vals='{"primary_node": "{{.NodeID}}", "direction": "from-primary"}'
                         hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard">
                   Play on {{.NodeID}}

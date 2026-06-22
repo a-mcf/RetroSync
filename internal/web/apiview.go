@@ -20,7 +20,7 @@ type statusResponse struct {
 }
 
 type statusActive struct {
-	GameID      string `json:"game_id"`
+	SyncID      string `json:"sync_id"`
 	PrimaryNode string `json:"primary_node"`
 	Since       string `json:"since"`
 	Conflict    bool   `json:"conflict"`
@@ -48,7 +48,7 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	}
 	for _, b := range bindings {
 		out.Active = append(out.Active, statusActive{
-			GameID:      b.GameID,
+			SyncID:      b.SyncID,
 			PrimaryNode: b.PrimaryNode,
 			Since:       b.StartedAt.UTC().Format(time.RFC3339),
 			Conflict:    b.ConflictAt != nil,
@@ -94,13 +94,24 @@ func (s *Server) buildGames(ctx context.Context, f store.GameFilter) ([]gameResp
 	for _, g := range games {
 		gr := gameResponse{ID: g.ID, Display: g.Display, System: g.System}
 
-		if b, err := s.store.GetBinding(ctx, g.ID); err == nil {
-			gr.Active = &gameActive{
-				PrimaryNode: b.PrimaryNode,
-				Since:       b.StartedAt.UTC().Format(time.RFC3339),
+		// A game is "active" when any of its syncs has an active binding. The
+		// binding is sync-keyed now, so we surface the primary of the first active
+		// sync (TODO(slice-registry-sync): the /api/games registry view moves onto
+		// per-sync state; for now this preserves the "is this title in play" hint).
+		syncs, err := s.store.ListSyncsByGame(ctx, g.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list syncs %s: %w", g.ID, err)
+		}
+		for _, sy := range syncs {
+			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
+				gr.Active = &gameActive{
+					PrimaryNode: b.PrimaryNode,
+					Since:       b.StartedAt.UTC().Format(time.RFC3339),
+				}
+				break
+			} else if err != store.ErrNotFound {
+				return nil, fmt.Errorf("get binding %s: %w", sy.ID, err)
 			}
-		} else if err != store.ErrNotFound {
-			return nil, fmt.Errorf("get binding %s: %w", g.ID, err)
 		}
 
 		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
@@ -109,13 +120,11 @@ func (s *Server) buildGames(ctx context.Context, f store.GameFilter) ([]gameResp
 		}
 		gr.Paths = make([]gamePathOutput, 0, len(paths))
 		for _, p := range paths {
-			po := gamePathOutput{NodeID: p.NodeID, Path: p.Path}
-			if m, err := s.store.GetManifest(ctx, g.ID, p.NodeID); err == nil {
-				po.Mtime = rfc3339Ptr(m.Mtime)
-			} else if err != store.ErrNotFound {
-				return nil, fmt.Errorf("get manifest %s/%s: %w", g.ID, p.NodeID, err)
-			}
-			gr.Paths = append(gr.Paths, po)
+			// TODO(slice-registry-sync): the manifest is now sync-keyed, so there is
+			// no per-(game,node) mtime to surface here. The registry game-paths JSON
+			// keeps the mtime FIELD (always present, per the api.md contract) but it
+			// is null until the registry view is re-pointed onto syncs.
+			gr.Paths = append(gr.Paths, gamePathOutput{NodeID: p.NodeID, Path: p.Path})
 		}
 		out = append(out, gr)
 	}

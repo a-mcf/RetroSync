@@ -4,16 +4,17 @@
 // embedded via embed.FS so the binary is self-contained and runs offline — no
 // runtime CDN (docs/ui.md self-hosted ethos).
 //
-// Slice-7 adds the play-sync ACTIONS: the "Play on <node>" / "Done playing"
-// buttons, the activation "use my save" modal, force-takeover, and per-session
-// CSRF protection on every state-changing POST. The web layer drives play-sync
-// only through the narrow Actioner interface (no internal/reach import).
+// The play-sync ACTIONS — the "Play on <node>" / "Done playing" buttons, the
+// activation "use my save" modal, force-takeover, conflict resolution — are keyed
+// by SYNC id (a sync is the unit of mirroring; its members are its scope). Every
+// state-changing POST is CSRF-protected. The web layer drives play-sync only
+// through the narrow Actioner interface (no internal/reach import).
 //
-// Slice-9 adds conflict RESOLUTION: the dashboard conflict banner, the conflict
-// modal (GET /games/{id}/conflict) that surfaces every node's live state, and
-// the owner/admin-gated, CSRF-protected POST /api/games/{id}/resolve-conflict
-// that drives the engine's ResolveConflict. The /games /nodes registry editing
-// UI remains out of scope; its hook point is marked TODO(slice-registry).
+// Conflict RESOLUTION: the dashboard conflict banner, the conflict modal
+// (GET /syncs/{id}/conflict) that surfaces every member's live state, and the
+// owner/admin-gated, CSRF-protected POST /api/syncs/{id}/resolve-conflict that
+// drives the engine's ResolveConflict. The /games /nodes registry editing UI
+// still manages game_paths (TODO(slice-registry-sync) moves it onto syncs).
 package web
 
 import (
@@ -50,18 +51,18 @@ const userCtxKey ctxKey = iota
 // value type (engine is core play-sync logic, not infrastructure). main.go wires
 // the real engine; tests pass a recording stub.
 type Actioner interface {
-	Activate(ctx context.Context, gameID, primaryNode, direction, peerScope string, force bool) error
-	Deactivate(ctx context.Context, gameID string) error
+	Activate(ctx context.Context, syncID, primaryNode, direction string, force bool) error
+	Deactivate(ctx context.Context, syncID string) error
 	// ResolveConflict makes winnerNodeID's current save the authority for a
 	// conflicted binding, fanning it out to every other in-scope peer (after
 	// backing each loser up) and clearing the conflict flag. The single most
 	// destructive action in the system: the POST handler gates it on
 	// owner-or-admin AND CSRF before ever reaching here.
-	ResolveConflict(ctx context.Context, gameID, winnerNodeID string) error
+	ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error
 	// NodeStates returns the live per-node state (mtime, size, presence) of every
-	// in-scope node, read-only, for the conflict modal to render so the human can
-	// pick a winner with full disclosure.
-	NodeStates(ctx context.Context, gameID string) ([]engine.NodeState, error)
+	// member of the sync, read-only, for the conflict modal to render so the human
+	// can pick a winner with full disclosure.
+	NodeStates(ctx context.Context, syncID string) ([]engine.NodeState, error)
 	// SmokeTest verifies that a node is reachable for the /nodes registry "Test"
 	// button and the pairing smoke-test flow (docs/auth.md). It is the engine
 	// method that lets the web layer probe reachability WITHOUT importing
@@ -170,21 +171,21 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/games", s.requireAuth(http.HandlerFunc(s.handleAPIGames)))
 	mux.Handle("GET /api/nodes", s.requireAuth(http.HandlerFunc(s.handleAPINodes)))
 
-	// Action endpoints (slice-7). The activation modal fragment is a GET (no
-	// state change, no CSRF needed). The state-changing POSTs are wrapped in
-	// requireCSRF *inside* requireAuth so an unauthenticated request 303s to
-	// /login (friendly) while an authenticated-but-tokenless request 403s.
-	mux.Handle("GET /games/{id}/activate", s.requireAuth(http.HandlerFunc(s.handleActivateModal)))
-	mux.Handle("POST /api/games/{id}/activate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleActivate))))
-	mux.Handle("POST /api/games/{id}/deactivate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleDeactivate))))
+	// Play-sync action endpoints, keyed by SYNC id. The activation modal fragment
+	// is a GET (no state change, no CSRF needed). The state-changing POSTs are
+	// wrapped in requireCSRF *inside* requireAuth so an unauthenticated request
+	// 303s to /login (friendly) while an authenticated-but-tokenless request 403s.
+	mux.Handle("GET /syncs/{id}/activate", s.requireAuth(http.HandlerFunc(s.handleActivateModal)))
+	mux.Handle("POST /api/syncs/{id}/activate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleActivate))))
+	mux.Handle("POST /api/syncs/{id}/deactivate", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleDeactivate))))
 
-	// Conflict resolution (slice-9). The modal fragment is a read-only GET
+	// Conflict resolution, keyed by SYNC id. The modal fragment is a read-only GET
 	// (viewable by any authenticated user, consistent with "can see others'
 	// sessions" — docs/ui.md / brief D). The resolve POST is the single most
 	// destructive action in the system: it is wrapped in requireCSRF AND re-checks
 	// owner-or-admin inside the handler before touching the engine.
-	mux.Handle("GET /games/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
-	mux.Handle("POST /api/games/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
+	mux.Handle("GET /syncs/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
+	mux.Handle("POST /api/syncs/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
 
 	// Nodes registry (slice-10). Admin-only per docs/auth.md: every page and every
 	// mutation is wrapped in requireAdmin, so a non-admin never reaches the Store.

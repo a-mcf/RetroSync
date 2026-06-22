@@ -13,16 +13,16 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// seedConflictBinding seeds super-metroid as bound on primaryNode with
-// conflict_at set, so the dashboard banner and the resolve handler's
-// authorization path have a conflicted binding to act on.
+// seedConflictBinding seeds sync sm-bob as bound on primaryNode with conflict_at
+// set, so the dashboard banner and the resolve handler's authorization path have
+// a conflicted binding to act on.
 func seedConflictBinding(t *testing.T, f *actionFixture, primaryNode string) {
 	t.Helper()
 	conflict := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: primaryNode,
-		StartedAt: time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC),
-		Direction: "from-primary", PeerScope: "all-configured",
+		SyncID: "sm-bob", PrimaryNode: primaryNode,
+		StartedAt:  time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC),
+		Direction:  "from-primary",
 		ConflictAt: &conflict,
 	}); err != nil {
 		t.Fatalf("seed conflict binding: %v", err)
@@ -44,7 +44,7 @@ func TestConflictModal_RendersLiveStatePerNode_WinnerButtonOnlyWhenPresent(t *te
 	}
 	c, _ := loginAs(t, f, "bob")
 
-	req := httptest.NewRequest(http.MethodGet, "/games/super-metroid/conflict", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs/sm-bob/conflict", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
@@ -60,7 +60,7 @@ func TestConflictModal_RendersLiveStatePerNode_WinnerButtonOnlyWhenPresent(t *te
 		}
 	}
 	// Winner button POSTs to resolve-conflict with the node as winner_node_id.
-	if !strings.Contains(body, `hx-post="/api/games/super-metroid/resolve-conflict"`) {
+	if !strings.Contains(body, `hx-post="/api/syncs/sm-bob/resolve-conflict"`) {
 		t.Errorf("modal winner button does not POST resolve-conflict\n%s", body)
 	}
 	if !strings.Contains(body, `name="winner_node_id" value="bob-deck"`) {
@@ -93,7 +93,7 @@ func TestConflictModal_ViewableByNonOwner(t *testing.T) {
 	}
 	// carol (regular user) does not own bob-deck, but may still VIEW the modal.
 	c, _ := loginAs(t, f, "carol")
-	req := httptest.NewRequest(http.MethodGet, "/games/super-metroid/conflict", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs/sm-bob/conflict", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
@@ -109,7 +109,7 @@ func TestResolveConflict_Owner_CallsActionerAndRefreshes(t *testing.T) {
 	seedConflictBinding(t, f, "carol-deck") // owned by carol
 	c, csrf := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusOK {
@@ -119,7 +119,7 @@ func TestResolveConflict_Owner_CallsActionerAndRefreshes(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("resolve calls = %d, want 1", len(calls))
 	}
-	if calls[0].gameID != "super-metroid" || calls[0].winnerNodeID != "carol-deck" {
+	if calls[0].syncID != "sm-bob" || calls[0].winnerNodeID != "carol-deck" {
 		t.Fatalf("resolve call = %+v, unexpected", calls[0])
 	}
 	if !strings.Contains(rec.Body.String(), `id="dashboard"`) {
@@ -131,7 +131,7 @@ func TestResolveConflict_Admin_Allowed(t *testing.T) {
 	f := newActionFixture(t)
 	seedConflictBinding(t, f, "carol-deck") // not bob's node
 	c, csrf := loginAs(t, f, "bob")         // admin
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusOK {
@@ -149,7 +149,7 @@ func TestResolveConflict_NonOwner_403_NoActionerCall(t *testing.T) {
 	seedConflictBinding(t, f, "bob-deck") // owned by bob (admin)
 	c, csrf := loginAs(t, f, "carol")     // does not own bob-deck
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"bob-deck"},
 	})
 	if rec.Code != http.StatusForbidden {
@@ -165,7 +165,7 @@ func TestResolveConflict_CSRF_NoToken_403_NoActionerCall(t *testing.T) {
 	seedConflictBinding(t, f, "carol-deck")
 	c, _ := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, "" /* no csrf */, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, "" /* no csrf */, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusForbidden {
@@ -181,7 +181,7 @@ func TestResolveConflict_CSRF_WrongToken_403_NoActionerCall(t *testing.T) {
 	seedConflictBinding(t, f, "carol-deck")
 	c, _ := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, "totally-wrong-token", "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, "totally-wrong-token", "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusForbidden {
@@ -199,7 +199,7 @@ func TestResolveConflict_EmptyWinner_400_NoActionerCall(t *testing.T) {
 	seedConflictBinding(t, f, "carol-deck")
 	c, csrf := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {""},
 	})
 	if rec.Code != http.StatusBadRequest {
@@ -218,7 +218,7 @@ func TestResolveConflict_NotConflicted_409Refresh(t *testing.T) {
 	f.act.resolveErr = engine.ErrNotConflicted
 	c, csrf := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusConflict {
@@ -236,7 +236,7 @@ func TestResolveConflict_SourceMissing_422(t *testing.T) {
 	f.act.resolveErr = engine.ErrSourceMissing
 	c, csrf := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"carol-deck"},
 	})
 	if rec.Code != http.StatusUnprocessableEntity {
@@ -250,7 +250,7 @@ func TestResolveConflict_NoBinding_409(t *testing.T) {
 	f := newActionFixture(t)
 	// No binding seeded.
 	c, csrf := loginAs(t, f, "bob") // admin
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/resolve-conflict", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/resolve-conflict", url.Values{
 		"winner_node_id": {"bob-deck"},
 	})
 	if rec.Code != http.StatusConflict {
@@ -281,7 +281,7 @@ func TestDashboard_ConflictBanner_ShownWhenConflicted(t *testing.T) {
 	if !strings.Contains(body, "Sync paused") {
 		t.Errorf("conflict banner copy missing\n%s", body)
 	}
-	if !strings.Contains(body, `hx-get="/games/super-metroid/conflict"`) {
+	if !strings.Contains(body, `hx-get="/syncs/sm-bob/conflict"`) {
 		t.Errorf("conflict banner missing modal-open button\n%s", body)
 	}
 }
@@ -292,8 +292,8 @@ func TestDashboard_NoConflictBanner_WhenClean(t *testing.T) {
 	f := newActionFixture(t)
 	// Active but NOT conflicted.
 	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "carol-deck",
-		StartedAt: time.Now(), Direction: "from-primary", PeerScope: "all-configured",
+		SyncID: "sm-bob", PrimaryNode: "carol-deck",
+		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed clean binding: %v", err)
 	}
@@ -310,7 +310,7 @@ func TestDashboard_NoConflictBanner_WhenClean(t *testing.T) {
 	if strings.Contains(body, "Sync paused") {
 		t.Errorf("conflict banner should be absent for a clean game\n%s", body)
 	}
-	if strings.Contains(body, `hx-get="/games/super-metroid/conflict"`) {
+	if strings.Contains(body, `hx-get="/syncs/sm-bob/conflict"`) {
 		t.Errorf("modal-open button should be absent for a clean game\n%s", body)
 	}
 }

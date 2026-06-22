@@ -2,13 +2,13 @@
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" role="dialog" aria-modal="true" aria-label="Start playing {{.GameDisplay}}">
     <div class="modal-head">
-      <h3>{{.GameDisplay}} <span class="sub">{{.System}}</span></h3>
+      <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h3>
       <button class="modal-close" type="button"
               aria-label="Close"
               onclick="document.getElementById('modal').innerHTML='';">&times;</button>
     </div>
     <p class="sub">Which save do you want to start from?</p>
-    <form hx-post="/api/games/{{.GameID}}/activate"
+    <form hx-post="/api/syncs/{{.SyncID}}/activate"
           hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
           hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
       <input type="hidden" name="csrf_token" value="{{.CSRF}}">

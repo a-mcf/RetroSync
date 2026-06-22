@@ -12,6 +12,8 @@ import (
 
 	"github.com/a-mcf/retrosync/internal/auth"
 	"github.com/a-mcf/retrosync/internal/engine"
+	"github.com/a-mcf/retrosync/internal/reach"
+	"github.com/a-mcf/retrosync/internal/reach/fakereach"
 	"github.com/a-mcf/retrosync/internal/store"
 	"github.com/a-mcf/retrosync/internal/store/memory"
 )
@@ -37,32 +39,32 @@ type stubActioner struct {
 }
 
 type activateCall struct {
-	gameID, primaryNode, direction, peerScope string
-	force                                     bool
+	syncID, primaryNode, direction string
+	force                          bool
 }
 
 type resolveCall struct {
-	gameID, winnerNodeID string
+	syncID, winnerNodeID string
 }
 
-func (s *stubActioner) Activate(_ context.Context, gameID, primaryNode, direction, peerScope string, force bool) error {
+func (s *stubActioner) Activate(_ context.Context, syncID, primaryNode, direction string, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, activateCall{gameID, primaryNode, direction, peerScope, force})
+	s.calls = append(s.calls, activateCall{syncID, primaryNode, direction, force})
 	return s.activateErr
 }
 
-func (s *stubActioner) Deactivate(_ context.Context, gameID string) error {
+func (s *stubActioner) Deactivate(_ context.Context, syncID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.deactivated = append(s.deactivated, gameID)
+	s.deactivated = append(s.deactivated, syncID)
 	return nil
 }
 
-func (s *stubActioner) ResolveConflict(_ context.Context, gameID, winnerNodeID string) error {
+func (s *stubActioner) ResolveConflict(_ context.Context, syncID, winnerNodeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.resolved = append(s.resolved, resolveCall{gameID, winnerNodeID})
+	s.resolved = append(s.resolved, resolveCall{syncID, winnerNodeID})
 	return s.resolveErr
 }
 
@@ -108,7 +110,8 @@ func (s *stubActioner) deactivateCalls() []string {
 //   - admin user "bob" owning "bob-deck"
 //   - regular user "carol" owning "carol-deck"
 //   - shared node "mister" (no owner)
-//   - game "super-metroid" with paths + manifests on bob-deck and carol-deck.
+//   - game "super-metroid" with sync "sm-bob" whose members (+ manifests) are
+//     bob-deck and carol-deck.
 type actionFixture struct {
 	srv   *Server
 	store store.Store
@@ -148,13 +151,21 @@ func newActionFixture(t *testing.T) *actionFixture {
 	if err := st.CreateGame(ctx, store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes"}); err != nil {
 		t.Fatalf("create game: %v", err)
 	}
+	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}); err != nil {
+		t.Fatalf("create sync: %v", err)
+	}
 	mtime := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
 	for _, n := range []string{"bob-deck", "carol-deck"} {
+		if err := st.SetSyncMember(ctx, store.SyncMember{SyncID: "sm-bob", NodeID: n, Path: "sm.srm"}); err != nil {
+			t.Fatalf("set member %s: %v", n, err)
+		}
+		if err := st.SetManifest(ctx, store.ManifestEntry{SyncID: "sm-bob", NodeID: n, Mtime: &mtime}); err != nil {
+			t.Fatalf("set manifest %s: %v", n, err)
+		}
+		// Also seed the registry game_path (the /games admin UI still manages
+		// game_paths, orphaned from the engine — TODO(slice-registry-sync)).
 		if err := st.SetGamePath(ctx, store.GamePath{GameID: "super-metroid", NodeID: n, Path: "sm.srm"}); err != nil {
 			t.Fatalf("set path %s: %v", n, err)
-		}
-		if err := st.SetManifest(ctx, store.ManifestEntry{GameID: "super-metroid", NodeID: n, Mtime: &mtime}); err != nil {
-			t.Fatalf("set manifest %s: %v", n, err)
 		}
 	}
 
@@ -212,7 +223,7 @@ func TestActivateModal_MultiSource_ListsEveryMtime_DefaultBindingNode(t *testing
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "bob")
 
-	req := httptest.NewRequest(http.MethodGet, "/games/super-metroid/activate?node=bob-deck", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs/sm-bob/activate?node=bob-deck", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
@@ -248,14 +259,14 @@ func TestActivateModal_SingleSource_PreselectsAndListsMtimes(t *testing.T) {
 	ctx := context.Background()
 	// Remove carol-deck's save so only bob-deck has one (still two configured
 	// sources, but a single SAVE). Per docs/ui.md the lone save is pre-selected.
-	if err := f.store.SetManifest(ctx, store.ManifestEntry{GameID: "super-metroid", NodeID: "carol-deck"}); err != nil {
+	if err := f.store.SetManifest(ctx, store.ManifestEntry{SyncID: "sm-bob", NodeID: "carol-deck"}); err != nil {
 		t.Fatalf("clear carol manifest: %v", err)
 	}
 	c, _ := loginAs(t, f, "bob")
 
 	// Bind from carol-deck (which has no save); the lone save (bob-deck) should
 	// be pre-selected, not carol-deck.
-	req := httptest.NewRequest(http.MethodGet, "/games/super-metroid/activate?node=carol-deck", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs/sm-bob/activate?node=carol-deck", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
@@ -283,7 +294,7 @@ func TestDashboard_TakeoverRow_OpensModal_NotDirectForcePost(t *testing.T) {
 	// Bind super-metroid on carol-deck so bob-deck (bob's owned node) becomes a
 	// takeover row on bob's dashboard.
 	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "carol-deck",
+		SyncID: "sm-bob", PrimaryNode: "carol-deck",
 		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed binding: %v", err)
@@ -300,7 +311,7 @@ func TestDashboard_TakeoverRow_OpensModal_NotDirectForcePost(t *testing.T) {
 	body := rec.Body.String()
 
 	// The takeover button must hx-get the modal for bob-deck.
-	if !strings.Contains(body, `hx-get="/games/super-metroid/activate?node=bob-deck"`) {
+	if !strings.Contains(body, `hx-get="/syncs/sm-bob/activate?node=bob-deck"`) {
 		t.Errorf("takeover row does not hx-get the activation modal\n%s", body)
 	}
 	// And it must read as a takeover.
@@ -319,7 +330,7 @@ func TestActivate_Success_CallsActionerAndRefreshes(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"},
 		"direction":    {"from-peer-carol-deck"},
 	})
@@ -331,8 +342,8 @@ func TestActivate_Success_CallsActionerAndRefreshes(t *testing.T) {
 		t.Fatalf("activate calls = %d, want 1", len(calls))
 	}
 	got := calls[0]
-	if got.gameID != "super-metroid" || got.primaryNode != "bob-deck" ||
-		got.direction != "from-peer-carol-deck" || got.peerScope != "all-configured" || got.force {
+	if got.syncID != "sm-bob" || got.primaryNode != "bob-deck" ||
+		got.direction != "from-peer-carol-deck" || got.force {
 		t.Fatalf("activate call = %+v, unexpected", got)
 	}
 	// Refresh returns the dashboard fragment.
@@ -349,13 +360,13 @@ func TestActivate_ForceTakeover_409ThenForce(t *testing.T) {
 	f.act.activateErr = store.ErrConflict
 	// Seed a binding so renderTakeover can name the "other" primary.
 	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "carol-deck",
+		SyncID: "sm-bob", PrimaryNode: "carol-deck",
 		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"},
 		"direction":    {"from-primary"},
 	})
@@ -375,7 +386,7 @@ func TestActivate_ForceTakeover_409ThenForce(t *testing.T) {
 
 	// Now re-POST with force=true; the Actioner should be called with force.
 	f.act.activateErr = nil
-	rec2 := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec2 := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"},
 		"direction":    {"from-primary"},
 		"force":        {"true"},
@@ -397,7 +408,7 @@ func TestDeactivate_CallsActioner_Idempotent(t *testing.T) {
 	c, csrf := loginAs(t, f, "bob")
 
 	for i := 0; i < 2; i++ {
-		rec := postForm(t, f, c, csrf, "/api/games/super-metroid/deactivate", url.Values{})
+		rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/deactivate", url.Values{})
 		if rec.Code != http.StatusOK {
 			t.Fatalf("deactivate[%d] status = %d, want 200\n%s", i, rec.Code, rec.Body.String())
 		}
@@ -415,14 +426,14 @@ func TestDeactivate_NonOwner_403_NoActionerCall(t *testing.T) {
 	ctx := context.Background()
 	// Session is bound on bob-deck (owned by bob, the admin).
 	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck",
 		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
 	// carol (regular user) does not own bob-deck.
 	c, csrf := loginAs(t, f, "carol")
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/deactivate", url.Values{})
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/deactivate", url.Values{})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("non-owner deactivate status = %d, want 403\n%s", rec.Code, rec.Body.String())
 	}
@@ -438,13 +449,13 @@ func TestDeactivate_Owner_Allowed(t *testing.T) {
 	ctx := context.Background()
 	// Session bound on carol-deck (owned by carol).
 	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "carol-deck",
+		SyncID: "sm-bob", PrimaryNode: "carol-deck",
 		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
 	c, csrf := loginAs(t, f, "carol")
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/deactivate", url.Values{})
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/deactivate", url.Values{})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("owner deactivate status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
@@ -460,13 +471,13 @@ func TestDeactivate_Admin_Allowed(t *testing.T) {
 	ctx := context.Background()
 	// Session bound on carol-deck; bob is admin and does not own it.
 	if err := f.store.CreateBinding(ctx, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "carol-deck",
+		SyncID: "sm-bob", PrimaryNode: "carol-deck",
 		StartedAt: time.Now(), Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
 	c, csrf := loginAs(t, f, "bob") // admin
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/deactivate", url.Values{})
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/deactivate", url.Values{})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin deactivate status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
@@ -482,7 +493,7 @@ func TestDeactivate_IdleGame_IdempotentSuccess(t *testing.T) {
 	f := newActionFixture(t)
 	// No binding seeded; carol (regular user) deactivates an idle game.
 	c, csrf := loginAs(t, f, "carol")
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/deactivate", url.Values{})
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/deactivate", url.Values{})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("idle deactivate status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
@@ -497,7 +508,7 @@ func TestActivate_CSRF_NoToken_403_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "bob")
 
-	rec := postForm(t, f, c, "" /* no csrf */, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, "" /* no csrf */, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"}, "direction": {"from-primary"},
 	})
 	if rec.Code != http.StatusForbidden {
@@ -512,7 +523,7 @@ func TestActivate_CSRF_WrongToken_403_NoActionerCall(t *testing.T) {
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "bob")
 
-	rec := postForm(t, f, c, "totally-wrong-token", "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, "totally-wrong-token", "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"}, "direction": {"from-primary"},
 	})
 	if rec.Code != http.StatusForbidden {
@@ -526,7 +537,7 @@ func TestActivate_CSRF_WrongToken_403_NoActionerCall(t *testing.T) {
 func TestDeactivate_CSRF_NoToken_403(t *testing.T) {
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "bob")
-	rec := postForm(t, f, c, "", "/api/games/super-metroid/deactivate", url.Values{})
+	rec := postForm(t, f, c, "", "/api/syncs/sm-bob/deactivate", url.Values{})
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
@@ -542,7 +553,7 @@ func TestActivate_User_CannotBindOnNodeTheyDontOwn_403(t *testing.T) {
 	// carol (regular user) tries to bind onto bob-deck (owned by bob).
 	c, csrf := loginAs(t, f, "carol")
 
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"bob-deck"},
 		"direction":    {"from-primary"},
 	})
@@ -557,7 +568,7 @@ func TestActivate_User_CannotBindOnNodeTheyDontOwn_403(t *testing.T) {
 func TestActivate_User_CanBindOwnNode(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "carol")
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"carol-deck"},
 		"direction":    {"from-primary"},
 	})
@@ -569,10 +580,91 @@ func TestActivate_User_CanBindOwnNode(t *testing.T) {
 	}
 }
 
+// TestActivate_OwnedButNonMemberPrimary_Rejected_NoBinding is the authority-gap
+// regression: a regular user who OWNS a node that is NOT a member of the target
+// sync must NOT be able to seize that sync's binding by naming the owned
+// non-member as primary. The web ownership check PASSES (they own the node);
+// the engine's member gate is what must reject it. This test wires the REAL
+// engine (not the recording stub) so the gate actually runs end-to-end, and
+// asserts the request is rejected (not 200) with NO binding created.
+func TestActivate_OwnedButNonMemberPrimary_Rejected_NoBinding(t *testing.T) {
+	st := memory.New()
+	ctx := context.Background()
+
+	hash, err := auth.Hash(testPassword)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if err := st.CreateUser(ctx, store.User{ID: "carol", Display: "carol", PwHash: hash, Role: store.RoleUser}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	carol := "carol"
+	// carol-deck is a member of the sync; carol-outsider is owned by carol but is
+	// NOT a member of the sync.
+	for _, id := range []string{"carol-deck", "carol-outsider"} {
+		if err := st.CreateNode(ctx, store.Node{
+			ID: id, OwnerUserID: &carol, Display: id,
+			Kind: store.KindDeck, Reach: store.ReachSyncthingShare,
+		}); err != nil {
+			t.Fatalf("create node %s: %v", id, err)
+		}
+	}
+	if err := st.CreateGame(ctx, store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes"}); err != nil {
+		t.Fatalf("create game: %v", err)
+	}
+	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}); err != nil {
+		t.Fatalf("create sync: %v", err)
+	}
+	// Only carol-deck is a member of the sync (with a save so activation would
+	// otherwise be viable). carol-outsider is deliberately NOT a member.
+	mtime := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)
+	if err := st.SetSyncMember(ctx, store.SyncMember{SyncID: "sm-bob", NodeID: "carol-deck", Path: "sm.srm"}); err != nil {
+		t.Fatalf("set member: %v", err)
+	}
+	if err := st.SetManifest(ctx, store.ManifestEntry{SyncID: "sm-bob", NodeID: "carol-deck", Mtime: &mtime}); err != nil {
+		t.Fatalf("set manifest: %v", err)
+	}
+
+	// Real engine with a fakereach per node; carol-deck holds a save.
+	fakes := map[string]*fakereach.Fake{
+		"carol-deck":     fakereach.New().Put("sm.srm", []byte("SAVE"), mtime),
+		"carol-outsider": fakereach.New().Put("o.srm", []byte("OUTSIDER"), mtime),
+	}
+	resolve := func(n store.Node) (reach.Reach, error) {
+		f, ok := fakes[n.ID]
+		if !ok {
+			t.Fatalf("no fake for node %q", n.ID)
+		}
+		return f, nil
+	}
+	eng := engine.New(st, resolve, nil)
+	srv, err := New(st, Options{Actioner: eng})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f := &actionFixture{srv: srv, store: st, act: nil}
+
+	c, csrf := loginAs(t, f, "carol")
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
+		"primary_node": {"carol-outsider"}, // owned by carol, NOT a member
+		"direction":    {"from-peer-carol-deck"},
+	})
+	if rec.Code == http.StatusOK {
+		t.Fatalf("non-member primary must be rejected, got 200\n%s", rec.Body.String())
+	}
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422\n%s", rec.Code, rec.Body.String())
+	}
+	// No binding may have been created for the sync.
+	if _, err := st.GetBinding(ctx, "sm-bob"); err == nil {
+		t.Fatal("a binding was created for a sync the caller is not a member of")
+	}
+}
+
 func TestActivate_Admin_CanBindAnyNode(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob") // admin
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/activate", url.Values{
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/activate", url.Values{
 		"primary_node": {"carol-deck"}, // not bob's node
 		"direction":    {"from-primary"},
 	})

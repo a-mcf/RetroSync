@@ -19,11 +19,19 @@ import (
 // No secrets are involved in games or game_paths (a path is not a credential),
 // but we keep the same discipline: nothing sensitive is logged.
 //
+// TODO(slice-registry-sync): the /games registry still manages game_paths, which
+// are now orphaned from the engine (the engine syncs via sync_members). The full
+// registry→syncs UI move + dropping game_paths + the file picker is slice 16.
+// This slice only re-points the binding-touching guards onto the sync-keyed
+// binding API so they compile and stay friendly.
+//
 // Two delete/remove guards, both surfaced as a friendly 409 rather than a 500:
-//   - Deleting a game that is currently active (has an active_bindings row) is
-//     refused — the Store's NO-ACTION FK returns ErrInvalidReference/ErrConflict.
-//   - Removing the path of the node that is the active primary for a game is
-//     refused — checked here against the active binding before the Store delete.
+//   - Deleting a game that has any ACTIVE sync is refused — the Store's
+//     DeleteGame returns ErrConflict (the FK graph would otherwise cascade a live
+//     binding away).
+//   - Removing the path of a node that is the active primary of ANY sync of this
+//     game is refused — checked here against the game's syncs' bindings before
+//     the Store delete.
 
 // --- view-models ---------------------------------------------------------
 
@@ -134,12 +142,22 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 	for _, g := range games {
 		row := gameAdminRow{ID: g.ID, Display: g.Display, System: g.System, Notes: g.Notes}
 
-		var primary string
-		if b, err := s.store.GetBinding(ctx, g.ID); err == nil {
-			row.Active = b.PrimaryNode
-			primary = b.PrimaryNode
-		} else if !errors.Is(err, store.ErrNotFound) {
+		// A game is "active" when any of its syncs has an active binding. We
+		// collect the set of active-primary node ids across the game's syncs so a
+		// game_path row on any of those nodes is flagged IsPrimary (guarded against
+		// removal). TODO(slice-registry-sync): the registry view moves onto syncs.
+		activePrimaries := make(map[string]bool)
+		syncs, err := s.store.ListSyncsByGame(ctx, g.ID)
+		if err != nil {
 			return gamesPageData{}, err
+		}
+		for _, sy := range syncs {
+			if b, err := s.store.GetBinding(ctx, sy.ID); err == nil {
+				row.Active = b.PrimaryNode
+				activePrimaries[b.PrimaryNode] = true
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return gamesPageData{}, err
+			}
 		}
 
 		paths, err := s.store.ListGamePathsByGame(ctx, g.ID)
@@ -150,7 +168,7 @@ func (s *Server) buildGamesPage(ctx context.Context, u store.User, f store.GameF
 			row.Paths = append(row.Paths, gamePathRow{
 				NodeID:    p.NodeID,
 				Path:      p.Path,
-				IsPrimary: primary != "" && p.NodeID == primary,
+				IsPrimary: activePrimaries[p.NodeID],
 			})
 		}
 		data.Games = append(data.Games, row)
@@ -215,11 +233,11 @@ func (s *Server) handleEditGame(w http.ResponseWriter, r *http.Request) {
 
 // --- POST /api/games/{id}/delete -----------------------------------------
 
-// handleDeleteGame handles POST /api/games/{id}/delete. game_paths/manifest/
-// sync_log cascade on delete; only an active binding blocks it. The Store
-// returns ErrInvalidReference/ErrConflict (active_bindings.game_id NO-ACTION FK)
-// for an active game — surfaced as a friendly 409 "being played right now"
-// rather than a 500.
+// handleDeleteGame handles POST /api/games/{id}/delete. game_paths cascade on
+// delete, and the game's syncs (and their runtime rows) cascade too — but only
+// if NONE of those syncs is active. The Store refuses to delete a game with any
+// active sync, returning ErrConflict (or ErrInvalidReference) — surfaced as a
+// friendly 409 "being played right now" rather than a 500.
 func (s *Server) handleDeleteGame(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -279,10 +297,14 @@ func (s *Server) handleSetGamePath(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteGamePath handles POST /api/games/{id}/paths/{node_id}/delete.
 // Per docs/api.md it is forbidden if this node is the active primary for the
-// game: we check the active binding first and return a friendly 409 in that
-// case (the Store FK would otherwise let the delete through, since game_paths
-// are not what the binding references). Otherwise we delete; a missing mapping
-// is a 404.
+// game: we check the game's syncs' bindings first and return a friendly 409 in
+// that case (the Store FK would otherwise let the delete through, since
+// game_paths are not what a binding references). Otherwise we delete; a missing
+// mapping is a 404.
+//
+// TODO(slice-registry-sync): re-pointed onto the sync-keyed binding API — the
+// node is "the active primary" if it is the primary of ANY active sync of this
+// game. The whole game_paths registry moves onto sync_members in slice 16.
 func (s *Server) handleDeleteGamePath(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -292,24 +314,32 @@ func (s *Server) handleDeleteGamePath(w http.ResponseWriter, r *http.Request) {
 	gameID := r.PathValue("id")
 	nodeID := r.PathValue("node_id")
 
-	// Guard: refuse removing the path of the node that is the active primary.
-	// NOTE: GetBinding-then-DeleteGamePath is a benign TOCTOU — a binding could
-	// in principle appear between the read and the delete. Harmless here: this
-	// route is admin-only and not driven concurrently, so the window cannot be
-	// raced in practice. A transaction-scoped guard would only be warranted if
-	// this ever ran under concurrent mutation.
-	if b, err := s.store.GetBinding(r.Context(), gameID); err == nil {
-		if b.PrimaryNode == nodeID {
-			http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)
-			return
-		}
-	} else if !errors.Is(err, store.ErrNotFound) {
-		s.logger.ErrorContext(r.Context(), "delete game path: get binding failed", "game", gameID, "err", err.Error())
+	// Guard: refuse removing the path of a node that is the active primary of any
+	// sync of this game.
+	// NOTE: ListSyncsByGame/GetBinding-then-DeleteGamePath is a benign TOCTOU — a
+	// binding could in principle appear between the reads and the delete. Harmless
+	// here: this route is admin-only and not driven concurrently, so the window
+	// cannot be raced in practice.
+	syncs, err := s.store.ListSyncsByGame(r.Context(), gameID)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "delete game path: list syncs failed", "game", gameID, "err", err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	for _, sy := range syncs {
+		if b, err := s.store.GetBinding(r.Context(), sy.ID); err == nil {
+			if b.PrimaryNode == nodeID {
+				http.Error(w, "this node is the active primary — stop the session first", http.StatusConflict)
+				return
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			s.logger.ErrorContext(r.Context(), "delete game path: get binding failed", "sync", sy.ID, "err", err.Error())
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
 
-	err := s.store.DeleteGamePath(r.Context(), gameID, nodeID)
+	err = s.store.DeleteGamePath(r.Context(), gameID, nodeID)
 	switch {
 	case err == nil:
 		s.refreshGamesList(w, r, u)

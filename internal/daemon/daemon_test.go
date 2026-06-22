@@ -113,7 +113,7 @@ func (p *blockingPoller) calls() []string {
 func bindings(ids ...string) []store.ActiveBinding {
 	out := make([]store.ActiveBinding, len(ids))
 	for i, id := range ids {
-		out[i] = store.ActiveBinding{GameID: id, PrimaryNode: "n1"}
+		out[i] = store.ActiveBinding{SyncID: id, PrimaryNode: "n1"}
 	}
 	return out
 }

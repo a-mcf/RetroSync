@@ -58,6 +58,7 @@ func Run(t *testing.T, newStore Factory) {
 		{"SyncMemberInvalidReference", testSyncMemberInvalidReference},
 		{"SyncCascades", testSyncCascades},
 		{"SyncMembersByNode", testSyncMembersByNode},
+		{"RuntimeCascadesOnSyncDelete", testRuntimeCascadesOnSyncDelete},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -502,36 +503,32 @@ func testInvalidValue(t *testing.T, s store.Store) {
 
 func testBindings(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	mustNode(t, s, "mister", nil)
 
 	b := store.ActiveBinding{
-		GameID:      "super-metroid",
+		SyncID:      "sm-bob",
 		PrimaryNode: "bob-deck",
 		Direction:   "from-primary",
 	}
 	if err := s.CreateBinding(c, b); err != nil {
 		t.Fatalf("CreateBinding: %v", err)
 	}
-	// Duplicate game_id -> conflict (one active session per game invariant).
+	// Duplicate sync_id -> conflict (one active session per sync invariant).
 	if err := s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "mister", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "mister", Direction: "from-primary",
 	}); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("duplicate CreateBinding: want ErrConflict, got %v", err)
 	}
 
-	got, err := s.GetBinding(c, "super-metroid")
+	got, err := s.GetBinding(c, "sm-bob")
 	if err != nil {
 		t.Fatalf("GetBinding: %v", err)
 	}
-	if got.GameID != "super-metroid" || got.PrimaryNode != "bob-deck" ||
+	if got.SyncID != "sm-bob" || got.PrimaryNode != "bob-deck" ||
 		got.Direction != "from-primary" {
 		t.Fatalf("GetBinding mismatch: %+v", got)
-	}
-	// peer_scope defaults to all-configured.
-	if got.PeerScope != "all-configured" {
-		t.Fatalf("PeerScope default = %q, want all-configured", got.PeerScope)
 	}
 	// started_at defaulted to a real time.
 	if got.StartedAt.IsZero() {
@@ -545,11 +542,10 @@ func testBindings(t *testing.T, s store.Store) {
 		t.Fatalf("GetBinding(missing): want ErrNotFound, got %v", err)
 	}
 
-	// A peer-direction binding for a second game (and explicit peer_scope).
-	mustGame(t, s, "zelda")
+	// A peer-direction binding for a second sync.
+	mustSync(t, s, "z-1", "zelda")
 	if err := s.CreateBinding(c, store.ActiveBinding{
-		GameID: "zelda", PrimaryNode: "mister", Direction: "from-peer-bob-deck",
-		PeerScope: "bob-deck,mister",
+		SyncID: "z-1", PrimaryNode: "mister", Direction: "from-peer-bob-deck",
 	}); err != nil {
 		t.Fatalf("CreateBinding(peer direction): %v", err)
 	}
@@ -560,8 +556,8 @@ func testBindings(t *testing.T, s store.Store) {
 	if len(list) != 2 {
 		t.Fatalf("ListBindings len = %d, want 2", len(list))
 	}
-	if list[0].GameID != "super-metroid" || list[1].GameID != "zelda" {
-		t.Fatalf("ListBindings not ordered by game_id: %+v", list)
+	if list[0].SyncID != "sm-bob" || list[1].SyncID != "z-1" {
+		t.Fatalf("ListBindings not ordered by sync_id: %+v", list)
 	}
 
 	// Update mutable fields.
@@ -572,7 +568,7 @@ func testBindings(t *testing.T, s store.Store) {
 	if err := s.UpdateBinding(c, got); err != nil {
 		t.Fatalf("UpdateBinding: %v", err)
 	}
-	reread, _ := s.GetBinding(c, "super-metroid")
+	reread, _ := s.GetBinding(c, "sm-bob")
 	if reread.PrimaryNode != "mister" || reread.Direction != "from-peer-mister" {
 		t.Fatalf("UpdateBinding not applied: %+v", reread)
 	}
@@ -582,34 +578,34 @@ func testBindings(t *testing.T, s store.Store) {
 
 	// Update missing -> not found.
 	if err := s.UpdateBinding(c, store.ActiveBinding{
-		GameID: "ghost", PrimaryNode: "mister", Direction: "from-primary",
+		SyncID: "ghost", PrimaryNode: "mister", Direction: "from-primary",
 	}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("UpdateBinding(missing): want ErrNotFound, got %v", err)
 	}
 
-	// Delete returns the game to idle.
-	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+	// Delete returns the sync to idle.
+	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
 		t.Fatalf("DeleteBinding: %v", err)
 	}
-	if _, err := s.GetBinding(c, "super-metroid"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.GetBinding(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("after DeleteBinding: want ErrNotFound, got %v", err)
 	}
 }
 
 func testBindingInvalidReference(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 
-	// Missing game.
+	// Missing sync.
 	if err := s.CreateBinding(c, store.ActiveBinding{
-		GameID: "ghost-game", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "ghost-sync", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("CreateBinding(missing game): want ErrInvalidReference, got %v", err)
+		t.Fatalf("CreateBinding(missing sync): want ErrInvalidReference, got %v", err)
 	}
 	// Missing node.
 	if err := s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "ghost-node", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "ghost-node", Direction: "from-primary",
 	}); !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("CreateBinding(missing node): want ErrInvalidReference, got %v", err)
 	}
@@ -617,22 +613,22 @@ func testBindingInvalidReference(t *testing.T, s store.Store) {
 
 func testBindingInvalidValue(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 
 	// Bad direction (neither from-primary nor from-peer-*).
 	if err := s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "newer-wins",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "newer-wins",
 	}); !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("CreateBinding(bad direction): want ErrInvalidValue, got %v", err)
 	}
 
 	// A valid binding, then an update to a bad direction.
 	must(t, s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}))
 	if err := s.UpdateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "garbage",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "garbage",
 	}); !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("UpdateBinding(bad direction): want ErrInvalidValue, got %v", err)
 	}
@@ -645,29 +641,29 @@ func testBindingDeleteIdempotent(t *testing.T, s store.Store) {
 		t.Fatalf("DeleteBinding(absent): want nil, got %v", err)
 	}
 
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	must(t, s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}))
-	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
 		t.Fatalf("DeleteBinding: %v", err)
 	}
 	// Second delete is still a no-op, not ErrNotFound.
-	if err := s.DeleteBinding(c, "super-metroid"); err != nil {
+	if err := s.DeleteBinding(c, "sm-bob"); err != nil {
 		t.Fatalf("DeleteBinding(repeat): want nil, got %v", err)
 	}
 }
 
 func testBindingConflictFlag(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	must(t, s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}))
 
-	b, _ := s.GetBinding(c, "super-metroid")
+	b, _ := s.GetBinding(c, "sm-bob")
 	if b.ConflictAt != nil {
 		t.Fatalf("new binding conflict_at = %v, want nil", b.ConflictAt)
 	}
@@ -678,7 +674,7 @@ func testBindingConflictFlag(t *testing.T, s store.Store) {
 	if err := s.UpdateBinding(c, b); err != nil {
 		t.Fatalf("UpdateBinding(set conflict): %v", err)
 	}
-	got, _ := s.GetBinding(c, "super-metroid")
+	got, _ := s.GetBinding(c, "sm-bob")
 	if got.ConflictAt == nil || !got.ConflictAt.Equal(conflictTS) {
 		t.Fatalf("conflict_at = %v, want %v", got.ConflictAt, conflictTS)
 	}
@@ -688,7 +684,7 @@ func testBindingConflictFlag(t *testing.T, s store.Store) {
 	if err := s.UpdateBinding(c, got); err != nil {
 		t.Fatalf("UpdateBinding(clear conflict): %v", err)
 	}
-	cleared, _ := s.GetBinding(c, "super-metroid")
+	cleared, _ := s.GetBinding(c, "sm-bob")
 	if cleared.ConflictAt != nil {
 		t.Fatalf("conflict_at after clear = %v, want nil", cleared.ConflictAt)
 	}
@@ -698,33 +694,33 @@ func testBindingConflictFlag(t *testing.T, s store.Store) {
 
 func testSyncLog(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
-	mustGame(t, s, "zelda")
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustSync(t, s, "z-1", "zelda")
 
 	bytes := int64(2048)
 	src := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
 	dst := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
 
-	// Three entries for super-metroid, appended oldest-first.
+	// Three entries for sm-bob, appended oldest-first.
 	must(t, s.AppendLog(c, store.LogEntry{
-		GameID: "super-metroid", FromNode: "bob-deck", ToNode: "mister",
+		SyncID: "sm-bob", FromNode: "bob-deck", ToNode: "mister",
 		Bytes: &bytes, SrcMtime: &src, DstMtime: &dst,
 		Outcome: store.OutcomeOK, Message: "",
 	}))
 	must(t, s.AppendLog(c, store.LogEntry{
-		GameID: "super-metroid", FromNode: "bob-deck", ToNode: "alice-deck",
+		SyncID: "sm-bob", FromNode: "bob-deck", ToNode: "alice-deck",
 		Outcome: store.OutcomeNoop,
 	}))
 	must(t, s.AppendLog(c, store.LogEntry{
-		GameID: "super-metroid", Outcome: store.OutcomeError, Message: "boom",
+		SyncID: "sm-bob", Outcome: store.OutcomeError, Message: "boom",
 	}))
-	// An entry for a different game must not leak into the listing.
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", Outcome: store.OutcomeOK}))
+	// An entry for a different sync must not leak into the listing.
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "z-1", Outcome: store.OutcomeOK}))
 
 	// Most-recent-first: the error entry (appended last) comes first.
-	all, err := s.ListLogByGame(c, "super-metroid", 0)
+	all, err := s.ListLogBySync(c, "sm-bob", 0)
 	if err != nil {
-		t.Fatalf("ListLogByGame: %v", err)
+		t.Fatalf("ListLogBySync: %v", err)
 	}
 	if len(all) != 3 {
 		t.Fatalf("ListLogByGame len = %d, want 3", len(all))
@@ -751,9 +747,9 @@ func testSyncLog(t *testing.T, s store.Store) {
 	}
 
 	// Limit caps the result, keeping most-recent-first.
-	limited, err := s.ListLogByGame(c, "super-metroid", 2)
+	limited, err := s.ListLogBySync(c, "sm-bob", 2)
 	if err != nil {
-		t.Fatalf("ListLogByGame(limit): %v", err)
+		t.Fatalf("ListLogBySync(limit): %v", err)
 	}
 	if len(limited) != 2 {
 		t.Fatalf("ListLogByGame(limit=2) len = %d, want 2", len(limited))
@@ -771,7 +767,7 @@ func testSyncLog(t *testing.T, s store.Store) {
 // impls return the same ts-then-id ordering.
 func testSyncLogOrderByTS(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 
 	t1 := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC) // earliest
 	t2 := time.Date(2026, 6, 21, 13, 0, 0, 0, time.UTC)
@@ -781,13 +777,13 @@ func testSyncLogOrderByTS(t *testing.T, s store.Store) {
 	//   id=1 -> t3 (latest), id=2 -> t1 (earliest), id=3 -> t2 (middle).
 	// Relying on append order would yield id=3,2,1; the ts contract yields
 	// id=1 (t3), id=3 (t2), id=2 (t1).
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t3, Message: "id1-t3", Outcome: store.OutcomeOK}))
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t1, Message: "id2-t1", Outcome: store.OutcomeOK}))
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", TS: t2, Message: "id3-t2", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", TS: t3, Message: "id1-t3", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", TS: t1, Message: "id2-t1", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", TS: t2, Message: "id3-t2", Outcome: store.OutcomeOK}))
 
-	got, err := s.ListLogByGame(c, "super-metroid", 0)
+	got, err := s.ListLogBySync(c, "sm-bob", 0)
 	if err != nil {
-		t.Fatalf("ListLogByGame: %v", err)
+		t.Fatalf("ListLogBySync: %v", err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("ListLogByGame len = %d, want 3", len(got))
@@ -803,14 +799,14 @@ func testSyncLogOrderByTS(t *testing.T, s store.Store) {
 
 	// Tie-break by id DESC: two entries sharing one ts must come back
 	// highest-id-first.
-	mustGame(t, s, "zelda")
+	mustSync(t, s, "z-1", "zelda")
 	tie := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", TS: tie, Message: "first", Outcome: store.OutcomeOK}))
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "zelda", TS: tie, Message: "second", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "z-1", TS: tie, Message: "first", Outcome: store.OutcomeOK}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "z-1", TS: tie, Message: "second", Outcome: store.OutcomeOK}))
 
-	ties, err := s.ListLogByGame(c, "zelda", 0)
+	ties, err := s.ListLogBySync(c, "z-1", 0)
 	if err != nil {
-		t.Fatalf("ListLogByGame(zelda): %v", err)
+		t.Fatalf("ListLogBySync(z-1): %v", err)
 	}
 	if len(ties) != 2 {
 		t.Fatalf("ListLogByGame(zelda) len = %d, want 2", len(ties))
@@ -825,9 +821,9 @@ func testSyncLogOrderByTS(t *testing.T, s store.Store) {
 
 func testSyncLogInvalidValue(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	if err := s.AppendLog(c, store.LogEntry{
-		GameID: "super-metroid", Outcome: store.Outcome("exploded"),
+		SyncID: "sm-bob", Outcome: store.Outcome("exploded"),
 	}); !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("AppendLog(bad outcome): want ErrInvalidValue, got %v", err)
 	}
@@ -836,9 +832,9 @@ func testSyncLogInvalidValue(t *testing.T, s store.Store) {
 func testSyncLogInvalidReference(t *testing.T, s store.Store) {
 	c := ctx()
 	if err := s.AppendLog(c, store.LogEntry{
-		GameID: "ghost-game", Outcome: store.OutcomeOK,
+		SyncID: "ghost-sync", Outcome: store.OutcomeOK,
 	}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("AppendLog(missing game): want ErrInvalidReference, got %v", err)
+		t.Fatalf("AppendLog(missing sync): want ErrInvalidReference, got %v", err)
 	}
 }
 
@@ -846,7 +842,7 @@ func testSyncLogInvalidReference(t *testing.T, s store.Store) {
 
 func testManifest(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	mustNode(t, s, "mister", nil)
 
@@ -854,13 +850,13 @@ func testManifest(t *testing.T, s store.Store) {
 	size := int64(512)
 	checked := time.Date(2026, 6, 21, 9, 0, 30, 0, time.UTC)
 	m := store.ManifestEntry{
-		GameID: "super-metroid", NodeID: "bob-deck",
+		SyncID: "sm-bob", NodeID: "bob-deck",
 		Mtime: &mtime, Size: &size, LastChecked: &checked,
 	}
 	if err := s.SetManifest(c, m); err != nil {
 		t.Fatalf("SetManifest: %v", err)
 	}
-	got, err := s.GetManifest(c, "super-metroid", "bob-deck")
+	got, err := s.GetManifest(c, "sm-bob", "bob-deck")
 	if err != nil {
 		t.Fatalf("GetManifest: %v", err)
 	}
@@ -871,7 +867,7 @@ func testManifest(t *testing.T, s store.Store) {
 		t.Fatalf("SHA256 = %v, want nil (lazy)", got.SHA256)
 	}
 
-	if _, err := s.GetManifest(c, "super-metroid", "nope"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.GetManifest(c, "sm-bob", "nope"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetManifest(missing): want ErrNotFound, got %v", err)
 	}
 
@@ -883,7 +879,7 @@ func testManifest(t *testing.T, s store.Store) {
 	if err := s.SetManifest(c, m); err != nil {
 		t.Fatalf("SetManifest(upsert): %v", err)
 	}
-	got, _ = s.GetManifest(c, "super-metroid", "bob-deck")
+	got, _ = s.GetManifest(c, "sm-bob", "bob-deck")
 	if got.Mtime == nil || !got.Mtime.Equal(mtime2) || got.Size == nil || *got.Size != size2 {
 		t.Fatalf("upsert not applied: %+v", got)
 	}
@@ -891,24 +887,24 @@ func testManifest(t *testing.T, s store.Store) {
 		t.Fatalf("upsert sha256 = %v, want %q", got.SHA256, sha)
 	}
 
-	// Second node, then list by game.
-	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "mister"}))
-	list, err := s.ListManifestByGame(c, "super-metroid")
+	// Second node, then list by sync.
+	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "mister"}))
+	list, err := s.ListManifestBySync(c, "sm-bob")
 	if err != nil {
-		t.Fatalf("ListManifestByGame: %v", err)
+		t.Fatalf("ListManifestBySync: %v", err)
 	}
 	if len(list) != 2 {
-		t.Fatalf("ListManifestByGame len = %d, want 2", len(list))
+		t.Fatalf("ListManifestBySync len = %d, want 2", len(list))
 	}
 	if list[0].NodeID != "bob-deck" || list[1].NodeID != "mister" {
-		t.Fatalf("ListManifestByGame not ordered by node_id: %+v", list)
+		t.Fatalf("ListManifestBySync not ordered by node_id: %+v", list)
 	}
 
-	// Missing game/node -> invalid reference.
-	if err := s.SetManifest(c, store.ManifestEntry{GameID: "ghost", NodeID: "bob-deck"}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("SetManifest(missing game): want ErrInvalidReference, got %v", err)
+	// Missing sync/node -> invalid reference.
+	if err := s.SetManifest(c, store.ManifestEntry{SyncID: "ghost", NodeID: "bob-deck"}); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("SetManifest(missing sync): want ErrInvalidReference, got %v", err)
 	}
-	if err := s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "ghost"}); !errors.Is(err, store.ErrInvalidReference) {
+	if err := s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "ghost"}); !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("SetManifest(missing node): want ErrInvalidReference, got %v", err)
 	}
 }
@@ -921,21 +917,26 @@ func testManifest(t *testing.T, s store.Store) {
 // memory).
 func testDeleteBlockedByActiveBinding(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "a"}))
 	must(t, s.CreateBinding(c, store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: "bob-deck", Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
 	}))
 
-	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("DeleteGame(active): want ErrInvalidReference, got %v", err)
+	// A game with an active sync may not be deleted: the FK graph would cascade
+	// the live binding away. Surfaced as ErrConflict (the explicit guard).
+	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("DeleteGame(active): want ErrConflict, got %v", err)
 	}
+	// A node that is the active primary may not be deleted (active_bindings
+	// .primary_node NO-ACTION FK -> ErrInvalidReference).
 	if err := s.DeleteNode(c, "bob-deck"); !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("DeleteNode(active primary): want ErrInvalidReference, got %v", err)
 	}
 
 	// After deactivation, both deletes succeed.
-	must(t, s.DeleteBinding(c, "super-metroid"))
+	must(t, s.DeleteBinding(c, "sm-bob"))
 	if err := s.DeleteNode(c, "bob-deck"); err != nil {
 		t.Fatalf("DeleteNode after unbind: %v", err)
 	}
@@ -945,23 +946,27 @@ func testDeleteBlockedByActiveBinding(t *testing.T, s store.Store) {
 }
 
 // testCascadeRuntimeOnGameDelete asserts manifest and sync_log rows cascade
-// when a game with no active binding is deleted.
+// when a game with no active binding is deleted: the game's syncs cascade, and
+// each sync's manifest/sync_log cascade in turn.
 func testCascadeRuntimeOnGameDelete(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "bob-deck"}))
-	must(t, s.AppendLog(c, store.LogEntry{GameID: "super-metroid", Outcome: store.OutcomeOK}))
+	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck"}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", Outcome: store.OutcomeOK}))
 
-	// No active binding -> delete succeeds and cascades runtime rows.
+	// No active binding -> delete succeeds and cascades syncs + runtime rows.
 	if err := s.DeleteGame(c, "super-metroid"); err != nil {
 		t.Fatalf("DeleteGame: %v", err)
 	}
-	man, _ := s.ListManifestByGame(c, "super-metroid")
+	if _, err := s.GetSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("sync after game delete: want ErrNotFound, got %v", err)
+	}
+	man, _ := s.ListManifestBySync(c, "sm-bob")
 	if len(man) != 0 {
 		t.Fatalf("manifest after game delete = %d, want 0 (cascade)", len(man))
 	}
-	logs, _ := s.ListLogByGame(c, "super-metroid", 0)
+	logs, _ := s.ListLogBySync(c, "sm-bob", 0)
 	if len(logs) != 0 {
 		t.Fatalf("sync_log after game delete = %d, want 0 (cascade)", len(logs))
 	}
@@ -972,14 +977,14 @@ func testCascadeRuntimeOnGameDelete(t *testing.T, s store.Store) {
 // or cascade).
 func testCascadeManifestOnNodeDelete(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
+	mustSync(t, s, "sm-bob", "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.SetManifest(c, store.ManifestEntry{GameID: "super-metroid", NodeID: "bob-deck"}))
+	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck"}))
 
 	if err := s.DeleteNode(c, "bob-deck"); err != nil {
 		t.Fatalf("DeleteNode: %v", err)
 	}
-	man, _ := s.ListManifestByGame(c, "super-metroid")
+	man, _ := s.ListManifestBySync(c, "sm-bob")
 	if len(man) != 0 {
 		t.Fatalf("manifest after node delete = %d, want 0 (cascade)", len(man))
 	}
@@ -1258,6 +1263,38 @@ func testSyncMembersByNode(t *testing.T, s store.Store) {
 	}
 }
 
+// testRuntimeCascadesOnSyncDelete asserts the new FK behavior: deleting a sync
+// cascades its active_binding, manifest, and sync_log rows (all REFERENCE syncs
+// ON DELETE CASCADE). Unlike DeleteGame, DeleteSync does NOT refuse an active
+// sync — the binding simply cascades away with it.
+func testRuntimeCascadesOnSyncDelete(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.CreateBinding(c, store.ActiveBinding{
+		SyncID: "sm-bob", PrimaryNode: "bob-deck", Direction: "from-primary",
+	}))
+	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck"}))
+	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", Outcome: store.OutcomeOK}))
+
+	if err := s.DeleteSync(c, "sm-bob"); err != nil {
+		t.Fatalf("DeleteSync(active): want nil (binding cascades), got %v", err)
+	}
+	if _, err := s.GetBinding(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("binding after sync delete: want ErrNotFound (cascade), got %v", err)
+	}
+	if man, _ := s.ListManifestBySync(c, "sm-bob"); len(man) != 0 {
+		t.Fatalf("manifest after sync delete = %d, want 0 (cascade)", len(man))
+	}
+	if logs, _ := s.ListLogBySync(c, "sm-bob", 0); len(logs) != 0 {
+		t.Fatalf("sync_log after sync delete = %d, want 0 (cascade)", len(logs))
+	}
+	// The node, freed of its active-primary binding, is now deletable.
+	if err := s.DeleteNode(c, "bob-deck"); err != nil {
+		t.Fatalf("DeleteNode after sync delete: %v", err)
+	}
+}
+
 // ---- helpers ----
 
 func must(t *testing.T, err error) {
@@ -1275,6 +1312,29 @@ func mustUser(t *testing.T, s store.Store, id string) {
 func mustGame(t *testing.T, s store.Store, id string) {
 	t.Helper()
 	must(t, s.CreateGame(ctx(), store.Game{ID: id, Display: id, System: "snes"}))
+}
+
+// mustSync creates a sync (and its parent game, tolerating one already present)
+// so binding/manifest/sync_log rows — now sync_id-keyed — have a valid parent.
+func mustSync(t *testing.T, s store.Store, syncID, gameID string) {
+	t.Helper()
+	if err := s.CreateGame(ctx(), store.Game{ID: gameID, Display: gameID, System: "snes"}); err != nil && !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("setup game %q: %v", gameID, err)
+	}
+	must(t, s.CreateSync(ctx(), store.Sync{ID: syncID, GameID: gameID}))
+}
+
+// mustMember adds a (node, path) member to a sync (creating the node, tolerating
+// one already present), the sync-scoped equivalent of a game_path.
+func mustMember(t *testing.T, s store.Store, syncID, nodeID, path string) {
+	t.Helper()
+	if err := s.CreateNode(ctx(), store.Node{
+		ID: nodeID, Display: nodeID, Kind: store.KindGeneric, Reach: store.ReachSSH,
+		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "ref"},
+	}); err != nil && !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("setup node %q: %v", nodeID, err)
+	}
+	must(t, s.SetSyncMember(ctx(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path}))
 }
 
 func mustNode(t *testing.T, s store.Store, id string, owner *string) {

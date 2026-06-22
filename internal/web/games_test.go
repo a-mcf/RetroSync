@@ -25,11 +25,13 @@ func gameIDs(t *testing.T, f *actionFixture) map[string]bool {
 	return out
 }
 
-// seedBinding makes super-metroid active with the given primary node.
+// seedBinding makes the sync sm-bob (of game super-metroid) active with the
+// given primary node — so the game's registry delete/remove-path guards have an
+// active sync to refuse against.
 func seedBinding(t *testing.T, f *actionFixture, primary string) {
 	t.Helper()
 	if err := f.store.CreateBinding(context.Background(), store.ActiveBinding{
-		GameID: "super-metroid", PrimaryNode: primary, Direction: "from-primary",
+		SyncID: "sm-bob", PrimaryNode: primary, Direction: "from-primary",
 	}); err != nil {
 		t.Fatalf("create binding: %v", err)
 	}

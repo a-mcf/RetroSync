@@ -16,7 +16,10 @@ import (
 
 // --- test harness --------------------------------------------------------
 
-const gameID = "super-metroid"
+const (
+	gameID = "super-metroid"
+	syncID = "sm-bob"
+)
 
 // fixedClock returns a Clock that advances by a fixed step on each call, so
 // timestamps are deterministic but distinguishable.
@@ -58,18 +61,21 @@ func newHarness(t *testing.T, clock engine.Clock) *harness {
 	if err := h.store.CreateGame(ctx, store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.store.CreateSync(ctx, store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
-// addNode registers a node + its game path + a backing fake. If present, seeds
-// the node's file with content at mtime.
+// addNode registers a node + a sync member (the engine's in-scope (node, path))
+// + a backing fake. If present, seeds the node's file with content at mtime.
 func (h *harness) addNode(id, path string, content []byte, mtime time.Time, present bool) {
 	h.t.Helper()
 	ctx := context.Background()
 	if err := h.store.CreateNode(ctx, store.Node{ID: id, Display: id, Kind: store.KindGeneric, Reach: store.ReachSyncthingShare}); err != nil {
 		h.t.Fatal(err)
 	}
-	if err := h.store.SetGamePath(ctx, store.GamePath{GameID: gameID, NodeID: id, Path: path}); err != nil {
+	if err := h.store.SetSyncMember(ctx, store.SyncMember{SyncID: syncID, NodeID: id, Path: path}); err != nil {
 		h.t.Fatal(err)
 	}
 	f := fakereach.New()
@@ -80,11 +86,24 @@ func (h *harness) addNode(id, path string, content []byte, mtime time.Time, pres
 	h.paths[id] = path
 }
 
+// addNonMemberNode registers a node + a backing fake but NO sync member, so the
+// node is out of scope for the sync. Used to prove the engine only touches sync
+// members.
+func (h *harness) addNonMemberNode(id, path string) {
+	h.t.Helper()
+	ctx := context.Background()
+	if err := h.store.CreateNode(ctx, store.Node{ID: id, Display: id, Kind: store.KindGeneric, Reach: store.ReachSyncthingShare}); err != nil {
+		h.t.Fatal(err)
+	}
+	h.fakes[id] = fakereach.New()
+	h.paths[id] = path
+}
+
 func (h *harness) fake(id string) *fakereach.Fake { return h.fakes[id] }
 
 func (h *harness) binding() store.ActiveBinding {
 	h.t.Helper()
-	b, err := h.store.GetBinding(context.Background(), gameID)
+	b, err := h.store.GetBinding(context.Background(), syncID)
 	if err != nil {
 		h.t.Fatalf("get binding: %v", err)
 	}
@@ -93,7 +112,7 @@ func (h *harness) binding() store.ActiveBinding {
 
 func (h *harness) manifest(nodeID string) store.ManifestEntry {
 	h.t.Helper()
-	m, err := h.store.GetManifest(context.Background(), gameID, nodeID)
+	m, err := h.store.GetManifest(context.Background(), syncID, nodeID)
 	if err != nil {
 		h.t.Fatalf("get manifest %s: %v", nodeID, err)
 	}
@@ -102,7 +121,7 @@ func (h *harness) manifest(nodeID string) store.ManifestEntry {
 
 func (h *harness) logCount(outcome store.Outcome) int {
 	h.t.Helper()
-	entries, err := h.store.ListLogByGame(context.Background(), gameID, 0)
+	entries, err := h.store.ListLogBySync(context.Background(), syncID, 0)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -145,12 +164,12 @@ func TestActivate_NoNodeHasFile_Errors(t *testing.T) {
 	h.addNode("primary", "p.srm", nil, t0, false)
 	h.addNode("peer", "q.srm", nil, t0, false)
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
+	err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false)
 	if !errors.Is(err, engine.ErrNoSave) {
 		t.Fatalf("want ErrNoSave, got %v", err)
 	}
 	// No binding should have been created.
-	if _, err := h.store.GetBinding(ctx(), gameID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := h.store.GetBinding(ctx(), syncID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("binding should not exist: %v", err)
 	}
 }
@@ -162,7 +181,7 @@ func TestActivate_SingleSource_AutoPickAndFanOut(t *testing.T) {
 	h.addNode("peer1", "q.srm", nil, t0, false)
 	h.addNode("peer2", "r.srm", nil, t0, false)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,7 +221,7 @@ func TestActivate_MultiSource_FromPrimary(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), pMtime, true)
 	h.addNode("peer", "q.srm", []byte("PEER"), peerMtime, true)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	// from-primary => primary is the source; peer is overwritten with PRIMARY.
@@ -216,7 +235,7 @@ func TestActivate_MultiSource_FromPeer(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), pMtime, true)
 	h.addNode("peer", "q.srm", []byte("PEER"), peerMtime, true)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-peer-peer", false); err != nil {
 		t.Fatal(err)
 	}
 	// from-peer-peer => peer is the source; primary is overwritten with PEER.
@@ -228,7 +247,7 @@ func TestActivate_FromPeer_MissingSource_Errors(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), t0, true)
 	h.addNode("peer", "q.srm", nil, t0, false) // peer has no file
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-peer-peer", "all-configured", false)
+	err := h.engine.Activate(ctx(), syncID, "primary", "from-peer-peer", false)
 	if !errors.Is(err, engine.ErrSourceMissing) {
 		t.Fatalf("want ErrSourceMissing, got %v", err)
 	}
@@ -239,10 +258,10 @@ func TestActivate_AlreadyActive_Rejected(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("SAVE"), t0, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
 
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
+	err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false)
 	if !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("want store.ErrConflict, got %v", err)
 	}
@@ -251,26 +270,32 @@ func TestActivate_AlreadyActive_Rejected(t *testing.T) {
 func TestActivate_ForceTakeover_ReplacesBinding(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	srcMtime := t0.Add(-time.Hour)
+	mineMtime := t0.Add(2 * time.Hour)
 	h.addNode("primary", "p.srm", []byte("OLD"), srcMtime, true)
-	h.addNode("other", "q.srm", []byte("MINE"), srcMtime, true)
+	h.addNode("other", "q.srm", []byte("OLD"), srcMtime, true)
 
-	// First session: "primary" holds the binding, sourced from itself, scoped to
-	// itself so "other" keeps its own MINE save (we take over from it next).
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary", false); err != nil {
+	// First session: "primary" holds the binding, sourced from itself; the
+	// fan-out gives "other" the OLD save too (both nodes are members of the sync —
+	// a sync's members ARE its scope, there is no per-session scope to exclude).
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	if b := h.binding(); b.PrimaryNode != "primary" {
 		t.Fatalf("first binding primary = %q, want primary", b.PrimaryNode)
 	}
 
+	// "other" writes its own save out of band (the divergence the taker wants to
+	// keep). We do NOT poll, so the conflict is not flagged before the takeover.
+	h.fake("other").Mutate("q.srm", []byte("MINE"), mineMtime)
+
 	// Without force, taking over fails.
-	if err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", false); !errors.Is(err, store.ErrConflict) {
+	if err := h.engine.Activate(ctx(), syncID, "other", "from-peer-other", false); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("takeover without force: want ErrConflict, got %v", err)
 	}
 
 	// With force, the existing binding is replaced (raw delete + create), and
 	// the new source ("other") is fanned out — so "primary" now holds MINE.
-	if err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", true); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "other", "from-peer-other", true); err != nil {
 		t.Fatalf("force takeover: %v", err)
 	}
 	b := h.binding()
@@ -280,7 +305,7 @@ func TestActivate_ForceTakeover_ReplacesBinding(t *testing.T) {
 	if b.Direction != "from-peer-other" {
 		t.Fatalf("after force takeover direction = %q, want from-peer-other", b.Direction)
 	}
-	h.assertFile("primary", []byte("MINE"), srcMtime)
+	h.assertFile("primary", []byte("MINE"), mineMtime)
 }
 
 func TestActivate_Force_NonViableSource_LeavesExistingBinding(t *testing.T) {
@@ -292,19 +317,20 @@ func TestActivate_Force_NonViableSource_LeavesExistingBinding(t *testing.T) {
 	h.addNode("primary", "p.srm", []byte("OLD"), srcMtime, true)
 	h.addNode("other", "q.srm", nil, srcMtime, false /* no file */)
 
-	// First session: "primary" holds the binding, scoped to itself so the
-	// fan-out does not give "other" a file (we need "other" to stay empty so the
-	// takeover below has a non-viable source).
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary", false); err != nil {
+	// First session: "primary" holds the binding, sourced from itself. The
+	// fan-out gives "other" the OLD save; we then REMOVE it out of band so the
+	// takeover below has a non-viable source (a member with no file).
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
+	h.fake("other").Remove("q.srm")
 	before := h.binding()
 	if before.PrimaryNode != "primary" {
 		t.Fatalf("setup binding primary = %q, want primary", before.PrimaryNode)
 	}
 
 	// Force takeover sourced from "other", which has no file → ErrSourceMissing.
-	err := h.engine.Activate(ctx(), gameID, "other", "from-peer-other", "all-configured", true)
+	err := h.engine.Activate(ctx(), syncID, "other", "from-peer-other", true)
 	if !errors.Is(err, engine.ErrSourceMissing) {
 		t.Fatalf("force takeover with missing source: want ErrSourceMissing, got %v", err)
 	}
@@ -325,7 +351,7 @@ func TestActivate_Force_OnIdleGame_Activates(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	h.addNode("primary", "p.srm", []byte("SAVE"), t0.Add(-time.Hour), true)
 	h.addNode("peer", "q.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", true); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", true); err != nil {
 		t.Fatalf("force activate on idle: %v", err)
 	}
 	if b := h.binding(); b.PrimaryNode != "primary" {
@@ -336,27 +362,89 @@ func TestActivate_Force_OnIdleGame_Activates(t *testing.T) {
 func TestActivate_BadDirection_Rejected(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	h.addNode("primary", "p.srm", []byte("SAVE"), t0, true)
-	err := h.engine.Activate(ctx(), gameID, "primary", "sideways", "all-configured", false)
+	err := h.engine.Activate(ctx(), syncID, "primary", "sideways", false)
 	if !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("want ErrInvalidValue, got %v", err)
 	}
 }
 
-func TestActivate_PeerScope_CSV(t *testing.T) {
+// TestActivate_ScopeIsSyncMembers proves the engine's in-scope set is EXACTLY
+// the sync's members (a sync's members ARE its scope — there is no peer_scope).
+// A node that is NOT a member of the sync is never touched, even if it holds a
+// file at the same path on the same device class.
+func TestActivate_ScopeIsSyncMembers(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	src := t0.Add(-time.Hour)
 	h.addNode("primary", "p.srm", []byte("SAVE"), src, true)
 	h.addNode("in", "q.srm", nil, t0, false)
-	h.addNode("out", "r.srm", nil, t0, false)
+	// "out" is a registered node with a backing fake but NOT a member of this
+	// sync, so it is out of scope. addNonMemberNode wires the fake without a
+	// SyncMember row.
+	h.addNonMemberNode("out", "r.srm")
 
-	// Scope excludes "out".
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "primary,in", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	h.assertFile("in", []byte("SAVE"), src)
-	// "out" was out of scope: nothing written.
+	// "out" is not a member: nothing written.
 	if _, err := h.fake("out").Stat(ctx(), "r.srm"); !errors.Is(err, reach.ErrNotExist) {
-		t.Fatalf("out-of-scope node should be untouched, got %v", err)
+		t.Fatalf("non-member node should be untouched, got %v", err)
+	}
+}
+
+// TestActivate_PrimaryNotMember_Rejected_NothingMutated proves the authority
+// gate: a primaryNode that is NOT a member of the sync is rejected with
+// ErrPrimaryNotMember BEFORE any binding is created — even though the node is a
+// registered node with a file. (The web layer only checks node OWNERSHIP; the
+// engine must independently require membership so owning an unrelated node can
+// never seize a sync's play authority.)
+func TestActivate_PrimaryNotMember_Rejected_NothingMutated(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	h.addNode("member", "p.srm", []byte("SAVE"), t0.Add(-time.Hour), true)
+	// "outsider" is a registered node with its own file but is NOT a member of
+	// the sync. Naming it as primary must be rejected.
+	h.addNonMemberNode("outsider", "o.srm")
+	h.fake("outsider").Put("o.srm", []byte("OUTSIDER"), t0)
+
+	err := h.engine.Activate(ctx(), syncID, "outsider", "from-peer-member", false)
+	if !errors.Is(err, engine.ErrPrimaryNotMember) {
+		t.Fatalf("want ErrPrimaryNotMember, got %v", err)
+	}
+	// No binding created.
+	if _, err := h.store.GetBinding(ctx(), syncID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("binding must not exist after rejected activate: %v", err)
+	}
+	// The member's file was not fanned out anywhere (nothing mutated).
+	if got := h.logCount(store.OutcomeOK); got != 0 {
+		t.Fatalf("rejected activate logged ok rows: %d", got)
+	}
+}
+
+// TestActivate_ForcePrimaryNotMember_LeavesExistingBinding proves the
+// authority gate runs BEFORE the force-takeover delete: a force activate naming
+// a non-member primary must be rejected WITHOUT having displaced the existing
+// binding.
+func TestActivate_ForcePrimaryNotMember_LeavesExistingBinding(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	h.addNode("member", "p.srm", []byte("SAVE"), t0.Add(-time.Hour), true)
+	h.addNode("peer", "q.srm", nil, t0, false)
+	h.addNonMemberNode("outsider", "o.srm")
+	h.fake("outsider").Put("o.srm", []byte("OUTSIDER"), t0)
+
+	// Establish an existing binding on a legitimate member.
+	if err := h.engine.Activate(ctx(), syncID, "member", "from-primary", false); err != nil {
+		t.Fatal(err)
+	}
+	before := h.binding()
+
+	// Force-takeover naming the non-member as primary → rejected, binding intact.
+	err := h.engine.Activate(ctx(), syncID, "outsider", "from-peer-member", true)
+	if !errors.Is(err, engine.ErrPrimaryNotMember) {
+		t.Fatalf("want ErrPrimaryNotMember, got %v", err)
+	}
+	after := h.binding()
+	if after.PrimaryNode != before.PrimaryNode || !after.StartedAt.Equal(before.StartedAt) {
+		t.Fatalf("existing binding must survive a rejected force activate: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -370,7 +458,7 @@ func activateClean(t *testing.T) (*harness, time.Time) {
 	srcMtime := t0.Add(-time.Hour)
 	h.addNode("primary", "p.srm", []byte("V1"), srcMtime, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	return h, srcMtime
@@ -379,7 +467,7 @@ func activateClean(t *testing.T) (*harness, time.Time) {
 func TestPoll_Noop(t *testing.T) {
 	h, _ := activateClean(t)
 	okBefore := h.logCount(store.OutcomeOK)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.logCount(store.OutcomeOK); got != okBefore {
@@ -395,7 +483,7 @@ func TestPoll_PrimaryChanged_FanOut(t *testing.T) {
 	newMtime := t0.Add(time.Hour)
 	h.fake("primary").Mutate("p.srm", []byte("V2"), newMtime)
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	h.assertFile("peer", []byte("V2"), newMtime)
@@ -412,7 +500,7 @@ func TestPoll_PeerChanged_Conflict(t *testing.T) {
 	// Peer mutates out of band; primary unchanged.
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), t0.Add(2*time.Hour))
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -430,7 +518,7 @@ func TestPoll_BothChanged_Conflict(t *testing.T) {
 	h.fake("primary").Mutate("p.srm", []byte("V2"), t0.Add(time.Hour))
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), t0.Add(2*time.Hour))
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -442,7 +530,7 @@ func TestPoll_ConflictedBinding_Skipped(t *testing.T) {
 	h, _ := activateClean(t)
 	// Force into conflict.
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), t0.Add(2*time.Hour))
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	conflictAt := h.binding().ConflictAt
@@ -452,7 +540,7 @@ func TestPoll_ConflictedBinding_Skipped(t *testing.T) {
 	// Now the primary changes; a subsequent poll must do nothing (paused).
 	h.fake("primary").Mutate("p.srm", []byte("V99"), t0.Add(3*time.Hour))
 	okBefore := h.logCount(store.OutcomeOK)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if got := h.logCount(store.OutcomeOK); got != okBefore {
@@ -473,21 +561,21 @@ func TestDeactivate_CleanFinalPass_Deletes(t *testing.T) {
 	newMtime := t0.Add(time.Hour)
 	h.fake("primary").Mutate("p.srm", []byte("FINAL"), newMtime)
 
-	if err := h.engine.Deactivate(ctx(), gameID); err != nil {
+	if err := h.engine.Deactivate(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	h.assertFile("peer", []byte("FINAL"), newMtime)
-	if _, err := h.store.GetBinding(ctx(), gameID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := h.store.GetBinding(ctx(), syncID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("binding should be deleted, got %v", err)
 	}
 }
 
 func TestDeactivate_NoChange_Deletes(t *testing.T) {
 	h, _ := activateClean(t)
-	if err := h.engine.Deactivate(ctx(), gameID); err != nil {
+	if err := h.engine.Deactivate(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.GetBinding(ctx(), gameID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := h.store.GetBinding(ctx(), syncID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("binding should be deleted, got %v", err)
 	}
 }
@@ -497,10 +585,10 @@ func TestDeactivate_ConflictingFinalPass_LeavesActive(t *testing.T) {
 	// A peer mutated out of band: the final pass would conflict.
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), t0.Add(2*time.Hour))
 
-	if err := h.engine.Deactivate(ctx(), gameID); err != nil {
+	if err := h.engine.Deactivate(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
-	b, err := h.store.GetBinding(ctx(), gameID)
+	b, err := h.store.GetBinding(ctx(), syncID)
 	if err != nil {
 		t.Fatalf("binding should still exist: %v", err)
 	}
@@ -512,7 +600,7 @@ func TestDeactivate_ConflictingFinalPass_LeavesActive(t *testing.T) {
 func TestDeactivate_Idle_Idempotent(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	h.addNode("primary", "p.srm", nil, t0, false)
-	if err := h.engine.Deactivate(ctx(), gameID); err != nil {
+	if err := h.engine.Deactivate(ctx(), syncID); err != nil {
 		t.Fatalf("deactivating idle game should be a no-op, got %v", err)
 	}
 }
@@ -529,7 +617,7 @@ func TestPoll_WriteFails_ManifestNotAdvanced_RetriesNextPoll(t *testing.T) {
 	boom := errors.New("sftp: connection reset")
 	h.fake("peer").FailWriteAtomic("q.srm", boom)
 
-	if err := h.engine.Poll(ctx(), gameID); !errors.Is(err, boom) {
+	if err := h.engine.Poll(ctx(), syncID); !errors.Is(err, boom) {
 		t.Fatalf("want write error, got %v", err)
 	}
 	// Manifest must NOT have advanced (crash-safety: manifest trails the write).
@@ -544,7 +632,7 @@ func TestPoll_WriteFails_ManifestNotAdvanced_RetriesNextPoll(t *testing.T) {
 
 	// Recover: clear the failure and re-poll. The retry now succeeds.
 	h.fake("peer").FailWriteAtomic("q.srm", nil)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("retry poll: %v", err)
 	}
 	h.assertFile("peer", []byte("V2"), newMtime)
@@ -565,20 +653,20 @@ func TestActivate_FanOutFails_RollsBackToIdle_AndRetrySucceeds(t *testing.T) {
 	boom := errors.New("sftp: connection reset")
 	h.fake("peer").FailWriteAtomic("q.srm", boom)
 
-	err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false)
+	err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false)
 	if !errors.Is(err, boom) {
 		t.Fatalf("want fan-out write error, got %v", err)
 	}
 	// The binding must have been rolled back: the game is idle again, not stuck
 	// half-active with a nil last_synced.
-	if _, err := h.store.GetBinding(ctx(), gameID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := h.store.GetBinding(ctx(), syncID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("binding should have been rolled back to idle, got %v", err)
 	}
 
 	// Clear the injected failure and retry: a clean activation must now succeed
 	// (no lingering ErrConflict from the half-active row).
 	h.fake("peer").FailWriteAtomic("q.srm", nil)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatalf("retry activate should succeed after rollback, got %v", err)
 	}
 	h.assertFile("peer", []byte("SAVE"), srcMtime)
@@ -599,7 +687,7 @@ func activateCleanMulti(t *testing.T) (*harness, time.Time) {
 	h.addNode("primary", "p.srm", []byte("V1"), srcMtime, true)
 	h.addNode("peerA", "a.srm", nil, t0, false)
 	h.addNode("peerB", "b.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	return h, srcMtime
@@ -626,7 +714,7 @@ func TestPoll_MultiPeer_PrimaryChanged_FansOutToBoth(t *testing.T) {
 	newMtime := t0.Add(time.Hour)
 	h.fake("primary").Mutate("p.srm", []byte("V2"), newMtime)
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	// Fan-out reached BOTH peers.
@@ -643,7 +731,7 @@ func TestPoll_MultiPeer_OnePeerMutates_ConflictAndOtherPeerUntouched(t *testing.
 	peerAMtime := t0.Add(2 * time.Hour)
 	h.fake("peerA").Mutate("a.srm", []byte("A-WROTE"), peerAMtime)
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -667,7 +755,7 @@ func TestPoll_MultiPeer_PartialFanOut_SelfHeals(t *testing.T) {
 	boom := errors.New("sftp: connection reset")
 	h.fake("peerB").FailWriteAtomic("b.srm", boom)
 
-	if err := h.engine.Poll(ctx(), gameID); !errors.Is(err, boom) {
+	if err := h.engine.Poll(ctx(), syncID); !errors.Is(err, boom) {
 		t.Fatalf("want write error on peerB, got %v", err)
 	}
 	// peerA advanced (content + manifest), peerB did not.
@@ -682,7 +770,7 @@ func TestPoll_MultiPeer_PartialFanOut_SelfHeals(t *testing.T) {
 	// Next poll self-heals: clear the failure and re-poll. peerB now converges
 	// and the system reaches a consistent state with no conflict.
 	h.fake("peerB").FailWriteAtomic("b.srm", nil)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("self-heal poll: %v", err)
 	}
 	h.assertFile("peerA", []byte("V2"), newMtime)
@@ -702,7 +790,7 @@ func TestPoll_PrimaryVanished_Conflict_PeersUntouched(t *testing.T) {
 	// The primary's file disappears (e.g. the device wiped its save).
 	h.fake("primary").Remove("p.srm")
 
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -734,12 +822,12 @@ func activateConflicted(t *testing.T) (h *harness, primaryMtime, peerMtime time.
 	peerMtime = t0.Add(2 * time.Hour)
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	// After activation the peer holds PRIMARY@primaryMtime; mutate it out of band.
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), peerMtime)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -751,7 +839,7 @@ func activateConflicted(t *testing.T) (h *harness, primaryMtime, peerMtime time.
 func TestResolveConflict_PrimaryWins_BacksUpLoserAndFansOut(t *testing.T) {
 	h, primaryMtime, peerMtime := activateConflicted(t)
 
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 
@@ -797,7 +885,7 @@ func TestResolveConflict_PrimaryWins_BacksUpLoserAndFansOut(t *testing.T) {
 
 	// sync_log has the backup row (message names the backup path) and the fan-out
 	// ok row. There is 1 backup + 1 fan-out copy here.
-	entries, err := h.store.ListLogByGame(ctx(), gameID, 0)
+	entries, err := h.store.ListLogBySync(ctx(), syncID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -828,7 +916,7 @@ func TestResolveConflict_NotConflicted_Errors_NothingMutated(t *testing.T) {
 	okBefore := h.logCount(store.OutcomeOK)
 	writesBefore := len(h.fake("peer").Writes()) // activation already wrote once
 
-	err := h.engine.ResolveConflict(ctx(), gameID, "primary")
+	err := h.engine.ResolveConflict(ctx(), syncID, "primary")
 	if !errors.Is(err, engine.ErrNotConflicted) {
 		t.Fatalf("want ErrNotConflicted, got %v", err)
 	}
@@ -847,7 +935,7 @@ func TestResolveConflict_WinnerNotInScope_Errors_NothingMutated(t *testing.T) {
 	conflictBefore := h.binding().ConflictAt
 	okBefore := h.logCount(store.OutcomeOK)
 
-	err := h.engine.ResolveConflict(ctx(), gameID, "ghost-node")
+	err := h.engine.ResolveConflict(ctx(), syncID, "ghost-node")
 	if !errors.Is(err, engine.ErrNoPath) {
 		t.Fatalf("want ErrNoPath, got %v", err)
 	}
@@ -866,7 +954,7 @@ func TestResolveConflict_WinnerHasNoFile_Errors_NothingMutated(t *testing.T) {
 	// Remove the primary's file so the chosen winner has nothing to fan out.
 	h.fake("primary").Remove("p.srm")
 
-	err := h.engine.ResolveConflict(ctx(), gameID, "primary")
+	err := h.engine.ResolveConflict(ctx(), syncID, "primary")
 	if !errors.Is(err, engine.ErrSourceMissing) {
 		t.Fatalf("want ErrSourceMissing, got %v", err)
 	}
@@ -888,14 +976,14 @@ func TestResolveConflict_NodeWithoutFile_NoBackup_StillReceivesWinner(t *testing
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
 	h.addNode("peerA", "a.srm", nil, t0, false)
 	h.addNode("peerB", "b.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 	// peerA mutates out of band (becomes a loser with a file); peerB is then wiped
 	// so it has NO file at resolution time.
 	peerAMtime := t0.Add(2 * time.Hour)
 	h.fake("peerA").Mutate("a.srm", []byte("A-WROTE"), peerAMtime)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
@@ -903,7 +991,7 @@ func TestResolveConflict_NodeWithoutFile_NoBackup_StillReceivesWinner(t *testing
 	}
 	h.fake("peerB").Remove("b.srm")
 
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 
@@ -940,7 +1028,7 @@ func TestResolveConflict_FanOutFails_LeavesConflictSet_Reresolvable(t *testing.T
 	// so the backup succeeds but the overwrite fails.
 	h.fake("peer").FailWriteAtomic("q.srm", boom)
 
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); !errors.Is(err, boom) {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); !errors.Is(err, boom) {
 		t.Fatalf("want fan-out write error, got %v", err)
 	}
 	// Conflict must remain set (re-resolvable).
@@ -966,7 +1054,7 @@ func TestResolveConflict_FanOutFails_LeavesConflictSet_Reresolvable(t *testing.T
 
 	// Recover: clear the failure and re-resolve. It now succeeds.
 	h.fake("peer").FailWriteAtomic("q.srm", nil)
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("re-resolve after recovery: %v", err)
 	}
 	h.assertFile("peer", []byte("PRIMARY"), primaryMtime)
@@ -1005,19 +1093,19 @@ func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *tes
 	peerMtime1 := t0.Add(2 * time.Hour)
 	h.addNode("primary", "p.srm", []byte("PRIMARY"), primaryMtime, true)
 	h.addNode("peer", "q.srm", nil, t0, false)
-	if err := h.engine.Activate(ctx(), gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := h.engine.Activate(ctx(), syncID, "primary", "from-primary", false); err != nil {
 		t.Fatal(err)
 	}
 
 	// First conflict: peer diverges, poll flags it, then resolve (primary wins).
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE-1"), peerMtime1)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
 		t.Fatal("setup: expected first conflict")
 	}
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("first resolve: %v", err)
 	}
 	firstResolvedAt := *h.binding().LastSynced
@@ -1029,13 +1117,13 @@ func TestResolveConflict_SameSecondResolves_DistinctBackupPaths_NoClobber(t *tes
 	// Second conflict on the SAME binding, resolved later in the SAME second.
 	peerMtime2 := t0.Add(3 * time.Hour)
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE-2"), peerMtime2)
-	if err := h.engine.Poll(ctx(), gameID); err != nil {
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
 	if h.binding().ConflictAt == nil {
 		t.Fatal("setup: expected second conflict")
 	}
-	if err := h.engine.ResolveConflict(ctx(), gameID, "primary"); err != nil {
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
 		t.Fatalf("second resolve: %v", err)
 	}
 	secondResolvedAt := *h.binding().LastSynced
@@ -1078,7 +1166,7 @@ func TestNodeStates_PerNodePresentMtimeSize_SortedByNodeID(t *testing.T) {
 	h.addNode("alpha", "a.srm", []byte("ALPHALONG"), aMtime, true)
 	h.addNode("zeta", "z.srm", nil, t0, false) // absent
 
-	states, err := h.engine.NodeStates(ctx(), gameID)
+	states, err := h.engine.NodeStates(ctx(), syncID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,7 +1201,7 @@ func TestNodeStates_StatError_IsReturned(t *testing.T) {
 	boom := errors.New("sftp: host down")
 	h.fake("primary").FailStat("p.srm", boom)
 
-	if _, err := h.engine.NodeStates(ctx(), gameID); !errors.Is(err, boom) {
+	if _, err := h.engine.NodeStates(ctx(), syncID); !errors.Is(err, boom) {
 		t.Fatalf("a non-ErrNotExist Stat error must be returned, got %v", err)
 	}
 }
@@ -1124,10 +1212,10 @@ func TestDeactivate_ConflictMessage_MarksFinalPass(t *testing.T) {
 	h, _ := activateClean(t)
 	h.fake("peer").Mutate("q.srm", []byte("PEER-WROTE"), t0.Add(2*time.Hour))
 
-	if err := h.engine.Deactivate(ctx(), gameID); err != nil {
+	if err := h.engine.Deactivate(ctx(), syncID); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := h.store.ListLogByGame(ctx(), gameID, 0)
+	entries, err := h.store.ListLogBySync(ctx(), syncID, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

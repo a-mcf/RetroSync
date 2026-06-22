@@ -23,10 +23,10 @@ type Store struct {
 	games map[string]store.Game
 	// paths keyed by game_id then node_id.
 	paths map[gpKey]store.GamePath
-	// bindings keyed by game_id (the PK / one-active-session invariant).
+	// bindings keyed by sync_id (the PK / one-active-session invariant).
 	bindings map[string]store.ActiveBinding
-	// manifest keyed by (game_id, node_id).
-	manifest map[gpKey]store.ManifestEntry
+	// manifest keyed by (sync_id, node_id).
+	manifest map[smKey]store.ManifestEntry
 	// log is the append-only sync_log, ordered by append; nextLogID assigns the
 	// bigserial-equivalent id.
 	log       []store.LogEntry
@@ -55,7 +55,7 @@ func New() *Store {
 		games:       make(map[string]store.Game),
 		paths:       make(map[gpKey]store.GamePath),
 		bindings:    make(map[string]store.ActiveBinding),
-		manifest:    make(map[gpKey]store.ManifestEntry),
+		manifest:    make(map[smKey]store.ManifestEntry),
 		nextLogID:   1,
 		syncs:       make(map[string]store.Sync),
 		syncMembers: make(map[smKey]store.SyncMember),
@@ -288,46 +288,62 @@ func (s *Store) DeleteGame(_ context.Context, id string) error {
 	if _, ok := s.games[id]; !ok {
 		return store.ErrNotFound
 	}
-	// An active binding makes this game active. The Postgres NO-ACTION FK
-	// (active_bindings.game_id) refuses the delete with a 23503 ->
-	// ErrInvalidReference; mirror that here so both impls agree.
-	if _, ok := s.bindings[id]; ok {
-		return store.ErrInvalidReference
+	// A game is "active" when any of its syncs has an active binding. Deleting it
+	// would cascade through syncs into active_bindings, silently tearing down a
+	// live session. Refuse instead (brief F: delete-active-game is a friendly
+	// 409). We surface ErrConflict so both impls agree and the web layer maps it
+	// to "being played right now — stop the session first".
+	for syncID, sy := range s.syncs {
+		if sy.GameID != id {
+			continue
+		}
+		if _, active := s.bindings[syncID]; active {
+			return store.ErrConflict
+		}
 	}
 	delete(s.games, id)
-	// Cascade: delete game_paths, manifest, and sync_log referencing this game.
+	// Cascade: delete game_paths referencing this game (game_paths is kept for the
+	// registry; it still cascades on game delete).
 	for k := range s.paths {
 		if k.gameID == id {
 			delete(s.paths, k)
 		}
 	}
+	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE. Each deleted sync
+	// in turn cascades its members, manifest, sync_log, and (none, since none are
+	// active here) any binding.
+	for syncID, sy := range s.syncs {
+		if sy.GameID != id {
+			continue
+		}
+		s.deleteSyncCascade(syncID)
+	}
+	return nil
+}
+
+// deleteSyncCascade removes a sync and every row that cascades from it:
+// sync_members, manifest, sync_log, and the active binding. The caller must hold
+// s.mu. It does NOT remove the syncs entry's siblings — only the given sync.
+func (s *Store) deleteSyncCascade(syncID string) {
+	delete(s.syncs, syncID)
+	for k := range s.syncMembers {
+		if k.syncID == syncID {
+			delete(s.syncMembers, k)
+		}
+	}
 	for k := range s.manifest {
-		if k.gameID == id {
+		if k.syncID == syncID {
 			delete(s.manifest, k)
 		}
 	}
 	kept := s.log[:0]
 	for _, e := range s.log {
-		if e.GameID != id {
+		if e.SyncID != syncID {
 			kept = append(kept, e)
 		}
 	}
 	s.log = kept
-	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE, and
-	// sync_members.sync_id cascades from syncs. Delete the game's syncs and
-	// their members.
-	for syncID, sy := range s.syncs {
-		if sy.GameID != id {
-			continue
-		}
-		delete(s.syncs, syncID)
-		for k := range s.syncMembers {
-			if k.syncID == syncID {
-				delete(s.syncMembers, k)
-			}
-		}
-	}
-	return nil
+	delete(s.bindings, syncID)
 }
 
 // ---- GamePaths ----
@@ -400,29 +416,26 @@ func (s *Store) CreateBinding(_ context.Context, b store.ActiveBinding) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.games[b.GameID]; !ok {
+	if _, ok := s.syncs[b.SyncID]; !ok {
 		return store.ErrInvalidReference
 	}
 	if _, ok := s.nodes[b.PrimaryNode]; !ok {
 		return store.ErrInvalidReference
 	}
-	if _, ok := s.bindings[b.GameID]; ok {
+	if _, ok := s.bindings[b.SyncID]; ok {
 		return store.ErrConflict
-	}
-	if b.PeerScope == "" {
-		b.PeerScope = "all-configured"
 	}
 	if b.StartedAt.IsZero() {
 		b.StartedAt = time.Now().UTC()
 	}
-	s.bindings[b.GameID] = cloneBinding(b)
+	s.bindings[b.SyncID] = cloneBinding(b)
 	return nil
 }
 
-func (s *Store) GetBinding(_ context.Context, gameID string) (store.ActiveBinding, error) {
+func (s *Store) GetBinding(_ context.Context, syncID string) (store.ActiveBinding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	b, ok := s.bindings[gameID]
+	b, ok := s.bindings[syncID]
 	if !ok {
 		return store.ActiveBinding{}, store.ErrNotFound
 	}
@@ -436,7 +449,7 @@ func (s *Store) ListBindings(_ context.Context) ([]store.ActiveBinding, error) {
 	for _, b := range s.bindings {
 		out = append(out, cloneBinding(b))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].GameID < out[j].GameID })
+	sort.Slice(out, func(i, j int) bool { return out[i].SyncID < out[j].SyncID })
 	return out, nil
 }
 
@@ -445,7 +458,7 @@ func (s *Store) UpdateBinding(_ context.Context, b store.ActiveBinding) error {
 	defer s.mu.Unlock()
 	// Match Postgres: a no-match UPDATE reports ErrNotFound before the CHECK
 	// constraint can fire, so the existence check comes first.
-	if _, ok := s.bindings[b.GameID]; !ok {
+	if _, ok := s.bindings[b.SyncID]; !ok {
 		return store.ErrNotFound
 	}
 	if !store.ValidDirection(b.Direction) {
@@ -454,19 +467,16 @@ func (s *Store) UpdateBinding(_ context.Context, b store.ActiveBinding) error {
 	if _, ok := s.nodes[b.PrimaryNode]; !ok {
 		return store.ErrInvalidReference
 	}
-	if b.PeerScope == "" {
-		b.PeerScope = "all-configured"
-	}
-	s.bindings[b.GameID] = cloneBinding(b)
+	s.bindings[b.SyncID] = cloneBinding(b)
 	return nil
 }
 
-func (s *Store) DeleteBinding(_ context.Context, gameID string) error {
+func (s *Store) DeleteBinding(_ context.Context, syncID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Idempotent: deleting an absent binding is a no-op (api.md "deactivate is
 	// idempotent"). No ErrNotFound here, unlike the other Delete* methods.
-	delete(s.bindings, gameID)
+	delete(s.bindings, syncID)
 	return nil
 }
 
@@ -478,7 +488,7 @@ func (s *Store) AppendLog(_ context.Context, e store.LogEntry) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.games[e.GameID]; !ok {
+	if _, ok := s.syncs[e.SyncID]; !ok {
 		return store.ErrInvalidReference
 	}
 	e.ID = s.nextLogID
@@ -490,7 +500,7 @@ func (s *Store) AppendLog(_ context.Context, e store.LogEntry) error {
 	return nil
 }
 
-func (s *Store) ListLogByGame(_ context.Context, gameID string, limit int) ([]store.LogEntry, error) {
+func (s *Store) ListLogBySync(_ context.Context, syncID string, limit int) ([]store.LogEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	// Most-recent-first by ts, ties broken by id descending — matching the
@@ -499,7 +509,7 @@ func (s *Store) ListLogByGame(_ context.Context, gameID string, limit int) ([]st
 	// can make insertion order diverge from ts order, so sort explicitly.
 	out := make([]store.LogEntry, 0)
 	for _, e := range s.log {
-		if e.GameID == gameID {
+		if e.SyncID == syncID {
 			out = append(out, cloneLog(e))
 		}
 	}
@@ -520,32 +530,32 @@ func (s *Store) ListLogByGame(_ context.Context, gameID string, limit int) ([]st
 func (s *Store) SetManifest(_ context.Context, m store.ManifestEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.games[m.GameID]; !ok {
+	if _, ok := s.syncs[m.SyncID]; !ok {
 		return store.ErrInvalidReference
 	}
 	if _, ok := s.nodes[m.NodeID]; !ok {
 		return store.ErrInvalidReference
 	}
-	s.manifest[gpKey{m.GameID, m.NodeID}] = cloneManifest(m)
+	s.manifest[smKey{m.SyncID, m.NodeID}] = cloneManifest(m)
 	return nil
 }
 
-func (s *Store) GetManifest(_ context.Context, gameID, nodeID string) (store.ManifestEntry, error) {
+func (s *Store) GetManifest(_ context.Context, syncID, nodeID string) (store.ManifestEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	m, ok := s.manifest[gpKey{gameID, nodeID}]
+	m, ok := s.manifest[smKey{syncID, nodeID}]
 	if !ok {
 		return store.ManifestEntry{}, store.ErrNotFound
 	}
 	return cloneManifest(m), nil
 }
 
-func (s *Store) ListManifestByGame(_ context.Context, gameID string) ([]store.ManifestEntry, error) {
+func (s *Store) ListManifestBySync(_ context.Context, syncID string) ([]store.ManifestEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]store.ManifestEntry, 0)
 	for k, m := range s.manifest {
-		if k.gameID == gameID {
+		if k.syncID == syncID {
 			out = append(out, cloneManifest(m))
 		}
 	}
@@ -612,13 +622,11 @@ func (s *Store) DeleteSync(_ context.Context, id string) error {
 	if _, ok := s.syncs[id]; !ok {
 		return store.ErrNotFound
 	}
-	delete(s.syncs, id)
-	// Cascade: sync_members.sync_id REFERENCES syncs ON DELETE CASCADE.
-	for k := range s.syncMembers {
-		if k.syncID == id {
-			delete(s.syncMembers, k)
-		}
-	}
+	// Cascade: sync_members, manifest, sync_log, and the active binding all
+	// REFERENCE syncs ON DELETE CASCADE. (Unlike DeleteGame, DeleteSync does NOT
+	// refuse an active sync: a sync's binding cascades away with it, mirroring the
+	// Postgres active_bindings.sync_id ON DELETE CASCADE.)
+	s.deleteSyncCascade(id)
 	return nil
 }
 

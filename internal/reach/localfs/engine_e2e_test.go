@@ -20,7 +20,10 @@ import (
 	"github.com/a-mcf/retrosync/internal/store/memory"
 )
 
-const gameID = "super-metroid"
+const (
+	gameID = "super-metroid"
+	syncID = "sm-bob"
+)
 
 func steppingClock(start time.Time, step time.Duration) engine.Clock {
 	cur := start
@@ -59,6 +62,9 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	if err := st.CreateGame(ctx, store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.CreateSync(ctx, store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+		t.Fatal(err)
+	}
 	// Two syncthing-share nodes, each rooted at its own temp dir via reach_config.
 	mustNode(t, st, "primary", primaryRoot)
 	mustNode(t, st, "peer", peerRoot)
@@ -68,7 +74,7 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	clock := steppingClock(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), time.Second)
 	eng := engine.New(st, resolve.ResolveReach, clock)
 
-	if err := eng.Activate(ctx, gameID, "primary", "from-primary", "all-configured", false); err != nil {
+	if err := eng.Activate(ctx, syncID, "primary", "from-primary", false); err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
 
@@ -99,7 +105,7 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := eng.Poll(ctx, gameID); err != nil {
+	if err := eng.Poll(ctx, syncID); err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
 	gotData2, err := os.ReadFile(peerAbs)
@@ -118,7 +124,7 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	}
 
 	// A second Poll with no changes must be a noop: peer file unchanged, no error.
-	if err := eng.Poll(ctx, gameID); err != nil {
+	if err := eng.Poll(ctx, syncID); err != nil {
 		t.Fatalf("idempotent Poll: %v", err)
 	}
 	gotData3, err := os.ReadFile(peerAbs)
@@ -160,9 +166,11 @@ func mustNode(t *testing.T, st store.Store, id, root string) {
 	}
 }
 
+// mustPath adds a sync member (node, path) — the engine's in-scope (node, file)
+// pair, the sync-scoped successor of a game_path.
 func mustPath(t *testing.T, st store.Store, nodeID, path string) {
 	t.Helper()
-	if err := st.SetGamePath(context.Background(), store.GamePath{GameID: gameID, NodeID: nodeID, Path: path}); err != nil {
-		t.Fatalf("SetGamePath %q: %v", nodeID, err)
+	if err := st.SetSyncMember(context.Background(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path}); err != nil {
+		t.Fatalf("SetSyncMember %q: %v", nodeID, err)
 	}
 }

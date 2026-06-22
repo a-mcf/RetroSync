@@ -286,6 +286,24 @@ func (s *Store) UpdateGame(ctx context.Context, g store.Game) error {
 }
 
 func (s *Store) DeleteGame(ctx context.Context, id string) error {
+	// A game is "active" when any of its syncs has an active binding. The FK
+	// graph would CASCADE a game delete through syncs into active_bindings,
+	// silently tearing down a live session — so we refuse it explicitly here
+	// (brief F: delete-active-game is a friendly 409). We surface ErrConflict so
+	// the web layer maps it to "being played right now — stop the session first".
+	// This guard mirrors the memory store's; both impls agree.
+	var active bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM active_bindings ab
+		   JOIN syncs sy ON sy.id = ab.sync_id
+		   WHERE sy.game_id = $1)`, id,
+	).Scan(&active); err != nil {
+		return mapErr(err)
+	}
+	if active {
+		return store.ErrConflict
+	}
 	tag, err := s.db.Exec(ctx, `DELETE FROM games WHERE id = $1`, id)
 	if err != nil {
 		return mapErr(err)
@@ -361,33 +379,29 @@ func (s *Store) DeleteGamePath(ctx context.Context, gameID, nodeID string) error
 
 // ---- ActiveBindings ----
 //
-// The active_bindings.game_id PRIMARY KEY enforces one active session per game
-// (duplicate insert -> 23505 -> ErrConflict). Its game_id/primary_node FKs are
-// NO ACTION, so DeleteGame/DeleteNode of a referenced row fail with 23503 ->
-// ErrInvalidReference without any extra check here.
+// The active_bindings.sync_id PRIMARY KEY enforces one active session per sync
+// (duplicate insert -> 23505 -> ErrConflict). sync_id REFERENCES syncs ON DELETE
+// CASCADE; primary_node is NO ACTION, so DeleteNode of an active primary fails
+// with 23503 -> ErrInvalidReference without any extra check here.
 
 func (s *Store) CreateBinding(ctx context.Context, b store.ActiveBinding) error {
-	// Let the DB default started_at/peer_scope when the caller leaves them zero.
+	// Let the DB default started_at when the caller leaves it zero.
 	var startedAt any
 	if !b.StartedAt.IsZero() {
 		startedAt = b.StartedAt
 	}
-	peerScope := b.PeerScope
-	if peerScope == "" {
-		peerScope = "all-configured"
-	}
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO active_bindings
-		   (game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced)
-		 VALUES ($1, $2, COALESCE($3, now()), $4, $5, $6, $7)`,
-		b.GameID, b.PrimaryNode, startedAt, b.Direction, peerScope, b.ConflictAt, b.LastSynced)
+		   (sync_id, primary_node, started_at, direction, conflict_at, last_synced)
+		 VALUES ($1, $2, COALESCE($3, now()), $4, $5, $6)`,
+		b.SyncID, b.PrimaryNode, startedAt, b.Direction, b.ConflictAt, b.LastSynced)
 	return mapErr(err)
 }
 
-func (s *Store) GetBinding(ctx context.Context, gameID string) (store.ActiveBinding, error) {
+func (s *Store) GetBinding(ctx context.Context, syncID string) (store.ActiveBinding, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced
-		 FROM active_bindings WHERE game_id = $1`, gameID)
+		`SELECT sync_id, primary_node, started_at, direction, conflict_at, last_synced
+		 FROM active_bindings WHERE sync_id = $1`, syncID)
 	b, err := scanBinding(row)
 	if err != nil {
 		return store.ActiveBinding{}, mapErr(err)
@@ -397,8 +411,8 @@ func (s *Store) GetBinding(ctx context.Context, gameID string) (store.ActiveBind
 
 func (s *Store) ListBindings(ctx context.Context) ([]store.ActiveBinding, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT game_id, primary_node, started_at, direction, peer_scope, conflict_at, last_synced
-		 FROM active_bindings ORDER BY game_id`)
+		`SELECT sync_id, primary_node, started_at, direction, conflict_at, last_synced
+		 FROM active_bindings ORDER BY sync_id`)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -415,16 +429,12 @@ func (s *Store) ListBindings(ctx context.Context) ([]store.ActiveBinding, error)
 }
 
 func (s *Store) UpdateBinding(ctx context.Context, b store.ActiveBinding) error {
-	peerScope := b.PeerScope
-	if peerScope == "" {
-		peerScope = "all-configured"
-	}
 	tag, err := s.db.Exec(ctx,
 		`UPDATE active_bindings
-		 SET primary_node = $2, direction = $3, peer_scope = $4,
-		     conflict_at = $5, last_synced = $6
-		 WHERE game_id = $1`,
-		b.GameID, b.PrimaryNode, b.Direction, peerScope, b.ConflictAt, b.LastSynced)
+		 SET primary_node = $2, direction = $3,
+		     conflict_at = $4, last_synced = $5
+		 WHERE sync_id = $1`,
+		b.SyncID, b.PrimaryNode, b.Direction, b.ConflictAt, b.LastSynced)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -434,17 +444,17 @@ func (s *Store) UpdateBinding(ctx context.Context, b store.ActiveBinding) error 
 	return nil
 }
 
-func (s *Store) DeleteBinding(ctx context.Context, gameID string) error {
+func (s *Store) DeleteBinding(ctx context.Context, syncID string) error {
 	// Idempotent: an absent binding is not an error (api.md "deactivate is
 	// idempotent"), so we ignore RowsAffected.
-	_, err := s.db.Exec(ctx, `DELETE FROM active_bindings WHERE game_id = $1`, gameID)
+	_, err := s.db.Exec(ctx, `DELETE FROM active_bindings WHERE sync_id = $1`, syncID)
 	return mapErr(err)
 }
 
 func scanBinding(r rowScanner) (store.ActiveBinding, error) {
 	var b store.ActiveBinding
-	if err := r.Scan(&b.GameID, &b.PrimaryNode, &b.StartedAt, &b.Direction,
-		&b.PeerScope, &b.ConflictAt, &b.LastSynced); err != nil {
+	if err := r.Scan(&b.SyncID, &b.PrimaryNode, &b.StartedAt, &b.Direction,
+		&b.ConflictAt, &b.LastSynced); err != nil {
 		return store.ActiveBinding{}, err
 	}
 	return b, nil
@@ -459,14 +469,14 @@ func (s *Store) AppendLog(ctx context.Context, e store.LogEntry) error {
 	}
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO sync_log
-		   (ts, game_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message)
+		   (ts, sync_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message)
 		 VALUES (COALESCE($1, now()), $2, $3, $4, $5, $6, $7, $8, $9)`,
-		ts, e.GameID, nullIfEmpty(e.FromNode), nullIfEmpty(e.ToNode),
+		ts, e.SyncID, nullIfEmpty(e.FromNode), nullIfEmpty(e.ToNode),
 		e.Bytes, e.SrcMtime, e.DstMtime, string(e.Outcome), e.Message)
 	return mapErr(err)
 }
 
-func (s *Store) ListLogByGame(ctx context.Context, gameID string, limit int) ([]store.LogEntry, error) {
+func (s *Store) ListLogBySync(ctx context.Context, syncID string, limit int) ([]store.LogEntry, error) {
 	// Most-recent-first. id (bigserial) breaks ts ties deterministically.
 	// limit <= 0 means no cap; NULL disables the LIMIT clause.
 	var lim any
@@ -474,10 +484,10 @@ func (s *Store) ListLogByGame(ctx context.Context, gameID string, limit int) ([]
 		lim = limit
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT id, ts, game_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message
-		 FROM sync_log WHERE game_id = $1
+		`SELECT id, ts, sync_id, from_node, to_node, bytes, src_mtime, dst_mtime, outcome, message
+		 FROM sync_log WHERE sync_id = $1
 		 ORDER BY ts DESC, id DESC
-		 LIMIT $2`, gameID, lim)
+		 LIMIT $2`, syncID, lim)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -489,7 +499,7 @@ func (s *Store) ListLogByGame(ctx context.Context, gameID string, limit int) ([]
 			from, to *string
 			outcome  string
 		)
-		if err := rows.Scan(&e.ID, &e.TS, &e.GameID, &from, &to, &e.Bytes,
+		if err := rows.Scan(&e.ID, &e.TS, &e.SyncID, &from, &to, &e.Bytes,
 			&e.SrcMtime, &e.DstMtime, &outcome, &e.Message); err != nil {
 			return nil, mapErr(err)
 		}
@@ -518,19 +528,19 @@ func nullIfEmpty(s string) any {
 
 func (s *Store) SetManifest(ctx context.Context, m store.ManifestEntry) error {
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO manifest (game_id, node_id, mtime, size, sha256, last_checked)
+		`INSERT INTO manifest (sync_id, node_id, mtime, size, sha256, last_checked)
 		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (game_id, node_id) DO UPDATE SET
+		 ON CONFLICT (sync_id, node_id) DO UPDATE SET
 		   mtime = EXCLUDED.mtime, size = EXCLUDED.size,
 		   sha256 = EXCLUDED.sha256, last_checked = EXCLUDED.last_checked`,
-		m.GameID, m.NodeID, m.Mtime, m.Size, m.SHA256, m.LastChecked)
+		m.SyncID, m.NodeID, m.Mtime, m.Size, m.SHA256, m.LastChecked)
 	return mapErr(err)
 }
 
-func (s *Store) GetManifest(ctx context.Context, gameID, nodeID string) (store.ManifestEntry, error) {
+func (s *Store) GetManifest(ctx context.Context, syncID, nodeID string) (store.ManifestEntry, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT game_id, node_id, mtime, size, sha256, last_checked
-		 FROM manifest WHERE game_id = $1 AND node_id = $2`, gameID, nodeID)
+		`SELECT sync_id, node_id, mtime, size, sha256, last_checked
+		 FROM manifest WHERE sync_id = $1 AND node_id = $2`, syncID, nodeID)
 	m, err := scanManifest(row)
 	if err != nil {
 		return store.ManifestEntry{}, mapErr(err)
@@ -538,10 +548,10 @@ func (s *Store) GetManifest(ctx context.Context, gameID, nodeID string) (store.M
 	return m, nil
 }
 
-func (s *Store) ListManifestByGame(ctx context.Context, gameID string) ([]store.ManifestEntry, error) {
+func (s *Store) ListManifestBySync(ctx context.Context, syncID string) ([]store.ManifestEntry, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT game_id, node_id, mtime, size, sha256, last_checked
-		 FROM manifest WHERE game_id = $1 ORDER BY node_id`, gameID)
+		`SELECT sync_id, node_id, mtime, size, sha256, last_checked
+		 FROM manifest WHERE sync_id = $1 ORDER BY node_id`, syncID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -559,7 +569,7 @@ func (s *Store) ListManifestByGame(ctx context.Context, gameID string) ([]store.
 
 func scanManifest(r rowScanner) (store.ManifestEntry, error) {
 	var m store.ManifestEntry
-	if err := r.Scan(&m.GameID, &m.NodeID, &m.Mtime, &m.Size, &m.SHA256, &m.LastChecked); err != nil {
+	if err := r.Scan(&m.SyncID, &m.NodeID, &m.Mtime, &m.Size, &m.SHA256, &m.LastChecked); err != nil {
 		return store.ManifestEntry{}, err
 	}
 	return m, nil
@@ -567,9 +577,9 @@ func scanManifest(r rowScanner) (store.ManifestEntry, error) {
 
 // ---- Syncs ----
 //
-// TODO(slice-sync-cutover): syncs/sync_members are the additive foundation of
-// the data-model redesign. The engine, runtime tables, and web still key off
-// game_id; later slices move them onto sync_id.
+// syncs/sync_members are the unit of mirroring. The runtime tables
+// (active_bindings, manifest, sync_log) key off sync_id, REFERENCES syncs ON
+// DELETE CASCADE — so DeleteSync tears down a sync's binding/manifest/log too.
 
 func (s *Store) CreateSync(ctx context.Context, sy store.Sync) error {
 	// A missing game (FK) -> 23503 -> ErrInvalidReference; a duplicate id (PK) ->
