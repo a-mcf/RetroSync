@@ -181,6 +181,54 @@ fork when two devices coincidentally reach the *same* bytes; the hash makes both
 calls accurate without weakening any data-loss guarantee — a distinct-hash changer
 is never silently overwritten.)
 
+### `save_blobs` + `save_versions` (the recovery net — slice 20)
+
+Before RetroSync overwrites **any** member's save — during a normal propagation
+*or* a conflict resolution — it snapshots the about-to-be-overwritten bytes into a
+server-side, content-addressed version store, so a bad propagation/resolve is
+always recoverable. This **replaces** the old device-side
+`.retrosync-conflict-<ts>` sibling backups (which cluttered device directories and
+replicated via Syncthing) with a clean central store. Restore picks a version → it
+becomes the authoritative save and propagates to every member.
+
+`save_blobs` — the content-addressed blob store. Identical content is stored once
+(dedup by the `hash` PK). Saves are tiny, so `bytea` in Postgres is fine.
+
+| field | type   | notes                                          |
+|-------|--------|------------------------------------------------|
+| hash  | text   | PK — lowercase-hex sha256 of `data`            |
+| data  | bytea  | the raw save bytes                             |
+| size  | bigint | byte length of `data`                          |
+
+`save_versions` — the per-member capture index.
+
+| field       | type        | notes                                                              |
+|-------------|-------------|--------------------------------------------------------------------|
+| seq         | bigserial   | PK — the **monotonic retention key** (see below)                   |
+| sync_id     | text        | FK → syncs, `ON DELETE CASCADE`                                     |
+| node_id     | text        | FK → nodes, `ON DELETE CASCADE`                                     |
+| hash        | text        | FK → save_blobs                                                     |
+| captured_at | timestamptz | **display-only** ("ago" in the UI); never used for ordering        |
+| reason      | text        | why captured: `propagate`, `conflict-resolve`, `restore`           |
+
+Index `(sync_id, node_id, seq DESC)` backs both newest-first listing and pruning.
+
+**Retention is count-based** (default **10**, a const), per `(sync_id, node_id)`,
+ordered by the monotonic **`seq`** — **not** `captured_at`. Ordering by `seq`
+rather than a timestamp is deliberate: a device with a bad/RTC-less clock must
+never be able to misorder or evict a good snapshot. On every capture the store:
+
+1. **upserts the blob by hash** (dedup — identical content is stored once);
+2. **appends a `save_versions` row** *unless* the most recent version for this
+   `(sync, node)` already has this exact hash (no churn on a no-op/identical
+   re-save);
+3. **prunes** to the newest 10 versions per `(sync, node)` by `seq DESC`; and
+4. **garbage-collects** any `save_blobs` row no surviving version references.
+
+Cascade: deleting a sync or node removes its versions (FK `ON DELETE CASCADE`),
+and the now-orphaned blobs are GC'd. Both store implementations (memory + Postgres)
+mirror this retention/dedup/GC behavior and run the same conformance suite.
+
 ## Storage choice
 
 - **Postgres** is the store, running as **CNPG** (CloudNativePG) in production. It gives us the `UNIQUE (node_id, path)` invariant on `sync_members`, JSONB for `reach_config`, `ON DELETE CASCADE` for `syncs` / `sync_members` / `manifest` / `sync_log`, and a managed/HA operator in k8s.

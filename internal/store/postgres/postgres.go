@@ -24,11 +24,21 @@ const (
 	pgCheckViolation      = "23514"
 )
 
-// querier is the subset of pgx used by Store; satisfied by *pgxpool.Pool.
+// querier is the subset of pgx used by Store; satisfied by both *pgxpool.Pool
+// and pgx.Tx, so a statement can run either directly on the pool or inside a
+// transaction.
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// txBeginner is the subset of *pgxpool.Pool that opens a transaction. The pool
+// satisfies it; PutSaveVersion type-asserts s.db to it so its multi-statement
+// blob/version/prune/GC sequence runs atomically. (A non-pool querier — e.g. a
+// test double — without Begin falls back to running the statements directly.)
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // Store is a Postgres-backed store.Store.
@@ -204,7 +214,8 @@ func (s *Store) DeleteNode(ctx context.Context, id string) error {
 	if tag.RowsAffected() == 0 {
 		return store.ErrNotFound
 	}
-	return nil
+	// save_versions cascades on node delete (FK), which can orphan blobs.
+	return s.gcBlobs(ctx)
 }
 
 // rowScanner abstracts pgx.Row and pgx.Rows for scanNode.
@@ -311,7 +322,8 @@ func (s *Store) DeleteGame(ctx context.Context, id string) error {
 	if tag.RowsAffected() == 0 {
 		return store.ErrNotFound
 	}
-	return nil
+	// A game delete cascades through syncs -> save_versions, which can orphan blobs.
+	return s.gcBlobs(ctx)
 }
 
 // ---- SyncLog ----
@@ -543,7 +555,8 @@ func (s *Store) DeleteSync(ctx context.Context, id string) error {
 	if tag.RowsAffected() == 0 {
 		return store.ErrNotFound
 	}
-	return nil
+	// save_versions cascades on sync delete (FK), which can orphan blobs.
+	return s.gcBlobs(ctx)
 }
 
 // ---- SyncMembers ----
@@ -612,4 +625,158 @@ func (s *Store) DeleteSyncMember(ctx context.Context, syncID, nodeID string) err
 		return store.ErrNotFound
 	}
 	return nil
+}
+
+// ---- SaveVersions ----
+//
+// The recovery net: save_blobs is content-addressed (hash PK, dedup), and
+// save_versions indexes captures per (sync_id, node_id), ordered by the
+// monotonic seq bigserial. Retention is enforced on every PutSaveVersion (keep
+// the newest store.SaveVersionRetention by seq DESC per (sync,node)), followed by
+// orphan-blob GC. save_versions cascades on sync/node delete via FKs; gcBlobs
+// then sweeps any blob left unreferenced.
+
+func (s *Store) PutSaveVersion(ctx context.Context, syncID, nodeID, hash string, data []byte, reason string) error {
+	// Validate the FK targets up front so a missing sync/node surfaces as
+	// ErrInvalidReference (mirroring the memory store), independent of whether the
+	// blob already exists.
+	var syncOK, nodeOK bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM syncs WHERE id = $1),
+		        EXISTS (SELECT 1 FROM nodes WHERE id = $2)`, syncID, nodeID,
+	).Scan(&syncOK, &nodeOK); err != nil {
+		return mapErr(err)
+	}
+	if !syncOK || !nodeOK {
+		return store.ErrInvalidReference
+	}
+
+	// Dedup detail: if the most recent version for this (sync,node) already has
+	// this exact hash, do NOT add a duplicate (no churn on identical re-saves).
+	var lastHash string
+	err := s.db.QueryRow(ctx,
+		`SELECT hash FROM save_versions
+		 WHERE sync_id = $1 AND node_id = $2
+		 ORDER BY seq DESC LIMIT 1`, syncID, nodeID).Scan(&lastHash)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return mapErr(err)
+	}
+	if err == nil && lastHash == hash {
+		return nil
+	}
+
+	// The blob-upsert / version-insert / prune / GC are a single logical mutation:
+	// run them in ONE transaction so a mid-sequence failure or a concurrent caller
+	// can't leave the table in a partial state (e.g. > retention rows, or a GC that
+	// raced an interleaved insert). If the pool can't begin a tx (a non-pool test
+	// double), fall back to running them directly on s.db.
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return s.putSaveVersionStmts(ctx, s.db, syncID, nodeID, hash, data, reason)
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) // no-op after a successful Commit
+	if err := s.putSaveVersionStmts(ctx, tx, syncID, nodeID, hash, data, reason); err != nil {
+		return err
+	}
+	return mapErr(tx.Commit(ctx))
+}
+
+// putSaveVersionStmts runs the four mutating statements of a save-version put
+// (blob upsert, version insert, prune-to-retention, orphan-blob GC) on q, which
+// is either the pool or a transaction. PutSaveVersion runs it inside a tx for
+// atomicity; the per-statement order is unchanged.
+func (s *Store) putSaveVersionStmts(ctx context.Context, q querier, syncID, nodeID, hash string, data []byte, reason string) error {
+	// Upsert the blob by hash (content-addressed dedup — identical content stored
+	// once; ON CONFLICT keeps the existing bytes).
+	if _, err := q.Exec(ctx,
+		`INSERT INTO save_blobs (hash, data, size) VALUES ($1, $2, $3)
+		 ON CONFLICT (hash) DO NOTHING`, hash, data, int64(len(data))); err != nil {
+		return mapErr(err)
+	}
+
+	// Append the version row (seq is assigned by the bigserial).
+	if _, err := q.Exec(ctx,
+		`INSERT INTO save_versions (sync_id, node_id, hash, reason)
+		 VALUES ($1, $2, $3, $4)`, syncID, nodeID, hash, reason); err != nil {
+		return mapErr(err)
+	}
+
+	// Prune to the newest store.SaveVersionRetention per (sync,node) by seq DESC.
+	if _, err := q.Exec(ctx,
+		`DELETE FROM save_versions
+		 WHERE sync_id = $1 AND node_id = $2
+		   AND seq NOT IN (
+		     SELECT seq FROM save_versions
+		     WHERE sync_id = $1 AND node_id = $2
+		     ORDER BY seq DESC LIMIT $3)`,
+		syncID, nodeID, store.SaveVersionRetention); err != nil {
+		return mapErr(err)
+	}
+
+	// GC any blob no surviving version references.
+	return s.gcBlobsWith(ctx, q)
+}
+
+// gcBlobs deletes save_blobs rows that no save_versions row references (orphan
+// blob GC). Called after the cascade deletes that can orphan a blob
+// (sync/node/game delete); PutSaveVersion's prune uses gcBlobsWith inside its tx.
+func (s *Store) gcBlobs(ctx context.Context) error {
+	return s.gcBlobsWith(ctx, s.db)
+}
+
+// gcBlobsWith runs the orphan-blob GC on q (the pool or a transaction).
+func (s *Store) gcBlobsWith(ctx context.Context, q querier) error {
+	_, err := q.Exec(ctx,
+		`DELETE FROM save_blobs b
+		 WHERE NOT EXISTS (SELECT 1 FROM save_versions v WHERE v.hash = b.hash)`)
+	return mapErr(err)
+}
+
+func (s *Store) ListSaveVersions(ctx context.Context, syncID, nodeID string, limit int) ([]store.SaveVersion, error) {
+	var lim any
+	if limit > 0 {
+		lim = limit
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT v.seq, v.sync_id, v.node_id, v.hash, v.captured_at, b.size, v.reason
+		 FROM save_versions v JOIN save_blobs b ON b.hash = v.hash
+		 WHERE v.sync_id = $1 AND v.node_id = $2
+		 ORDER BY v.seq DESC
+		 LIMIT $3`, syncID, nodeID, lim)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := make([]store.SaveVersion, 0)
+	for rows.Next() {
+		var v store.SaveVersion
+		if err := rows.Scan(&v.Seq, &v.SyncID, &v.NodeID, &v.Hash, &v.CapturedAt, &v.Size, &v.Reason); err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, v)
+	}
+	return out, mapErr(rows.Err())
+}
+
+func (s *Store) GetSaveVersionData(ctx context.Context, syncID string, seq int64) (store.SaveVersion, []byte, error) {
+	var (
+		v    store.SaveVersion
+		data []byte
+	)
+	// Bind the lookup to (sync_id, seq): a seq that belongs to a DIFFERENT sync
+	// returns no rows -> ErrNotFound, so a guessed cross-sync seq can never be
+	// loaded (the store-enforced authz floor for restore).
+	err := s.db.QueryRow(ctx,
+		`SELECT v.seq, v.sync_id, v.node_id, v.hash, v.captured_at, b.size, v.reason, b.data
+		 FROM save_versions v JOIN save_blobs b ON b.hash = v.hash
+		 WHERE v.seq = $1 AND v.sync_id = $2`, seq, syncID,
+	).Scan(&v.Seq, &v.SyncID, &v.NodeID, &v.Hash, &v.CapturedAt, &v.Size, &v.Reason, &data)
+	if err != nil {
+		return store.SaveVersion{}, nil, mapErr(err)
+	}
+	return v, data, nil
 }

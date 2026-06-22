@@ -16,15 +16,37 @@ box at top. Each card:
 - Game title and system, sync name
 - One line per member node: `<node>: <mtime>` (or "no save yet"); the user's own
   nodes are marked "(yours)"
+- A **History** link (opens the sync's save-history page)
 - The sync's **state**:
   - in sync → `in sync` badge + "last synced `<time ago>`"
   - conflicted → a red **Sync paused** banner with a **Resolve conflict** button
     (opens the conflict modal)
 
-There are no Play buttons: a sync needs no human action to mirror. The only button
-is **Resolve conflict**, and only when the sync has forked.
+There are no Play buttons: a sync needs no human action to mirror. The only
+state-changing buttons are **Resolve conflict** (when the sync has forked) and
+**Restore** (on the history page).
 
 **Nodes** — per-node reachability status (reachable / not seen, last-seen time).
+
+### `/syncs/{id}/history` — save history (the recovery net)
+
+Every sync card links here. The page lists each member node and its captured save
+versions, newest-first — each row shows when it was captured ("`<time ago>`"), why
+(`propagate` / `conflict-resolve` / `restore`), and its size, with a **Restore**
+button. Restore makes that snapshot the current save everywhere (a one-click undo
+for a bad sync). RetroSync captures a snapshot of a member's bytes **before** it
+overwrites them (normal propagation or conflict resolve), keeping the newest 10
+per member. Viewable by any authenticated user; **Restore** is gated on
+owner-of-a-member-node-or-admin + CSRF. This central store replaces the old
+device-side `.retrosync-conflict-<ts>` sibling backups.
+
+```
+  Save history — Super Metroid — Bob's stream
+  ─────────────────────────────────────────────────
+  bob-deck
+    4 minutes ago · conflict-resolve · 65 KB   [Restore]
+    2 hours ago   · propagate        · 64 KB   [Restore]
+```
 
 ### Conflict modal
 

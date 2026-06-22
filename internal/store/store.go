@@ -203,6 +203,38 @@ type Sync struct {
 	LastSynced *time.Time
 }
 
+// SaveVersionRetention is the count-based retention cap: the newest N save
+// versions are kept per (sync_id, node_id), ordered by the monotonic seq (NOT a
+// timestamp — a bad clock must never be able to misorder/evict). Older versions
+// are pruned on each PutSaveVersion, and any blob no surviving version
+// references is garbage-collected.
+const SaveVersionRetention = 10
+
+// SaveVersion is one captured pre-overwrite snapshot of a member's save, indexed
+// in save_versions and pointing at a content-addressed save_blobs row. It is the
+// recovery net: before RetroSync overwrites any member's save (propagation or
+// conflict resolve) it snapshots the about-to-be-overwritten bytes here, so a
+// bad propagation/resolve is always recoverable.
+type SaveVersion struct {
+	// Seq is the monotonic retention key (bigserial), assigned by the store. It
+	// orders versions for retention and newest-first listing; a bad clock can
+	// never misorder it.
+	Seq int64
+	// SyncID / NodeID identify the member this snapshot was captured from.
+	SyncID string
+	NodeID string
+	// Hash is the lowercase-hex sha256 of the captured bytes (the save_blobs PK).
+	Hash string
+	// CapturedAt is display-only ("ago" in the history UI); it is NEVER used for
+	// ordering or retention.
+	CapturedAt time.Time
+	// Size is the captured blob's size in bytes (carried from save_blobs).
+	Size int64
+	// Reason is a short tag for why the snapshot was taken, e.g. "propagate" or
+	// "conflict-resolve".
+	Reason string
+}
+
 // SyncMember is one (node, file) member of a Sync. The store enforces two
 // uniqueness rules: PK (SyncID, NodeID) — a node appears at most once per sync —
 // and a global UNIQUE (NodeID, Path): a given (device, file) lives in at most
@@ -304,4 +336,31 @@ type Store interface {
 	ListSyncMembers(ctx context.Context, syncID string) ([]SyncMember, error)
 	ListSyncMembersByNode(ctx context.Context, nodeID string) ([]SyncMember, error)
 	DeleteSyncMember(ctx context.Context, syncID, nodeID string) error
+
+	// SaveVersions — the server-side, content-addressed recovery net. Before any
+	// overwrite of a member's save, the engine captures the about-to-be-overwritten
+	// bytes here, so a bad propagation/resolve is always recoverable.
+
+	// PutSaveVersion captures data as a new version for (syncID, nodeID) with the
+	// given content hash (lowercase-hex sha256) and reason. It:
+	//   1. upserts the blob by hash (dedup — identical content is stored once);
+	//   2. appends a save_versions row (assigning a monotonic seq) UNLESS the most
+	//      recent version for this (sync,node) already has this exact hash, in which
+	//      case it is a no-op (no churn on identical re-saves);
+	//   3. prunes to keep only the newest SaveVersionRetention versions per
+	//      (sync,node) ordered by seq DESC, deleting older rows;
+	//   4. garbage-collects any save_blobs row no save_versions row references.
+	// Missing sync/node -> ErrInvalidReference.
+	PutSaveVersion(ctx context.Context, syncID, nodeID, hash string, data []byte, reason string) error
+	// ListSaveVersions returns the versions for (syncID, nodeID) newest-first by
+	// seq, metadata only (no bytes). Capped at limit (limit <= 0 means no cap).
+	ListSaveVersions(ctx context.Context, syncID, nodeID string, limit int) ([]SaveVersion, error)
+	// GetSaveVersionData returns a version and its blob bytes, for restore. The
+	// seq MUST belong to syncID: the lookup is bound to (sync_id, seq) so a seq
+	// owned by a DIFFERENT sync is ErrNotFound, not someone else's data. This
+	// store-enforced binding is the authz floor for restore — the web layer
+	// authorizes the caller against a sync's members, then passes that same
+	// syncID here, so a guessed cross-sync seq can never be loaded (and thus never
+	// restored). A seq that no longer exists (e.g. pruned) -> ErrNotFound.
+	GetSaveVersionData(ctx context.Context, syncID string, seq int64) (SaveVersion, []byte, error)
 }

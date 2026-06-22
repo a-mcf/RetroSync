@@ -31,6 +31,20 @@ type Store struct {
 	syncs map[string]store.Sync
 	// syncMembers keyed by (sync_id, node_id) — the PK.
 	syncMembers map[smKey]store.SyncMember
+
+	// saveBlobs is the content-addressed blob store, keyed by content hash (the
+	// save_blobs PK). Identical content is stored once.
+	saveBlobs map[string]blobRec
+	// saveVersions is the save_versions index, ordered by Seq (append order ==
+	// seq order since seq is monotonic). nextVersionSeq assigns the bigserial.
+	saveVersions   []store.SaveVersion
+	nextVersionSeq int64
+}
+
+// blobRec is one content-addressed blob: its bytes and size.
+type blobRec struct {
+	data []byte
+	size int64
 }
 
 type smKey struct {
@@ -48,6 +62,9 @@ func New() *Store {
 		nextLogID:   1,
 		syncs:       make(map[string]store.Sync),
 		syncMembers: make(map[smKey]store.SyncMember),
+
+		saveBlobs:      make(map[string]blobRec),
+		nextVersionSeq: 1,
 	}
 }
 
@@ -201,6 +218,16 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 			delete(s.syncMembers, k)
 		}
 	}
+	// Cascade: save_versions.node_id REFERENCES nodes ON DELETE CASCADE, then GC
+	// any blob left orphaned.
+	keptV := s.saveVersions[:0]
+	for _, v := range s.saveVersions {
+		if v.NodeID != id {
+			keptV = append(keptV, v)
+		}
+	}
+	s.saveVersions = keptV
+	s.gcBlobsLocked()
 	// sync_log.from_node/to_node are unconstrained text by design, so node
 	// deletion neither cascades nor blocks on the log.
 	return nil
@@ -313,6 +340,29 @@ func (s *Store) deleteSyncCascade(syncID string) {
 		}
 	}
 	s.log = kept
+	// save_versions.sync_id REFERENCES syncs ON DELETE CASCADE.
+	keptV := s.saveVersions[:0]
+	for _, v := range s.saveVersions {
+		if v.SyncID != syncID {
+			keptV = append(keptV, v)
+		}
+	}
+	s.saveVersions = keptV
+	s.gcBlobsLocked()
+}
+
+// gcBlobsLocked deletes any save_blobs entry no surviving save_versions row
+// references (orphan blob GC). The caller must hold s.mu.
+func (s *Store) gcBlobsLocked() {
+	used := make(map[string]bool, len(s.saveVersions))
+	for _, v := range s.saveVersions {
+		used[v.Hash] = true
+	}
+	for h := range s.saveBlobs {
+		if !used[h] {
+			delete(s.saveBlobs, h)
+		}
+	}
 }
 
 // ---- SyncLog ----
@@ -581,6 +631,128 @@ func (s *Store) DeleteSyncMember(_ context.Context, syncID, nodeID string) error
 	}
 	delete(s.syncMembers, k)
 	return nil
+}
+
+// ---- SaveVersions ----
+
+func (s *Store) PutSaveVersion(_ context.Context, syncID, nodeID, hash string, data []byte, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.syncs[syncID]; !ok {
+		return store.ErrInvalidReference
+	}
+	if _, ok := s.nodes[nodeID]; !ok {
+		return store.ErrInvalidReference
+	}
+
+	// Dedup detail: if the most recent version for this (sync,node) already has
+	// this exact hash, do NOT add a duplicate (no churn on no-op/identical
+	// re-saves). Scan back-to-front since seq order == append order.
+	for i := len(s.saveVersions) - 1; i >= 0; i-- {
+		v := s.saveVersions[i]
+		if v.SyncID == syncID && v.NodeID == nodeID {
+			if v.Hash == hash {
+				return nil
+			}
+			break
+		}
+	}
+
+	// Upsert the blob by hash (content-addressed dedup — identical content stored
+	// once). The size is derived from the bytes.
+	if _, ok := s.saveBlobs[hash]; !ok {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		s.saveBlobs[hash] = blobRec{data: cp, size: int64(len(cp))}
+	}
+
+	// Append the version row, assigning the monotonic seq.
+	s.saveVersions = append(s.saveVersions, store.SaveVersion{
+		Seq:        s.nextVersionSeq,
+		SyncID:     syncID,
+		NodeID:     nodeID,
+		Hash:       hash,
+		CapturedAt: time.Now().UTC(),
+		Size:       s.saveBlobs[hash].size,
+		Reason:     reason,
+	})
+	s.nextVersionSeq++
+
+	// Prune to the newest SaveVersionRetention per (sync,node) ordered by seq DESC.
+	s.pruneVersionsLocked(syncID, nodeID)
+	// GC any blob no surviving version references.
+	s.gcBlobsLocked()
+	return nil
+}
+
+// pruneVersionsLocked keeps only the newest store.SaveVersionRetention versions
+// for (syncID, nodeID) ordered by seq DESC, deleting older rows. The caller must
+// hold s.mu. saveVersions is maintained in seq order (== append order), so the
+// surviving versions for this key are simply its last N entries.
+func (s *Store) pruneVersionsLocked(syncID, nodeID string) {
+	// Collect the seqs for this key in ascending order, then mark the oldest
+	// (everything before the last N) for deletion.
+	var seqs []int64
+	for _, v := range s.saveVersions {
+		if v.SyncID == syncID && v.NodeID == nodeID {
+			seqs = append(seqs, v.Seq)
+		}
+	}
+	if len(seqs) <= store.SaveVersionRetention {
+		return
+	}
+	drop := make(map[int64]bool, len(seqs)-store.SaveVersionRetention)
+	for _, sq := range seqs[:len(seqs)-store.SaveVersionRetention] {
+		drop[sq] = true
+	}
+	kept := s.saveVersions[:0]
+	for _, v := range s.saveVersions {
+		if !drop[v.Seq] {
+			kept = append(kept, v)
+		}
+	}
+	s.saveVersions = kept
+}
+
+func (s *Store) ListSaveVersions(_ context.Context, syncID, nodeID string, limit int) ([]store.SaveVersion, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// Newest-first by seq. saveVersions is in ascending seq order, so walk it
+	// backwards.
+	out := make([]store.SaveVersion, 0)
+	for i := len(s.saveVersions) - 1; i >= 0; i-- {
+		v := s.saveVersions[i]
+		if v.SyncID != syncID || v.NodeID != nodeID {
+			continue
+		}
+		out = append(out, v)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) GetSaveVersionData(_ context.Context, syncID string, seq int64) (store.SaveVersion, []byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, v := range s.saveVersions {
+		// Bind the lookup to (sync_id, seq): a seq that belongs to a DIFFERENT
+		// sync is not found, so a guessed cross-sync seq can never be loaded.
+		if v.Seq != seq || v.SyncID != syncID {
+			continue
+		}
+		b, ok := s.saveBlobs[v.Hash]
+		if !ok {
+			// Should not happen: a live version always has its blob (GC only removes
+			// orphan blobs). Treat a dangling reference as not-found.
+			return store.SaveVersion{}, nil, store.ErrNotFound
+		}
+		data := make([]byte, len(b.data))
+		copy(data, b.data)
+		return v, data, nil
+	}
+	return store.SaveVersion{}, nil, store.ErrNotFound
 }
 
 // cloneSync deep-copies the sync's pointer runtime fields (conflict_at,

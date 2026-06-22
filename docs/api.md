@@ -57,10 +57,12 @@ the engine via the narrow `Actioner` interface; member-owner/admin-gated.
 
 ### `POST /api/syncs/{id}/resolve-conflict`
 
-Form field: `winner_node_id`. Backs up every other member's current file to a
-sibling `<path>.retrosync-conflict-<ts>` (nanosecond timestamp), then fans the
-winner out, marks the sync synced, and clears the conflict. The single most
-destructive action; auth is checked **first**:
+Form field: `winner_node_id`. **Captures** every other member's current bytes to
+the server-side save-version store (the recovery net — see `/syncs/{id}/history`),
+then fans the winner out, marks the sync synced, and clears the conflict. The
+capture is a hard gate before each overwrite (a capture failure aborts that write
+and leaves the sync re-resolvable). The single most destructive action; auth is
+checked **first**:
 
 - Unknown sync → `409` ("no such sync to resolve" — does not leak existence).
 - Caller owns no member node (and is not admin) → `403`. Empty `winner_node_id`
@@ -74,6 +76,26 @@ Read-only HTML fragment: the conflict modal, showing every member's live state
 (mtime, size, presence) so the human can pick a winner. Viewable by any
 authenticated user (not owner-gated — viewing is not mutating). Unknown sync →
 `404`.
+
+### `GET /syncs/{id}/history`
+
+Read-only HTML page: the **save history** for the sync — every member with its
+captured save versions (newest-first by `seq`: captured_at "ago", reason, size),
+each offering a **Restore** button. Viewable by any authenticated user (not
+owner-gated, like the conflict modal). Unknown sync → `404`.
+
+### `POST /api/syncs/{id}/versions/{seq}/restore`
+
+Makes the captured version `seq` authoritative again: writes its bytes back to its
+`(sync, node)` member and propagates to the rest of the sync (capture-before-
+overwrite on the others), clearing any conflict and marking synced. Destructive;
+auth is checked **first** with the same rule as resolve-conflict
+(member-owner-or-admin) + CSRF:
+
+- Unknown sync → `404`. Caller owns no member node (and is not admin) → `403`.
+  Non-numeric `seq` → `400`.
+- Engine `store.ErrNotFound` (version pruned/gone) → `410` Gone; captured member
+  no longer in the sync (`ErrNoPath`) → `409`. Success refreshes the dashboard.
 
 ## Registry — Nodes (admin-only)
 

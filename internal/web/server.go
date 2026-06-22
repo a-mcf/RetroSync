@@ -62,6 +62,15 @@ type Actioner interface {
 	// action in the system: the POST handler gates it on owner-of-a-member-node-
 	// or-admin AND CSRF before ever reaching here.
 	ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error
+	// RestoreVersion makes a previously-captured save version (identified by its
+	// monotonic seq, BOUND to syncID) the current authoritative content of its
+	// (sync, node) member and propagates it to the rest of the sync (the recovery
+	// net's undo). The POST handler gates it on owner-of-a-member-node-or-admin AND
+	// CSRF before ever reaching here, and passes the PATH syncID it authorized so a
+	// seq belonging to a DIFFERENT sync can never be restored (cross-sync restore
+	// is store-enforced -> store.ErrNotFound). A pruned/gone seq also returns
+	// store.ErrNotFound.
+	RestoreVersion(ctx context.Context, syncID string, seq int64) error
 	// NodeStates returns the live per-node state (mtime, size, presence) of every
 	// member of the sync, read-only, for the conflict modal to render so the human
 	// can pick a winner with full disclosure.
@@ -194,6 +203,15 @@ func (s *Server) Handler() http.Handler {
 	// the handler before touching the engine.
 	mux.Handle("GET /syncs/{id}/conflict", s.requireAuth(http.HandlerFunc(s.handleConflictModal)))
 	mux.Handle("POST /api/syncs/{id}/resolve-conflict", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleResolveConflict))))
+
+	// Save history + restore (slice-20: the recovery net). The history page lists
+	// the server-side captured save versions for a sync's members (read-only,
+	// viewable by any authenticated user, consistent with the conflict modal). The
+	// restore POST makes a chosen version authoritative again and propagates it —
+	// destructive, so it re-checks owner-of-a-member-node-or-admin AND CSRF, the
+	// same authority rule as resolve-conflict.
+	mux.Handle("GET /syncs/{id}/history", s.requireAuth(http.HandlerFunc(s.handleHistoryPage)))
+	mux.Handle("POST /api/syncs/{id}/versions/{seq}/restore", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleRestoreVersion))))
 
 	// Nodes registry (slice-10). Admin-only per docs/auth.md: every page and every
 	// mutation is wrapped in requireAdmin, so a non-admin never reaches the Store.
