@@ -39,7 +39,8 @@ Adding a new device kind is "register a new reach-config strategy," not "fork th
 
 Single Go (or Python) service. Owns:
 
-- The registry (games, nodes, syncs and their members — each member a node+path).
+- The registry (nodes, syncs and their members — each carrying a free-text game
+  label, each member a node+path).
 - The per-sync manifest (last-known mtime/size per member) and conflict state.
 - A poll loop that, for **every** sync, compares each member's live mtime/size
   against the manifest and acts on the changed set: 0 changed is a no-op, exactly
@@ -54,7 +55,7 @@ Single Go (or Python) service. Owns:
   conflicts. **Implemented** (`internal/web`), server-rendered fragments, no SPA.
 - The HTTP surface the UI is built on. **Implemented as HTMX/POST routes** (HTML
   forms can't issue PATCH/PUT/DELETE); a small read-only JSON surface
-  (`GET /api/{status,games,nodes}`) is the seed of a future agent-facing API. See
+  (`GET /api/{status,syncs,nodes}`) is the seed of a future agent-facing API. See
   api.md.
 
 Runs on the same host as the Syncthing server so it has local read access to per-device backup snapshots.
@@ -79,7 +80,7 @@ retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root pr
 ## Why two channels (recap)
 
 - **Backup** must be always-on and unidirectional (device → server). It must never push back to a device. If retrosync the service dies, backup keeps working.
-- **Play** is small, explicit, and bidirectional. Only the games you've bound are touched. Conflicts are surfaced, not auto-merged.
+- **Play** is small, explicit, and bidirectional. Only the syncs you've configured are touched. Conflicts are surfaced, not auto-merged.
 
 ## Deployment
 

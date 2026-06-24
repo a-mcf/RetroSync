@@ -10,7 +10,8 @@
 // resolving a conflict. It implements docs/state-machine.md.
 //
 // A *sync* is the unit of mirroring: a specific set of (node, save-file)
-// members that sync together (one game may have many independent syncs). The
+// members that sync together (its "game" is just a free-text display label the
+// engine ignores; many syncs may share one label). The
 // engine operates on a sync id and that sync's SyncMembers — each member's
 // node_id + path is the in-scope (node, file) pair. There is no peer-scope: a
 // sync's members ARE its scope. Per-sync runtime state (conflict_at,

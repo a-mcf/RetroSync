@@ -17,12 +17,12 @@ import (
 // with full disclosure (docs/state-machine.md "UI shows every node's current
 // state ... and a 'use this one' button per node").
 type conflictModalData struct {
-	SyncID      string
-	SyncName    string
-	GameDisplay string
-	System      string
-	Nodes       []conflictNode
-	CSRF        string
+	SyncID   string
+	SyncName string
+	// Game is the sync's free-text game label (a display grouping; "" when unset).
+	Game  string
+	Nodes []conflictNode
+	CSRF  string
 }
 
 // conflictNode is one in-scope node's live state in the conflict modal.
@@ -58,17 +58,6 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	g, err := s.store.GetGame(r.Context(), sy.GameID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			http.Error(w, "no such game", http.StatusNotFound)
-			return
-		}
-		s.logger.ErrorContext(r.Context(), "conflict modal: get game failed", "err", err.Error())
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	states, err := s.actioner.NodeStates(r.Context(), syncID)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "conflict modal: node states failed", "sync", syncID, "err", err.Error())
@@ -77,11 +66,10 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := conflictModalData{
-		SyncID:      sy.ID,
-		SyncName:    sy.Name,
-		GameDisplay: g.Display,
-		System:      g.System,
-		CSRF:        s.csrfFor(r),
+		SyncID:   sy.ID,
+		SyncName: sy.Name,
+		Game:     sy.Game,
+		CSRF:     s.csrfFor(r),
 	}
 	for _, st := range states {
 		cn := conflictNode{NodeID: st.NodeID, Present: st.Present}

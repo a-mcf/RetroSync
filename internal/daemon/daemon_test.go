@@ -113,7 +113,7 @@ func (p *blockingPoller) calls() []string {
 func syncs(ids ...string) []store.Sync {
 	out := make([]store.Sync, len(ids))
 	for i, id := range ids {
-		out[i] = store.Sync{ID: id, GameID: "g1"}
+		out[i] = store.Sync{ID: id, Game: "g1"}
 	}
 	return out
 }

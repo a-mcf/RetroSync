@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/store"
@@ -24,7 +25,7 @@ type statusResponse struct {
 
 type statusSync struct {
 	SyncID     string  `json:"sync_id"`
-	GameID     string  `json:"game_id"`
+	Game       string  `json:"game"`
 	Conflict   bool    `json:"conflict"`
 	ConflictAt *string `json:"conflict_at"`
 	LastSynced *string `json:"last_synced"`
@@ -53,7 +54,7 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	for _, sy := range syncs {
 		out.Syncs = append(out.Syncs, statusSync{
 			SyncID:     sy.ID,
-			GameID:     sy.GameID,
+			Game:       sy.Game,
 			Conflict:   sy.ConflictAt != nil,
 			ConflictAt: rfc3339Ptr(sy.ConflictAt),
 			LastSynced: rfc3339Ptr(sy.LastSynced),
@@ -69,20 +70,13 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	return out, nil
 }
 
-// gameResponse is one element of GET /api/games. With syncs now first-class,
-// each game lists its syncs (id, name, members with node + path + last-known
-// manifest mtime, and auto-mirror runtime state) — the registry view re-pointed
-// onto syncs (slice 16).
-type gameResponse struct {
-	ID      string         `json:"id"`
-	Display string         `json:"display"`
-	System  string         `json:"system"`
-	Syncs   []syncResponse `json:"syncs"`
-}
-
-// syncResponse is one sync of a game, with its auto-mirror runtime state.
+// syncResponse is one element of GET /api/syncs. The *sync* is the atomic entity
+// (there is no games table); each sync carries a free-text game label plus its
+// members (node + path + last-known manifest mtime) and auto-mirror runtime
+// state. The registry view re-pointed onto syncs (slice 21).
 type syncResponse struct {
 	ID      string             `json:"id"`
+	Game    string             `json:"game"`
 	Name    string             `json:"name"`
 	State   syncState          `json:"state"`
 	Members []syncMemberOutput `json:"members"`
@@ -104,49 +98,50 @@ type syncMemberOutput struct {
 	Mtime  *string `json:"mtime"`
 }
 
-func (s *Server) buildGames(ctx context.Context, f store.GameFilter) ([]gameResponse, error) {
-	games, err := s.store.ListGames(ctx, f)
+// buildSyncs returns every sync as a flat list (ordered by id, the store's
+// order), optionally filtered by a case-insensitive substring q over the game
+// label, sync name, and id. Each sync carries its free-text game label, members,
+// and runtime state.
+func (s *Server) buildSyncs(ctx context.Context, q string) ([]syncResponse, error) {
+	syncs, err := s.store.ListSyncs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list games: %w", err)
+		return nil, fmt.Errorf("list syncs: %w", err)
 	}
+	needle := strings.ToLower(q)
 
-	out := make([]gameResponse, 0, len(games))
-	for _, g := range games {
-		gr := gameResponse{ID: g.ID, Display: g.Display, System: g.System}
-
-		syncs, err := s.store.ListSyncsByGame(ctx, g.ID)
+	out := make([]syncResponse, 0, len(syncs))
+	for _, sy := range syncs {
+		if needle != "" &&
+			!strings.Contains(strings.ToLower(sy.Game), needle) &&
+			!strings.Contains(strings.ToLower(sy.Name), needle) &&
+			!strings.Contains(strings.ToLower(sy.ID), needle) {
+			continue
+		}
+		sr := syncResponse{
+			ID:   sy.ID,
+			Game: sy.Game,
+			Name: sy.Name,
+			State: syncState{
+				Conflict:   sy.ConflictAt != nil,
+				ConflictAt: rfc3339Ptr(sy.ConflictAt),
+				LastSynced: rfc3339Ptr(sy.LastSynced),
+			},
+		}
+		members, err := s.store.ListSyncMembers(ctx, sy.ID)
 		if err != nil {
-			return nil, fmt.Errorf("list syncs %s: %w", g.ID, err)
+			return nil, fmt.Errorf("list members %s: %w", sy.ID, err)
 		}
-		gr.Syncs = make([]syncResponse, 0, len(syncs))
-		for _, sy := range syncs {
-			sr := syncResponse{
-				ID:   sy.ID,
-				Name: sy.Name,
-				State: syncState{
-					Conflict:   sy.ConflictAt != nil,
-					ConflictAt: rfc3339Ptr(sy.ConflictAt),
-					LastSynced: rfc3339Ptr(sy.LastSynced),
-				},
+		sr.Members = make([]syncMemberOutput, 0, len(members))
+		for _, m := range members {
+			mo := syncMemberOutput{NodeID: m.NodeID, Path: m.Path}
+			if me, err := s.store.GetManifest(ctx, sy.ID, m.NodeID); err == nil {
+				mo.Mtime = rfc3339Ptr(me.Mtime)
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return nil, fmt.Errorf("get manifest %s/%s: %w", sy.ID, m.NodeID, err)
 			}
-
-			members, err := s.store.ListSyncMembers(ctx, sy.ID)
-			if err != nil {
-				return nil, fmt.Errorf("list members %s: %w", sy.ID, err)
-			}
-			sr.Members = make([]syncMemberOutput, 0, len(members))
-			for _, m := range members {
-				out := syncMemberOutput{NodeID: m.NodeID, Path: m.Path}
-				if me, err := s.store.GetManifest(ctx, sy.ID, m.NodeID); err == nil {
-					out.Mtime = rfc3339Ptr(me.Mtime)
-				} else if !errors.Is(err, store.ErrNotFound) {
-					return nil, fmt.Errorf("get manifest %s/%s: %w", sy.ID, m.NodeID, err)
-				}
-				sr.Members = append(sr.Members, out)
-			}
-			gr.Syncs = append(gr.Syncs, sr)
+			sr.Members = append(sr.Members, mo)
 		}
-		out = append(out, gr)
+		out = append(out, sr)
 	}
 	return out, nil
 }

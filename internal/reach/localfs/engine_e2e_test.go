@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	gameID = "super-metroid"
-	syncID = "sm-bob"
+	gameLabel = "Super Metroid"
+	syncID    = "sm-bob"
 )
 
 func steppingClock(start time.Time, step time.Duration) engine.Clock {
@@ -62,10 +62,7 @@ func TestEngineFanOut_RealLocalFS(t *testing.T) {
 	}
 
 	st := memory.New()
-	if err := st.CreateGame(ctx, store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.CreateSync(ctx, store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+	if err := st.CreateSync(ctx, store.Sync{ID: syncID, Game: gameLabel, Name: "Bob's stream"}); err != nil {
 		t.Fatal(err)
 	}
 	// Two syncthing-share nodes, each rooted at its own temp dir via reach_config.

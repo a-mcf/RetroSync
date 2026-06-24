@@ -36,8 +36,8 @@ func sha256Hex(b []byte) string {
 // --- test harness --------------------------------------------------------
 
 const (
-	gameID = "super-metroid"
-	syncID = "sm-bob"
+	gameLabel = "Super Metroid"
+	syncID    = "sm-bob"
 )
 
 // steppingClock returns a Clock that advances by a fixed step on each call, so
@@ -76,10 +76,7 @@ func newHarness(t *testing.T, clock engine.Clock) *harness {
 		return f, nil
 	}
 	h.engine = engine.New(h.store, resolve, clock)
-	if err := h.store.CreateGame(ctx(), store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.store.CreateSync(ctx(), store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+	if err := h.store.CreateSync(ctx(), store.Sync{ID: syncID, Game: gameLabel, Name: "Bob's stream"}); err != nil {
 		t.Fatal(err)
 	}
 	return h

@@ -133,10 +133,7 @@ func TestEngine_PollNoopAfterFanOut_PostgresLocalFS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.CreateGame(ctx, store.Game{ID: gameID, Display: "Super Metroid", System: "snes"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.CreateSync(ctx, store.Sync{ID: syncID, GameID: gameID, Name: "Bob's stream"}); err != nil {
+	if err := st.CreateSync(ctx, store.Sync{ID: syncID, Game: gameLabel, Name: "Bob's stream"}); err != nil {
 		t.Fatal(err)
 	}
 	mustPGNode(t, st, "primary", primaryRoot)

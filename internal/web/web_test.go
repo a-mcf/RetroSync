@@ -43,12 +43,10 @@ func newTestServer(t *testing.T) *Server {
 	}); err != nil {
 		t.Fatalf("create node: %v", err)
 	}
-	if err := st.CreateGame(ctx, store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes"}); err != nil {
-		t.Fatalf("create game: %v", err)
-	}
 	// The sync (the mirror + registry unit): member + manifest on bob-deck, and a
 	// last_synced timestamp (it has mirrored at least once) — but NOT conflicted.
-	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}); err != nil {
+	// "Super Metroid" is the sync's free-text game label (no games table).
+	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", Game: "Super Metroid", Name: "Bob's stream"}); err != nil {
 		t.Fatalf("create sync: %v", err)
 	}
 	if err := st.SetSyncMember(ctx, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "sm.srm"}); err != nil {
@@ -240,7 +238,7 @@ func TestAPIStatusShape(t *testing.T) {
 		t.Fatalf("syncs len = %d, want 1", len(got.Syncs))
 	}
 	a := got.Syncs[0]
-	if a.SyncID != "sm-bob" || a.GameID != "super-metroid" || a.Conflict {
+	if a.SyncID != "sm-bob" || a.Game != "Super Metroid" || a.Conflict {
 		t.Errorf("syncs[0] = %+v, unexpected", a)
 	}
 	if a.LastSynced == nil {
@@ -258,10 +256,10 @@ func TestAPIStatusShape(t *testing.T) {
 	}
 }
 
-func TestAPIGamesSyncsShape(t *testing.T) {
-	// /api/games lists each game's syncs (id, name, active-binding state, and
-	// members with node + path + last-known manifest mtime). The seeded fixture
-	// has game super-metroid -> sync sm-bob (active on bob-deck) with one member
+func TestAPISyncsShape(t *testing.T) {
+	// /api/syncs lists every sync as a flat list (id, free-text game label, name,
+	// auto-mirror state, and members with node + path + last-known manifest mtime).
+	// The seeded fixture has sync sm-bob (label "Super Metroid") with one member
 	// (bob-deck, mtime present). We add a second member with no manifest to assert
 	// mtime is present-or-null per member.
 	srv := newTestServer(t)
@@ -279,7 +277,7 @@ func TestAPIGamesSyncsShape(t *testing.T) {
 
 	h := srv.Handler()
 	c := login(t, h)
-	req := httptest.NewRequest(http.MethodGet, "/api/games", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/syncs", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -287,22 +285,15 @@ func TestAPIGamesSyncsShape(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 
-	var games []gameResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &games); err != nil {
+	var syncs []syncResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &syncs); err != nil {
 		t.Fatalf("decode: %v\nbody: %s", err, rec.Body.String())
 	}
-	if len(games) != 1 {
-		t.Fatalf("games len = %d, want 1", len(games))
+	if len(syncs) != 1 {
+		t.Fatalf("syncs len = %d, want 1", len(syncs))
 	}
-	g := games[0]
-	if g.ID != "super-metroid" || g.Display != "Super Metroid" {
-		t.Errorf("game = %+v, unexpected", g)
-	}
-	if len(g.Syncs) != 1 {
-		t.Fatalf("syncs len = %d, want 1", len(g.Syncs))
-	}
-	sy := g.Syncs[0]
-	if sy.ID != "sm-bob" || sy.Name != "Bob's stream" {
+	sy := syncs[0]
+	if sy.ID != "sm-bob" || sy.Game != "Super Metroid" || sy.Name != "Bob's stream" {
 		t.Errorf("sync = %+v, unexpected", sy)
 	}
 	if sy.State.Conflict || sy.State.ConflictAt != nil {
@@ -333,16 +324,12 @@ func TestAPIGamesSyncsShape(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode raw: %v", err)
 	}
-	for _, rg := range raw {
-		syncs, _ := rg["syncs"].([]any)
-		for _, sv := range syncs {
-			sm, _ := sv.(map[string]any)
-			members, _ := sm["members"].([]any)
-			for _, mv := range members {
-				m, _ := mv.(map[string]any)
-				if _, ok := m["mtime"]; !ok {
-					t.Fatalf("member object missing mtime key: %v", m)
-				}
+	for _, sm := range raw {
+		members, _ := sm["members"].([]any)
+		for _, mv := range members {
+			m, _ := mv.(map[string]any)
+			if _, ok := m["mtime"]; !ok {
+				t.Fatalf("member object missing mtime key: %v", m)
 			}
 		}
 	}

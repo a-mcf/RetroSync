@@ -65,7 +65,7 @@ func mapErr(err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case pgUniqueViolation:
-			// Duplicate id/PK or duplicate (game_id, node_id).
+			// Duplicate id/PK or duplicate (node_id, path) sync_member.
 			return fmt.Errorf("%w: %s", store.ErrConflict, pgErr.Code)
 		case pgForeignKeyViolation:
 			// A write referenced a parent row that does not exist.
@@ -241,91 +241,6 @@ func scanNode(r rowScanner) (store.Node, error) {
 	return n, nil
 }
 
-// ---- Games ----
-
-func (s *Store) CreateGame(ctx context.Context, g store.Game) error {
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO games (id, display, system, notes) VALUES ($1, $2, $3, $4)`,
-		g.ID, g.Display, g.System, g.Notes)
-	return mapErr(err)
-}
-
-func (s *Store) GetGame(ctx context.Context, id string) (store.Game, error) {
-	var g store.Game
-	err := s.db.QueryRow(ctx,
-		`SELECT id, display, system, notes FROM games WHERE id = $1`, id,
-	).Scan(&g.ID, &g.Display, &g.System, &g.Notes)
-	if err != nil {
-		return store.Game{}, mapErr(err)
-	}
-	return g, nil
-}
-
-func (s *Store) ListGames(ctx context.Context, f store.GameFilter) ([]store.Game, error) {
-	// $1 = system filter ('' means no filter); $2 = substring ('' means none).
-	rows, err := s.db.Query(ctx,
-		`SELECT id, display, system, notes FROM games
-		 WHERE ($1 = '' OR system = $1)
-		   AND ($2 = '' OR id ILIKE '%' || $2 || '%' OR display ILIKE '%' || $2 || '%')
-		 ORDER BY id`,
-		f.System, f.Q)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	defer rows.Close()
-	out := make([]store.Game, 0)
-	for rows.Next() {
-		var g store.Game
-		if err := rows.Scan(&g.ID, &g.Display, &g.System, &g.Notes); err != nil {
-			return nil, mapErr(err)
-		}
-		out = append(out, g)
-	}
-	return out, mapErr(rows.Err())
-}
-
-func (s *Store) UpdateGame(ctx context.Context, g store.Game) error {
-	tag, err := s.db.Exec(ctx,
-		`UPDATE games SET display = $2, system = $3, notes = $4 WHERE id = $1`,
-		g.ID, g.Display, g.System, g.Notes)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) DeleteGame(ctx context.Context, id string) error {
-	// Under auto-mirror every sync just mirrors; there is no "active session" to
-	// tear down. But a CONFLICTED sync is paused awaiting a human's resolution.
-	// A game delete CASCADEs through syncs, which would silently discard that
-	// unresolved fork — so we refuse if any of the game's syncs is conflicted
-	// (ErrConflict -> friendly 409 "resolve the conflict first"). This guard
-	// mirrors the memory store's; both impls agree.
-	var conflicted bool
-	if err := s.db.QueryRow(ctx,
-		`SELECT EXISTS (
-		   SELECT 1 FROM syncs sy
-		   WHERE sy.game_id = $1 AND sy.conflict_at IS NOT NULL)`, id,
-	).Scan(&conflicted); err != nil {
-		return mapErr(err)
-	}
-	if conflicted {
-		return store.ErrConflict
-	}
-	tag, err := s.db.Exec(ctx, `DELETE FROM games WHERE id = $1`, id)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	// A game delete cascades through syncs -> save_versions, which can orphan blobs.
-	return s.gcBlobs(ctx)
-}
-
 // ---- SyncLog ----
 
 func (s *Store) AppendLog(ctx context.Context, e store.LogEntry) error {
@@ -450,19 +365,19 @@ func scanManifest(r rowScanner) (store.ManifestEntry, error) {
 // tears down a sync's manifest/log too.
 
 func (s *Store) CreateSync(ctx context.Context, sy store.Sync) error {
-	// A missing game (FK) -> 23503 -> ErrInvalidReference; a duplicate id (PK) ->
-	// 23505 -> ErrConflict. Both are handled by mapErr. A freshly-created sync has
-	// no runtime state (conflict_at/last_synced default NULL), so we don't write
-	// those columns here.
+	// game is a free-text label (no FK), so the only constraint is the PK: a
+	// duplicate id (PK) -> 23505 -> ErrConflict, handled by mapErr. A
+	// freshly-created sync has no runtime state (conflict_at/last_synced default
+	// NULL), so we don't write those columns here.
 	_, err := s.db.Exec(ctx,
-		`INSERT INTO syncs (id, game_id, name) VALUES ($1, $2, $3)`,
-		sy.ID, sy.GameID, sy.Name)
+		`INSERT INTO syncs (id, game, name) VALUES ($1, $2, $3)`,
+		sy.ID, sy.Game, sy.Name)
 	return mapErr(err)
 }
 
 func (s *Store) GetSync(ctx context.Context, id string) (store.Sync, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT id, game_id, name, conflict_at, last_synced FROM syncs WHERE id = $1`, id)
+		`SELECT id, game, name, conflict_at, last_synced FROM syncs WHERE id = $1`, id)
 	sy, err := scanSync(row)
 	if err != nil {
 		return store.Sync{}, mapErr(err)
@@ -470,15 +385,9 @@ func (s *Store) GetSync(ctx context.Context, id string) (store.Sync, error) {
 	return sy, nil
 }
 
-func (s *Store) ListSyncsByGame(ctx context.Context, gameID string) ([]store.Sync, error) {
-	return s.querySyncs(ctx,
-		`SELECT id, game_id, name, conflict_at, last_synced
-		 FROM syncs WHERE game_id = $1 ORDER BY id`, gameID)
-}
-
 func (s *Store) ListSyncs(ctx context.Context) ([]store.Sync, error) {
 	return s.querySyncs(ctx,
-		`SELECT id, game_id, name, conflict_at, last_synced FROM syncs ORDER BY id`)
+		`SELECT id, game, name, conflict_at, last_synced FROM syncs ORDER BY id`)
 }
 
 func (s *Store) querySyncs(ctx context.Context, sql string, args ...any) ([]store.Sync, error) {
@@ -499,12 +408,12 @@ func (s *Store) querySyncs(ctx context.Context, sql string, args ...any) ([]stor
 }
 
 func (s *Store) UpdateSync(ctx context.Context, sy store.Sync) error {
-	// UpdateSync rewrites only the registry fields (game_id, name); the runtime
+	// UpdateSync rewrites only the registry fields (game label, name); the runtime
 	// state (conflict_at, last_synced) is owned by SetSyncConflict/MarkSyncSynced
-	// and left untouched here.
+	// and left untouched here. game is free text (no FK).
 	tag, err := s.db.Exec(ctx,
-		`UPDATE syncs SET game_id = $2, name = $3 WHERE id = $1`,
-		sy.ID, sy.GameID, sy.Name)
+		`UPDATE syncs SET game = $2, name = $3 WHERE id = $1`,
+		sy.ID, sy.Game, sy.Name)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -540,7 +449,7 @@ func (s *Store) MarkSyncSynced(ctx context.Context, syncID string, t time.Time) 
 
 func scanSync(r rowScanner) (store.Sync, error) {
 	var sy store.Sync
-	if err := r.Scan(&sy.ID, &sy.GameID, &sy.Name, &sy.ConflictAt, &sy.LastSynced); err != nil {
+	if err := r.Scan(&sy.ID, &sy.Game, &sy.Name, &sy.ConflictAt, &sy.LastSynced); err != nil {
 		return store.Sync{}, err
 	}
 	return sy, nil

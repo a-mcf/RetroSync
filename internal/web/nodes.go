@@ -19,8 +19,8 @@ import (
 // sets + CSRF so the "node-row" template can render an edit form with correct
 // pre-selected <option>s without each row re-deriving them.
 var templateFuncs = template.FuncMap{
-	"nodeRowCtx": nodeRowCtx,
-	"gameRowCtx": gameRowCtx,
+	"nodeRowCtx":  nodeRowCtx,
+	"groupRowCtx": groupRowCtx,
 }
 
 // nodeRowContext is the per-row template context: one node plus the shared
