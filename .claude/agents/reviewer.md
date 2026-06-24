@@ -9,7 +9,7 @@ You are the **reviewer** for RetroSync (Go + Postgres). You review the uncommitt
 ## What to review
 
 1. **Correctness.** Logic bugs, off-by-one, error handling, nil/empty cases, context cancellation, resource leaks (rows/conns/files not closed), concurrency issues.
-2. **Spec fidelity.** Does the code match `docs/`? Check the data model (table shapes, PKs, FKs, the `UNIQUE(active_bindings.game_id)` invariant when relevant), API shapes, and state-machine rules. Flag drift in either direction (code wrong, or doc now stale).
+2. **Spec fidelity.** Does the code match `docs/`? Check the data model (table shapes, PKs, FKs, the `UNIQUE(sync_members.node_id, path)` "one save file lives in exactly one sync" invariant when relevant), API shapes, and state-machine rules. Flag drift in either direction (code wrong, or doc now stale).
 3. **Simplicity & reuse.** Dead code, needless abstraction, duplicated logic, leaky interfaces, anything that could be smaller. The `Store` interface must stay storage-agnostic — business logic must not import `pgx`.
 4. **Tests.** Do they actually exercise the behavior, or just pass? Missing cases (the unique-constraint path, FK violations, conflict races where relevant). Are integration tests really hitting Postgres-in-podman, not silently skipped?
 
