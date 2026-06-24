@@ -166,14 +166,47 @@ route** — the client-side HTMX path-rewrite that splices the chosen `node_id`
 into the URL is progressive enhancement only. Empty path → `400`; missing sync or
 node (FK) → `422`; the `(node, path)` already a member of ANOTHER sync (the global
 `UNIQUE (node_id, path)` invariant) → `409` ("that save file is already in another
-sync"). The file picker / save-file discovery is deferred (slice 17); for now the
-path is typed by hand.
+sync"). The path may be typed, filled by the save-file **picker** (slice 17), or
+pre-filled by **discovery** (`/discover`, slice 22, which one-click-creates a sync
+from the candidates it finds).
 
 ### `POST /api/syncs/{id}/members/{node_id}/delete`
 
 Remove a member. Under auto-mirror **any** member is removable — there is no
 active primary to protect; a removed member's file simply stops mirroring.
 Unknown member → `404`.
+
+## Discovery (admin-only)
+
+The on-ramp that replaces hand-building syncs (slice 22): scan reachable devices'
+save dirs, infer a game name per save file, and one-click-create a sync from the
+candidates. Admin-only (same gating as the sync registry); the create POST is also
+CSRF-protected. The scan is **read-only** — nothing is written until the explicit
+create.
+
+### `GET /discover`
+
+The discovery admin page. On load it runs a read-only scan of every
+directory-listing-reachable node (syncthing-share; **ssh nodes are skipped**, not
+errored), infers a game name from each **save-like** file (a fixed SRAM/EEPROM/
+memory-card extension set; `.state*` save-states excluded), drops files already in
+a sync (`(node, path)` already a `sync_member`), and renders the survivors grouped
+by inferred game name with their candidate nodes + paths. The per-node walk is
+**bounded** (max depth + max entries) so a pathological tree can't hang it.
+
+### `POST /api/discover/create-sync`
+
+One-click create. Form fields: `game` (the free-text label, required), `name?`
+(the sync name; defaults to `Main`), `id?` (slug; auto-generated from `game` +
+`name` when omitted), and repeated `candidate` values (each
+`"<node_id>\x1f<path>"` — the selected candidates; checkboxes default all-checked
+so the admin unchecks to honor a Bob-vs-Alice split). It creates the sync
+(`CreateSync` with the label) then adds each selected candidate as a member
+(`SetSyncMember`). Mapping: empty selection / bad fields / invalid derived slug →
+`400`; duplicate sync id → `409`; a candidate `(node, path)` already in **another**
+sync (the global `UNIQUE (node_id, path)` invariant) → `409`; a candidate naming a
+missing node → `422`. On success it redirects to `/syncs` (an `HX-Redirect` header
+for an `HX-Request`, otherwise a `303`) so the new sync shows.
 
 ## Read-only JSON
 

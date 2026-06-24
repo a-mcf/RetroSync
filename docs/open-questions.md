@@ -94,6 +94,27 @@ is given; a manually-supplied id overrides. The final id is validated against th
 shared slug shape (lowercase letters, digits, hyphens). Node ids use the same slug
 validation.
 
+## Save-file discovery: filename-match vs. content-classify — RESOLVED (built)
+
+How does the admin go from "a pile of save files on several devices" to a sync,
+without typing a game label and a path per device? Two approaches: **classify by
+content** (parse ROM headers / hash against a DB — heavy, brittle, and an explicit
+non-goal: retrosync syncs the paths the user mapped, it does not identify games),
+or **match by filename** (group saves whose filenames infer the same game name).
+
+Decision: **filename-match**, shipped as the read-only `/discover` on-ramp (slice
+22). The engine's `DiscoverGames` scans each directory-listing-reachable node's
+save dir (ssh skipped, not errored; the walk is depth-/entry-bounded so it can't
+hang), collects **save-like** files (a fixed SRAM/EEPROM/memory-card extension
+set; `.state*` excluded per "What counts as the same save?" above), infers a game
+name (strip extension + trailing `(...)`/`[...]` region/version tags), excludes
+files already in a sync, and aggregates by inferred name across nodes. The admin
+unchecks any candidate that is really a different person's save (the Bob-vs-Alice
+split stays a human call — discovery never auto-creates), then one-click-creates
+the sync (label prefilled to the inferred name). Read-only until that explicit
+create. No content classification, no per-system layout auto-detection (that
+remains a non-goal).
+
 ## TGFX16 and other systems SGM-Helper drops
 
 retrosync doesn't classify by content — it syncs paths the user mapped. So TGFX16 is fine here as long as the user maps the path. Worth noting in README.

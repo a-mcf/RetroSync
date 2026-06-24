@@ -96,6 +96,15 @@ type Actioner interface {
 	// returns engine.ErrBrowseUnsupported; a missing node returns store.ErrNotFound.
 	// Read-only.
 	BrowseNode(ctx context.Context, nodeID, relPath string) ([]engine.DirEntry, error)
+	// DiscoverGames scans every directory-listing-reachable node's save directory,
+	// infers a game name per save-like file, drops files already claimed by a sync
+	// member, and aggregates the survivors by inferred game name — the discovery
+	// on-ramp (slice-22). It is READ-ONLY (no store/node writes) and resilient:
+	// unsupported-reach (ssh) and per-node scan errors are skipped, not fatal, and
+	// the per-node walk is bounded. The web layer drives it WITHOUT importing
+	// internal/reach (the engine owns the resolver, the bounded walk, and the
+	// containment).
+	DiscoverGames(ctx context.Context) ([]engine.DiscoveredGame, error)
 }
 
 // Server holds the web service's dependencies. Construct with New; build the
@@ -252,6 +261,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/syncs/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSync)))))
 	mux.Handle("POST /api/syncs/{id}/members/{node_id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSetSyncMember)))))
 	mux.Handle("POST /api/syncs/{id}/members/{node_id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSyncMember)))))
+
+	// Discovery (slice-22): the on-ramp that replaces manual sync-building. The GET
+	// page scans every reachable node's save dir, infers a game name per save file,
+	// and offers candidates; the POST one-click-creates a sync from the selected
+	// candidates. Admin-only (same wrapping as the rest of the registry); the POST
+	// is also CSRF-protected. The scan itself is READ-ONLY — nothing is written
+	// until the explicit create.
+	mux.Handle("GET /discover", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleDiscoverPage))))
+	mux.Handle("POST /api/discover/create-sync", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDiscoverCreateSync)))))
 
 	return mux
 }

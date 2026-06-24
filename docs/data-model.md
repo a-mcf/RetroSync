@@ -11,9 +11,18 @@
 >
 > **Note (flatten games, slice 21):** the `games` table was **dropped** (migration
 > 0008). The `sync` is now the atomic entity; "game" is a free-text **LABEL** on the
-> sync (`syncs.game`) — a display grouping (which a later slice will infer from save
-> filenames), **not** a stored entity. There is no games registry, no `Game` type,
-> and no game CRUD.
+> sync (`syncs.game`) — a display grouping, **not** a stored entity. There is no
+> games registry, no `Game` type, and no game CRUD.
+>
+> **Note (discovery, slice 22):** the game label is now **inferred from save
+> filenames** by the read-only `/discover` on-ramp (engine `DiscoverGames`): it
+> scans each reachable node's save dir, infers a game name per save file (strip
+> extension + trailing region/version tags), excludes files already in a sync, and
+> aggregates "this game is on these nodes." The admin one-click-creates a sync from
+> the candidates (the label prefilled to the inferred name). This is read-only until
+> the explicit create; it does **not** add a stored entity — it just fills the
+> existing `syncs` / `sync_members` rows. Filename-match (vs. content-classify) is
+> the resolved approach (see open-questions.md).
 >
 > **Note (auto-mirror, slice 18):** the old `active_bindings` table (one row per
 > game/sync in an explicit "play session", with a primary node + direction) was
@@ -66,8 +75,8 @@ A *sync* is a mirror group: a specific set of `(node, save-file)` members that
 sync together. It carries a free-text **game label** (a display grouping); many
 independent syncs may share the same label (e.g. two unrelated streams of the same
 title) so long as they do not share a `(node, path)` member. The label is **not** a
-foreign key — any text is allowed (a later slice will infer it from save
-filenames).
+foreign key — any text is allowed (the `/discover` on-ramp, slice 22, infers it
+from save filenames and prefills it on one-click sync creation).
 
 | field        | type | notes                                                        |
 |--------------|------|--------------------------------------------------------------|

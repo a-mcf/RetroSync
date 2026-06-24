@@ -1,0 +1,84 @@
+{{define "discover"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Discover</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // Let HTMX swap the 4xx bodies so inline error text (400/409/422) shows.
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      var s = e.detail.xhr.status;
+      if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync — Discover</h1>
+      <span class="who">
+        <a href="/">&larr; Dashboard</a> &nbsp;
+        <a href="/syncs">Syncs</a> &nbsp;
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <section>
+      <h2>Save files found across your devices</h2>
+      <p class="sub">Admin-only. RetroSync scanned every reachable device's save
+         directory and grouped the save files it found by an inferred game name.
+         Pick the copies you want to keep together (uncheck any that are really a
+         different person's save) and one-click create a sync. This scan is
+         read-only — nothing changes until you create a sync.</p>
+
+      {{if not .Games}}
+        <p class="empty">No un-synced save files were found. (Files already in a
+           sync are not shown; ssh nodes aren't scanned yet.)</p>
+      {{else}}
+        {{$csrf := .CSRF}}
+        {{range .Games}}
+          <div class="card game-card">
+            <h3>{{.Name}}</h3>
+            <form class="discover-create" hx-post="/api/discover/create-sync"
+                  hx-swap="none">
+              <input type="hidden" name="csrf_token" value="{{$csrf}}">
+              <input type="hidden" name="game" value="{{.Name}}">
+
+              <ul class="discover-candidates">
+                {{range .Candidates}}
+                  <li>
+                    <label>
+                      <input type="checkbox" name="candidate" value="{{.Value}}" checked>
+                      <span class="member-node">{{.NodeID}}</span>
+                      <code>{{.Path}}</code>
+                      <span class="sub">({{.Size}} B, {{.Mtime}})</span>
+                    </label>
+                  </li>
+                {{end}}
+              </ul>
+
+              <div class="discover-meta">
+                <label>sync name
+                  <input type="text" name="name" value="Main" placeholder="Main"></label>
+                <label>id
+                  <input type="text" name="id" value="{{.DefaultSyncID}}"
+                         placeholder="{{.DefaultSyncID}}"></label>
+              </div>
+              <p class="sub">Id is optional — leave blank to auto-generate a slug
+                 from the game + sync name.</p>
+              <p><button class="btn" type="submit">Create sync</button></p>
+              <div class="form-error"></div>
+            </form>
+          </div>
+        {{end}}
+      {{end}}
+    </section>
+  </div>
+</body>
+</html>{{end}}
