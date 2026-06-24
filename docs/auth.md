@@ -19,7 +19,7 @@ There's no per-node API token because nodes don't call retrosync; retrosync call
 ## Roles
 
 - `user` — can act on their own nodes. Can resolve a conflict on any sync that includes a node they own. Can view other syncs but not resolve their conflicts.
-- `admin` — can edit the registry, add nodes, delete games, and resolve any sync's conflict.
+- `admin` — can edit the registry, add nodes, create/edit/delete syncs, and resolve any sync's conflict.
 
 Single-tenant household — keep this minimal, two roles is enough.
 
@@ -48,6 +48,7 @@ Power-user flow (admin, via `/decks` or `/nodes`):
 2. retrosync runs a smoke test (stat the node's save root). **Implemented for
    `syncthing-share`** (a localfs stat); for `ssh` nodes the smoke-test reports
    "not supported yet (ssh adapter pending)" until the ssh adapter lands.
-3. Smoke pass → node appears as available; users can map game paths to it.
+3. Smoke pass → node appears as available; it can now be added as a member of a
+   sync (via `/discover` or the `/syncs` member picker).
 
 No QR-code pairing dance. Family-scale; the admin can set a few up by hand.

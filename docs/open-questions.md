@@ -8,9 +8,10 @@ Items below are tagged **RESOLVED** (decided and, where noted, built) or left op
 
 The store is **Postgres** (CNPG in production), behind the storage-agnostic
 `internal/store.Store` interface. SQLite was the original single-file default but
-Postgres fits the k8s sidecar deployment and gives us the unique constraint on
-`active_bindings`, JSONB `reach_config`, and `ON DELETE CASCADE`. Both an in-memory
-fake and the pgx v5 implementation run one conformance suite. See data-model.md.
+Postgres fits the k8s sidecar deployment and gives us the `UNIQUE (node_id, path)`
+invariant on `sync_members`, JSONB `reach_config`, and `ON DELETE CASCADE`. Both an
+in-memory fake and the pgx v5 implementation run one conformance suite. See
+data-model.md.
 
 ## Activation default direction
 
@@ -78,21 +79,25 @@ Right now: pick a winner. Should we offer "save both, let me sort it" — copy t
 
 Decision: yes, do that. Default behavior, no toggle.
 
-**Built:** `ResolveConflict` backs up every other in-scope node's current file to a
-sibling `<path>.retrosync-conflict-<ts>` on that same node *before* any overwrite,
-then fans the winner out. The `<ts>` is a UTC, filesystem-safe,
-**nanosecond-precision** stamp (`20060102T150405.000000000Z`, no colons), so two
-resolves in the same wall-clock second cannot collide. No toggle. See
-state-machine.md "Conflict handling".
+**Built (slice 20 form):** `ResolveConflict` captures every loser's current bytes
+*before* any overwrite, then fans the winner out. The original implementation
+wrote a sibling `<path>.retrosync-conflict-<ts>` on the device; that was
+**superseded** by the server-side, content-addressed save-version store
+(`save_blobs` / `save_versions`) — the same capture-before-overwrite net now also
+guards normal propagation, dedups by content hash, keeps the newest 10 per member,
+and offers one-click **Restore**, without cluttering device directories or
+replicating sibling files via Syncthing. The capture is a hard gate: a capture
+failure aborts that write and leaves the sync re-resolvable. No toggle. See
+data-model.md ("save_blobs + save_versions") and state-machine.md ("Conflict
+handling" / "Restore").
 
 ## Identity & name slugs — RESOLVED (built)
 
 `super-metroid` works. `super-mario-bros-3` works. Do we need a manual ID at all, or auto-generate from display? Auto with manual override is probably right.
 
-**Built:** game create auto-generates the id as a slug from the display when no id
-is given; a manually-supplied id overrides. The final id is validated against the
-shared slug shape (lowercase letters, digits, hyphens). Node ids use the same slug
-validation.
+**Built:** sync create auto-generates the sync id as a slug from `game + name`; a
+manually-supplied id overrides. The final id is validated against the shared slug
+shape (lowercase letters, digits, hyphens). Node ids use the same slug validation.
 
 ## Save-file discovery: filename-match vs. content-classify — RESOLVED (built)
 
