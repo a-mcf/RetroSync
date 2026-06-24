@@ -45,6 +45,13 @@ type stubActioner struct {
 	browseErr     error
 	browseEntries []engine.DirEntry
 	browsed       []browseCall
+
+	// discoverErr / discoverGames program DiscoverGames; discoverCalls counts the
+	// calls so discovery tests assert the handler reached the engine (and that the
+	// scan ran exactly once per page render).
+	discoverErr   error
+	discoverGames []engine.DiscoveredGame
+	discoverCount int
 }
 
 type browseCall struct {
@@ -113,6 +120,16 @@ func (s *stubActioner) browseCalls() []browseCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]browseCall(nil), s.browsed...)
+}
+
+func (s *stubActioner) DiscoverGames(_ context.Context) ([]engine.DiscoveredGame, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discoverCount++
+	if s.discoverErr != nil {
+		return nil, s.discoverErr
+	}
+	return append([]engine.DiscoveredGame(nil), s.discoverGames...), nil
 }
 
 func (s *stubActioner) resolveCalls() []resolveCall {

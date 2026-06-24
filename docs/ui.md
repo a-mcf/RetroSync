@@ -62,6 +62,40 @@ device-side `.retrosync-conflict-<ts>` sibling backups.
   [Use bob-deck]                  [Use living-room-mister]
 ```
 
+### `/discover` — discovery (the on-ramp)
+
+Admin-only. The one-click replacement for hand-building syncs. On load it runs a
+**read-only** scan of every reachable device's save directory (via the engine's
+`DiscoverGames`), infers a game name from each save file's name, and groups the
+results: **"Save files found across your devices"**, one card per inferred game,
+each listing the candidate nodes + file paths (size, mtime).
+
+For each game a checkbox per candidate (all checked by default) lets the admin
+honor the Bob-vs-Alice split — uncheck a copy that is really a different person's
+save — then **Create sync** one-click-creates the sync (game label prefilled to
+the inferred name, sync **name** editable, defaulting to "Main"; id auto-slugs
+from game + name). On success the admin lands on `/syncs` with the new sync
+showing.
+
+Scan rules (all in the engine, read-only):
+
+- Only **directory-listing-reachable** nodes are scanned (syncthing-share today);
+  ssh nodes are **skipped**, not errored. A node whose scan fails (missing share,
+  I/O) is skipped too — one bad node never fails discovery.
+- The per-node walk is **bounded** (max depth, max total entries) so a deep or
+  pathological tree can't hang it.
+- Only **save-like** files (a fixed set of SRAM/EEPROM/memory-card extensions)
+  are collected; **save states** (`.state*`) are excluded per the v1 non-goal.
+- Files **already in a sync** (a `(node, path)` already a `sync_member`) are
+  excluded — discovery only surfaces *un-synced* saves.
+- The inferred name strips the extension and trailing region/version tags
+  (`Super Metroid (USA) [!].srm` → `Super Metroid`); candidates with the same
+  inferred name (case-insensitive) across nodes aggregate into one card.
+
+Adding a node that does **not yet** hold the save (a fresh target device that
+should *receive* the game on first sync) stays the existing `/syncs` member-add
+via the picker — discovery groups *existing* files only.
+
 ### `/syncs` — registry
 
 Admin-only. Lists all syncs (grouped by their game label for display). A

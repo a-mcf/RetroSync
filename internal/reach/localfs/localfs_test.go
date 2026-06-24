@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -311,6 +312,53 @@ func TestList_NotADirectory(t *testing.T) {
 	if errors.Is(err, reach.ErrNotExist) {
 		t.Fatalf("List(file) mapped to ErrNotExist; want a distinct not-a-directory error: %v", err)
 	}
+}
+
+// TestList_TruncatesAtCap verifies the memory-DoS bound: a directory seeded with
+// more entries than maxListEntries returns EXACTLY the cap (not more) and does not
+// error. The cap is lowered via the package-var seam so we don't have to seed tens
+// of thousands of files.
+func TestList_TruncatesAtCap(t *testing.T) {
+	orig := maxListEntries
+	maxListEntries = 5
+	t.Cleanup(func() { maxListEntries = orig })
+
+	l, root := newRooted(t)
+	// Seed well over the cap so the streamed read must stop early.
+	const seeded = 5 * 1024 // > listReadBatch, so the cap is hit mid-batch
+	for i := 0; i < seeded; i++ {
+		name := filepath.Join(root, fmtName(i))
+		if err := os.WriteFile(name, []byte{0}, 0o644); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	entries, err := l.List(context.Background(), "")
+	if err != nil {
+		t.Fatalf("List over-cap dir: %v", err)
+	}
+	if len(entries) != maxListEntries {
+		t.Fatalf("List len = %d, want exactly cap %d", len(entries), maxListEntries)
+	}
+}
+
+// TestList_SmallDirUnchanged confirms a normal (under-cap) directory still returns
+// its full listing with the cap in force.
+func TestList_SmallDirUnchanged(t *testing.T) {
+	l, root := newRooted(t)
+	seedTree(t, root)
+	entries, err := l.List(context.Background(), "")
+	if err != nil {
+		t.Fatalf("List small dir: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("List small dir len = %d, want 3 (full listing): %+v", len(entries), entries)
+	}
+}
+
+// fmtName produces a stable, unique filename for the cap test's seed loop.
+func fmtName(i int) string {
+	return "save-" + strconv.Itoa(i) + ".srm"
 }
 
 func assertNoTempLeftover(t *testing.T, dir string) {

@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,6 +41,25 @@ type LocalFS struct {
 // for the temp file used by WriteAtomic. Kept distinctive so a leftover from a
 // crash is recognizable.
 const tempSuffix = ".retrosync-tmp"
+
+// maxListEntries is a generous per-call cap on how many directory entries a single
+// List will accumulate. List backs BOTH the discovery scan and the slice-17
+// picker; without a cap, a save directory with a pathological number of entries
+// would let a streamed read accumulate unboundedly (os.ReadDir would do worse —
+// it slurps the entire entry list before any caller-side cap can apply). When the
+// cap is hit, List stops reading (it does NOT drain the rest of the directory) and
+// logs a truncation at WARN; the engine/picker still get a bounded, useful listing.
+// The discovery scan's own maxScanEntries (total across the whole walk) still
+// applies on top — this only bounds a SINGLE directory read.
+//
+// It is a var (not a const) so a test can lower it to assert the bound without
+// having to seed tens of thousands of files.
+var maxListEntries = 10000
+
+// listReadBatch is how many entries each f.ReadDir call requests while streaming.
+// Streaming in batches (rather than one os.ReadDir slurp) is what lets List stop
+// at the cap without first materializing the entire directory in memory.
+const listReadBatch = 1024
 
 // New returns a LocalFS rooted at root. root must be absolute; a relative root
 // is a programming/config error (the Resolver passes reach_config.path, which
@@ -110,14 +130,21 @@ func (l *LocalFS) Hash(_ context.Context, path string) (string, error) {
 
 // List implements reach.Reach. It resolves relPath through safepath (so a
 // traversal/absolute/escape path is rejected exactly as Stat/Read are), then
-// os.ReadDir's the resolved directory and maps each entry to a reach.DirEntry.
+// STREAMS the resolved directory's entries (os.Open + f.ReadDir in batches) and
+// maps each to a reach.DirEntry, stopping at maxListEntries so a pathological
+// directory can't spike memory before the caller's own cap (e.g. the discovery
+// scan's maxScanEntries) applies.
 //
 // An empty relPath (or ".") names the node's save root. The returned entries are
-// metadata ONLY — name, type, size, mtime — never file contents: os.ReadDir
-// reads directory entries, and each entry's Info() is a stat, so no save bytes
-// are ever read here. Entries are sorted directories-first, then alphabetically,
-// for a deterministic picker render. A missing directory maps to
-// reach.ErrNotExist; a path that exists but is not a directory is a clear error.
+// metadata ONLY — name, type, size, mtime — never file contents: f.ReadDir reads
+// directory entries, and each entry's Info() is a stat, so no save bytes are ever
+// read here. Entries are sorted directories-first, then alphabetically, for a
+// deterministic picker render. A missing directory maps to reach.ErrNotExist; a
+// path that exists but is not a directory is a clear error.
+//
+// If the directory holds more than maxListEntries entries, List stops reading at
+// the cap (it does NOT drain the remainder) and logs a truncation at WARN; the
+// returned listing is bounded but still useful.
 func (l *LocalFS) List(_ context.Context, relPath string) ([]reach.DirEntry, error) {
 	// safepath rejects an empty rel; "" and "." both mean "the node root", so
 	// normalize "" to "." before resolving. Resolve(root, ".") yields the root.
@@ -131,7 +158,7 @@ func (l *LocalFS) List(_ context.Context, relPath string) ([]reach.DirEntry, err
 	}
 
 	// Stat first so we can map "absent" to ErrNotExist and reject a non-directory
-	// with a clear error (os.ReadDir on a file returns a less obvious error).
+	// with a clear error (a ReadDir on a file returns a less obvious error).
 	fi, err := os.Stat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -143,30 +170,57 @@ func (l *LocalFS) List(_ context.Context, relPath string) ([]reach.DirEntry, err
 		return nil, fmt.Errorf("localfs: list %q: not a directory", relPath)
 	}
 
-	dirents, err := os.ReadDir(abs)
+	f, err := os.Open(abs)
 	if err != nil {
-		return nil, fmt.Errorf("localfs: read dir %q: %w", relPath, err)
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("localfs: list %q: %w", relPath, reach.ErrNotExist)
+		}
+		return nil, fmt.Errorf("localfs: open dir %q: %w", relPath, err)
+	}
+	defer f.Close()
+
+	out := make([]reach.DirEntry, 0, listReadBatch)
+	truncated := false
+readLoop:
+	for {
+		dirents, rerr := f.ReadDir(listReadBatch)
+		for _, de := range dirents {
+			if len(out) >= maxListEntries {
+				// Cap hit: stop reading entirely (don't drain the rest of the
+				// directory) so memory stays bounded. We have a useful prefix.
+				truncated = true
+				break readLoop
+			}
+			// Info() is a stat of the entry: it yields size + mtime, NOT contents.
+			info, ierr := de.Info()
+			if ierr != nil {
+				// The entry vanished between ReadDir and Info (a transient race);
+				// skip it rather than failing the whole listing.
+				if os.IsNotExist(ierr) {
+					continue
+				}
+				return nil, fmt.Errorf("localfs: stat entry %q in %q: %w", de.Name(), relPath, ierr)
+			}
+			out = append(out, reach.DirEntry{
+				Name:  de.Name(),
+				IsDir: de.IsDir(),
+				Size:  info.Size(),
+				Mtime: info.ModTime(),
+			})
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("localfs: read dir %q: %w", relPath, rerr)
+		}
 	}
 
-	out := make([]reach.DirEntry, 0, len(dirents))
-	for _, de := range dirents {
-		// Info() is a stat of the entry: it yields size + mtime, NOT contents.
-		info, err := de.Info()
-		if err != nil {
-			// The entry vanished between ReadDir and Info (a transient race); skip
-			// it rather than failing the whole listing.
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("localfs: stat entry %q in %q: %w", de.Name(), relPath, err)
-		}
-		out = append(out, reach.DirEntry{
-			Name:  de.Name(),
-			IsDir: de.IsDir(),
-			Size:  info.Size(),
-			Mtime: info.ModTime(),
-		})
+	if truncated {
+		slog.Warn("localfs: directory listing truncated at cap",
+			"dir", abs, "cap", maxListEntries)
 	}
+
 	sortDirEntries(out)
 	return out, nil
 }
