@@ -20,8 +20,9 @@ var (
 	ErrConflict = errors.New("store: conflict")
 	// ErrInvalidReference is returned when a write references a parent row that
 	// does not exist: e.g. a node with an owner_user_id for a missing user, a
-	// sync naming a missing game, a sync_member naming a missing sync or node, or
-	// a manifest/log naming a missing sync (a foreign-key violation).
+	// sync_member naming a missing sync or node, or a manifest/log naming a
+	// missing sync (a foreign-key violation). Note: a sync's game is a free-text
+	// label, NOT a foreign key, so creating a sync never raises this for the game.
 	ErrInvalidReference = errors.New("store: invalid reference")
 	// ErrInvalidValue is returned when a field fails a domain/enum constraint:
 	// e.g. a bad role, kind, or reach (a CHECK violation).
@@ -117,15 +118,6 @@ type Node struct {
 	LastSeenAt *time.Time
 }
 
-// Game is a title in the registry. A game's playable members live in its Syncs'
-// SyncMembers (see Sync/SyncMember), not here.
-type Game struct {
-	ID      string
-	Display string
-	System  string
-	Notes   string
-}
-
 // Outcome is the result of a single directional sync copy, recorded in
 // sync_log. Mirrors the CHECK constraint in the runtime migration.
 type Outcome string
@@ -184,12 +176,16 @@ type ManifestEntry struct {
 }
 
 // Sync is a mirror group: a specific set of (node, save-file) members that sync
-// together. It belongs to one game, but a game may have MANY independent syncs
-// (e.g. two unrelated streams of the same title) so long as they do not share a
-// (node, path) member — see SyncMember and docs/data-model.md.
+// together. It is the atomic entity of the data model. "Game" is a free-text
+// LABEL on the sync (no separate games table, no FK) — a display grouping that a
+// later slice will infer from save filenames. Many syncs may carry the same game
+// label so long as they do not share a (node, path) member — see SyncMember and
+// docs/data-model.md.
 type Sync struct {
-	ID     string
-	GameID string
+	ID string
+	// Game is a free-text label (e.g. "Super Metroid"); defaults to "". It is NOT
+	// a foreign key — any value is allowed.
+	Game string
 	// Name is a free-form label; defaults to "".
 	Name string
 	// ConflictAt is non-nil when the sync forked — two or more members changed
@@ -247,15 +243,6 @@ type SyncMember struct {
 	Path   string
 }
 
-// GameFilter narrows Games.List. The zero value matches everything.
-type GameFilter struct {
-	// Q is an optional case-insensitive substring matched against id and
-	// display. Empty means no substring filter.
-	Q string
-	// System is an optional exact-match system filter. Empty means no filter.
-	System string
-}
-
 // Store is the storage-agnostic persistence boundary. All methods are
 // context-first and return ErrNotFound / ErrConflict where documented.
 type Store interface {
@@ -272,13 +259,6 @@ type Store interface {
 	ListNodes(ctx context.Context) ([]Node, error)
 	UpdateNode(ctx context.Context, n Node) error
 	DeleteNode(ctx context.Context, id string) error
-
-	// Games.
-	CreateGame(ctx context.Context, g Game) error
-	GetGame(ctx context.Context, id string) (Game, error)
-	ListGames(ctx context.Context, f GameFilter) ([]Game, error)
-	UpdateGame(ctx context.Context, g Game) error
-	DeleteGame(ctx context.Context, id string) error
 
 	// SyncLog (append-only).
 	// AppendLog: bad outcome -> ErrInvalidValue; missing sync ->
@@ -304,11 +284,11 @@ type Store interface {
 	// (conflict_at, last_synced) lives on the sync row itself. The engine,
 	// daemon, and web all operate on a Sync and its SyncMembers.
 
-	// CreateSync inserts a sync. Duplicate id -> ErrConflict; missing game ->
-	// ErrInvalidReference. A freshly-created sync has nil ConflictAt/LastSynced.
+	// CreateSync inserts a sync. Duplicate id -> ErrConflict. The Game label is
+	// free text (no FK), so any value — including "" — is accepted. A
+	// freshly-created sync has nil ConflictAt/LastSynced.
 	CreateSync(ctx context.Context, sy Sync) error
 	GetSync(ctx context.Context, id string) (Sync, error)
-	ListSyncsByGame(ctx context.Context, gameID string) ([]Sync, error)
 	// ListSyncs returns ALL syncs, ordered by id. The daemon sweeps every sync
 	// each poll (there is no "active" subset anymore — every sync auto-mirrors),
 	// so it lists them all and polls each.
@@ -321,8 +301,8 @@ type Store interface {
 	// MarkSyncSynced sets the sync's last_synced to t (a successful mirror pass).
 	// It does NOT touch conflict_at. Missing sync -> ErrNotFound.
 	MarkSyncSynced(ctx context.Context, syncID string, t time.Time) error
-	// UpdateSync rewrites the mutable fields (game_id, name) of an existing sync.
-	// Missing -> ErrNotFound; missing game -> ErrInvalidReference.
+	// UpdateSync rewrites the mutable fields (game label, name) of an existing
+	// sync. Missing -> ErrNotFound. The game label is free text (no FK).
 	UpdateSync(ctx context.Context, sy Sync) error
 	// DeleteSync removes a sync; missing -> ErrNotFound. Its members cascade.
 	DeleteSync(ctx context.Context, id string) error

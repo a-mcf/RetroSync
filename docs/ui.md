@@ -13,7 +13,7 @@ HTMX + server-rendered HTML. No build step. One CSS file. Optimized for "I'm sit
 **My syncs** — a status view of every sync the user has a member node in. Search
 box at top. Each card:
 
-- Game title and system, sync name
+- Game label and sync name
 - One line per member node: `<node>: <mtime>` (or "no save yet"); the user's own
   nodes are marked "(yours)"
 - A **History** link (opens the sync's save-history page)
@@ -62,11 +62,14 @@ device-side `.retrosync-conflict-<ts>` sibling backups.
   [Use bob-deck]                  [Use living-room-mister]
 ```
 
-### `/games` — registry
+### `/syncs` — registry
 
-Admin-ish. Add a game; under each game, create syncs; under each sync, add
-members (a node + the save-file path on it). Power-user surface. Most users live
-on `/`.
+Admin-only. Lists all syncs (grouped by their game label for display). A
+**+ New sync** form creates one (a game label + a sync name; the id is
+auto-generated from game + name). Under each sync, manage members (a node + the
+save-file path on it, with the **Browse** picker), and **rename/relabel** or
+**delete** the sync (delete is refused on a conflicted sync). Power-user surface;
+no game CRUD — there is no games table. Most users live on `/`.
 
 ### `/nodes` — devices
 
@@ -83,7 +86,7 @@ Per-node configuration UI. See auth.md.
 
 - Backup is healthy / stale / failing per node (Syncthing API).
 - A node is reachable / not.
-- A game has no save on any node ("haven't played yet — when you do, it'll be picked up").
+- A sync has no save on any node ("haven't played yet — when you do, it'll be picked up").
 - A node's save is from a different person's last session (show whose, with timestamp).
 - Sync paused due to conflict.
 - Sync currently in flight (transient spinner).

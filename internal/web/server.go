@@ -14,8 +14,9 @@
 // (GET /syncs/{id}/conflict) that surfaces every member's live state, and the
 // owner/admin-gated, CSRF-protected POST /api/syncs/{id}/resolve-conflict that
 // drives the engine's ResolveConflict. Authority is owning one of the sync's
-// member nodes (or admin). The /games registry editing UI manages a game's
-// syncs and each sync's members (node + path) directly.
+// member nodes (or admin). The /syncs registry editing UI manages syncs (each
+// carrying a free-text game label) and each sync's members (node + path)
+// directly — the sync is the atomic entity; there is no games table.
 package web
 
 import (
@@ -175,7 +176,7 @@ func New(st store.Store, opts Options) (*Server, error) {
 //	GET  /static/...     — embedded assets (css, htmx), no auth
 //	GET  /               — dashboard (auth required)
 //	GET  /api/status     — status JSON (auth required)
-//	GET  /api/games      — games JSON (auth required)
+//	GET  /api/syncs      — syncs JSON (auth required)
 //	GET  /api/nodes      — nodes JSON (auth required)
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -192,7 +193,7 @@ func (s *Server) Handler() http.Handler {
 	// Authenticated routes.
 	mux.Handle("GET /{$}", s.requireAuth(http.HandlerFunc(s.handleDashboard)))
 	mux.Handle("GET /api/status", s.requireAuth(http.HandlerFunc(s.handleAPIStatus)))
-	mux.Handle("GET /api/games", s.requireAuth(http.HandlerFunc(s.handleAPIGames)))
+	mux.Handle("GET /api/syncs", s.requireAuth(http.HandlerFunc(s.handleAPISyncs)))
 	mux.Handle("GET /api/nodes", s.requireAuth(http.HandlerFunc(s.handleAPINodes)))
 
 	// Conflict resolution, keyed by SYNC id — the only play-side action under
@@ -233,21 +234,19 @@ func (s *Server) Handler() http.Handler {
 	// is a safe GET (read-only) and admin-gated.
 	mux.Handle("GET /api/nodes/{id}/browse", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleBrowseNode))))
 
-	// Games registry (slice-11 + slice-16). Admin-only per docs/auth.md, same
-	// wrapping as /nodes: every page and mutation behind requireAuth+requireAdmin
+	// Syncs registry (slice-21). Admin-only per docs/auth.md, same wrapping as
+	// /nodes: the page and every mutation behind requireAuth+requireAdmin
 	// (mutations also behind requireCSRF), so a non-admin never reaches the Store.
-	// A game's playable scope is managed through its SYNCS and each sync's MEMBERS
-	// (node + path), all via POST (not PUT/DELETE) to stay consistent with the
-	// existing form/HTMX style.
-	mux.Handle("GET /games", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleGamesPage))))
-	mux.Handle("POST /api/games", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateGame)))))
-	mux.Handle("POST /api/games/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditGame)))))
-	mux.Handle("POST /api/games/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteGame)))))
+	// The *sync* is the atomic entity (there is no games table); "game" is just a
+	// free-text label on the sync, grouped for display. A sync's playable scope is
+	// its MEMBERS (node + path), all managed via POST (not PUT/DELETE) to stay
+	// consistent with the existing form/HTMX style.
+	mux.Handle("GET /syncs", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleSyncsPage))))
 
-	// Sync registry mutations (slice-16). Same admin + CSRF wrapping. Note these
-	// are distinct from the engine-side /api/syncs/{id}/resolve-conflict route
-	// above: that drives the auto-mirror engine and is owner/admin-gated; these
-	// edit the registry and are admin-only.
+	// Sync registry mutations. Same admin + CSRF wrapping. Note these are distinct
+	// from the engine-side /api/syncs/{id}/resolve-conflict route above: that
+	// drives the auto-mirror engine and is owner/admin-gated; these edit the
+	// registry and are admin-only.
 	mux.Handle("POST /api/syncs", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateSync)))))
 	mux.Handle("POST /api/syncs/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleRenameSync)))))
 	mux.Handle("POST /api/syncs/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSync)))))

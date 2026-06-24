@@ -31,8 +31,6 @@ func Run(t *testing.T, newStore Factory) {
 	}{
 		{"Users", testUsers},
 		{"Nodes", testNodes},
-		{"Games", testGames},
-		{"GamesFilter", testGamesFilter},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
 		{"ListSyncs", testListSyncs},
@@ -44,11 +42,9 @@ func Run(t *testing.T, newStore Factory) {
 		{"SyncLogInvalidValue", testSyncLogInvalidValue},
 		{"SyncLogInvalidReference", testSyncLogInvalidReference},
 		{"Manifest", testManifest},
-		{"DeleteGameBlockedByConflictedSync", testDeleteGameBlockedByConflictedSync},
-		{"CascadeRuntimeOnGameDelete", testCascadeRuntimeOnGameDelete},
 		{"CascadeManifestOnNodeDelete", testCascadeManifestOnNodeDelete},
 		{"Syncs", testSyncs},
-		{"SyncInvalidReference", testSyncInvalidReference},
+		{"SyncFreeTextGameLabel", testSyncFreeTextGameLabel},
 		{"SyncMembers", testSyncMembers},
 		{"SyncMemberUniquePathInvariant", testSyncMemberUniquePathInvariant},
 		{"SyncMemberInvalidReference", testSyncMemberInvalidReference},
@@ -234,92 +230,9 @@ func testNodes(t *testing.T, s store.Store) {
 	}
 }
 
-func testGames(t *testing.T, s store.Store) {
-	c := ctx()
-	g := store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes", Notes: ""}
-	if err := s.CreateGame(c, g); err != nil {
-		t.Fatalf("CreateGame: %v", err)
-	}
-	if err := s.CreateGame(c, g); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("duplicate CreateGame: want ErrConflict, got %v", err)
-	}
-	got, err := s.GetGame(c, "super-metroid")
-	if err != nil {
-		t.Fatalf("GetGame: %v", err)
-	}
-	if got != g {
-		t.Fatalf("GetGame = %+v, want %+v", got, g)
-	}
-	if _, err := s.GetGame(c, "nope"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("GetGame(missing): want ErrNotFound, got %v", err)
-	}
-	g.Notes = "100% run"
-	if err := s.UpdateGame(c, g); err != nil {
-		t.Fatalf("UpdateGame: %v", err)
-	}
-	got, _ = s.GetGame(c, "super-metroid")
-	if got.Notes != "100% run" {
-		t.Fatalf("UpdateGame not applied: %+v", got)
-	}
-	if err := s.UpdateGame(c, store.Game{ID: "ghost"}); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("UpdateGame(missing): want ErrNotFound, got %v", err)
-	}
-	if err := s.DeleteGame(c, "super-metroid"); err != nil {
-		t.Fatalf("DeleteGame: %v", err)
-	}
-	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("DeleteGame(missing): want ErrNotFound, got %v", err)
-	}
-}
-
-func testGamesFilter(t *testing.T, s store.Store) {
-	c := ctx()
-	games := []store.Game{
-		{ID: "super-metroid", Display: "Super Metroid", System: "snes"},
-		{ID: "super-mario-64", Display: "Super Mario 64", System: "n64"},
-		{ID: "zelda-oot", Display: "Ocarina of Time", System: "n64"},
-	}
-	for _, g := range games {
-		if err := s.CreateGame(c, g); err != nil {
-			t.Fatalf("CreateGame %s: %v", g.ID, err)
-		}
-	}
-
-	all, err := s.ListGames(c, store.GameFilter{})
-	if err != nil {
-		t.Fatalf("ListGames(all): %v", err)
-	}
-	if len(all) != 3 {
-		t.Fatalf("ListGames(all) len = %d, want 3", len(all))
-	}
-
-	// System filter.
-	n64, _ := s.ListGames(c, store.GameFilter{System: "n64"})
-	if len(n64) != 2 {
-		t.Fatalf("ListGames(n64) len = %d, want 2", len(n64))
-	}
-
-	// Substring filter (case-insensitive), matches display + id.
-	sup, _ := s.ListGames(c, store.GameFilter{Q: "SUPER"})
-	if len(sup) != 2 {
-		t.Fatalf("ListGames(q=SUPER) len = %d, want 2", len(sup))
-	}
-
-	// Combined.
-	combo, _ := s.ListGames(c, store.GameFilter{Q: "super", System: "n64"})
-	if len(combo) != 1 || combo[0].ID != "super-mario-64" {
-		t.Fatalf("ListGames(combo) = %+v, want only super-mario-64", combo)
-	}
-
-	// Substring on id only.
-	byID, _ := s.ListGames(c, store.GameFilter{Q: "oot"})
-	if len(byID) != 1 || byID[0].ID != "zelda-oot" {
-		t.Fatalf("ListGames(q=oot) = %+v, want zelda-oot", byID)
-	}
-}
-
 // testInvalidReference asserts both stores reject writes that name a missing
-// parent row with ErrInvalidReference (FK enforcement).
+// parent row with ErrInvalidReference (FK enforcement). Note: a sync's game is a
+// free-text LABEL, not an FK, so CreateSync never raises this for the game.
 func testInvalidReference(t *testing.T, s store.Store) {
 	c := ctx()
 
@@ -333,22 +246,20 @@ func testInvalidReference(t *testing.T, s store.Store) {
 		t.Fatalf("CreateNode(bad owner): want ErrInvalidReference, got %v", err)
 	}
 
-	// CreateSync naming a missing game.
-	err = s.CreateSync(c, store.Sync{ID: "ghost-sync", GameID: "ghost-game"})
-	if !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("CreateSync(missing game): want ErrInvalidReference, got %v", err)
+	// CreateSync carrying any game label succeeds (the label is free text, no FK).
+	if err := s.CreateSync(c, store.Sync{ID: "ghost-sync", Game: "any-label"}); err != nil {
+		t.Fatalf("CreateSync(free-text game label): want nil, got %v", err)
 	}
 
 	// SetSyncMember naming a missing sync (node exists).
 	mustNode(t, s, "real-node", nil)
-	err = s.SetSyncMember(c, store.SyncMember{SyncID: "ghost-sync", NodeID: "real-node", Path: "p"})
+	err = s.SetSyncMember(c, store.SyncMember{SyncID: "no-such-sync", NodeID: "real-node", Path: "p"})
 	if !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("SetSyncMember(missing sync): want ErrInvalidReference, got %v", err)
 	}
 
 	// SetSyncMember naming a missing node (sync exists).
-	mustGame(t, s, "real-game")
-	must(t, s.CreateSync(c, store.Sync{ID: "real-sync", GameID: "real-game"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "real-sync", Game: "real"}))
 	err = s.SetSyncMember(c, store.SyncMember{SyncID: "real-sync", NodeID: "ghost-node", Path: "p"})
 	if !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("SetSyncMember(missing node): want ErrInvalidReference, got %v", err)
@@ -727,63 +638,6 @@ func testManifest(t *testing.T, s store.Store) {
 
 // ---- runtime: cross-cutting delete behavior ----
 
-// testDeleteGameBlockedByConflictedSync asserts both impls refuse to delete a
-// game while any of its syncs is CONFLICTED (paused awaiting human resolution).
-// Deleting it would cascade the syncs away and silently discard the unresolved
-// fork. A non-conflicted game deletes freely. (Under auto-mirror there is no
-// "active session" to block on — only an unresolved conflict.)
-func testDeleteGameBlockedByConflictedSync(t *testing.T, s store.Store) {
-	c := ctx()
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "a"}))
-
-	// Flag the sync as conflicted.
-	conflictTS := time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)
-	must(t, s.SetSyncConflict(c, "sm-bob", &conflictTS))
-
-	// A game with a conflicted sync may not be deleted: ErrConflict (the guard).
-	if err := s.DeleteGame(c, "super-metroid"); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("DeleteGame(conflicted sync): want ErrConflict, got %v", err)
-	}
-
-	// After the conflict is resolved (cleared), the delete succeeds and cascades.
-	must(t, s.SetSyncConflict(c, "sm-bob", nil))
-	if err := s.DeleteGame(c, "super-metroid"); err != nil {
-		t.Fatalf("DeleteGame after conflict cleared: %v", err)
-	}
-	if _, err := s.GetSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("sync after game delete: want ErrNotFound, got %v", err)
-	}
-}
-
-// testCascadeRuntimeOnGameDelete asserts manifest and sync_log rows cascade
-// when a non-conflicted game is deleted: the game's syncs cascade, and each
-// sync's manifest/sync_log cascade in turn.
-func testCascadeRuntimeOnGameDelete(t *testing.T, s store.Store) {
-	c := ctx()
-	mustSync(t, s, "sm-bob", "super-metroid")
-	mustNode(t, s, "bob-deck", nil)
-	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck"}))
-	must(t, s.AppendLog(c, store.LogEntry{SyncID: "sm-bob", Outcome: store.OutcomeOK}))
-
-	// No active binding -> delete succeeds and cascades syncs + runtime rows.
-	if err := s.DeleteGame(c, "super-metroid"); err != nil {
-		t.Fatalf("DeleteGame: %v", err)
-	}
-	if _, err := s.GetSync(c, "sm-bob"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("sync after game delete: want ErrNotFound, got %v", err)
-	}
-	man, _ := s.ListManifestBySync(c, "sm-bob")
-	if len(man) != 0 {
-		t.Fatalf("manifest after game delete = %d, want 0 (cascade)", len(man))
-	}
-	logs, _ := s.ListLogBySync(c, "sm-bob", 0)
-	if len(logs) != 0 {
-		t.Fatalf("sync_log after game delete = %d, want 0 (cascade)", len(logs))
-	}
-}
-
 // testCascadeManifestOnNodeDelete asserts manifest rows cascade when a node is
 // deleted (sync_log from/to_node are unconstrained text, so they do not block
 // or cascade).
@@ -806,9 +660,8 @@ func testCascadeManifestOnNodeDelete(t *testing.T, s store.Store) {
 
 func testSyncs(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
 
-	sy := store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}
+	sy := store.Sync{ID: "sm-bob", Game: "Super Metroid", Name: "Bob's stream"}
 	if err := s.CreateSync(c, sy); err != nil {
 		t.Fatalf("CreateSync: %v", err)
 	}
@@ -824,38 +677,38 @@ func testSyncs(t *testing.T, s store.Store) {
 	if got != sy {
 		t.Fatalf("GetSync = %+v, want %+v", got, sy)
 	}
+	if got.Game != "Super Metroid" {
+		t.Fatalf("GetSync game label = %q, want Super Metroid", got.Game)
+	}
 	if _, err := s.GetSync(c, "nope"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetSync(missing): want ErrNotFound, got %v", err)
 	}
 
-	// A second, independent sync for the SAME game (the multi-sync case).
-	must(t, s.CreateSync(c, store.Sync{ID: "sm-alice", GameID: "super-metroid", Name: "Alice's stream"}))
-	// A sync for a different game must not leak into the listing.
-	mustGame(t, s, "zelda")
-	must(t, s.CreateSync(c, store.Sync{ID: "z-1", GameID: "zelda"}))
+	// A second, independent sync sharing the SAME game label (the multi-sync case).
+	must(t, s.CreateSync(c, store.Sync{ID: "sm-alice", Game: "Super Metroid", Name: "Alice's stream"}))
+	// A sync with an EMPTY game label is allowed (the label is free text).
+	must(t, s.CreateSync(c, store.Sync{ID: "z-1", Game: ""}))
 
-	list, err := s.ListSyncsByGame(c, "super-metroid")
+	list, err := s.ListSyncs(c)
 	if err != nil {
-		t.Fatalf("ListSyncsByGame: %v", err)
+		t.Fatalf("ListSyncs: %v", err)
 	}
-	if len(list) != 2 {
-		t.Fatalf("ListSyncsByGame len = %d, want 2", len(list))
-	}
-	if list[0].ID != "sm-alice" || list[1].ID != "sm-bob" {
-		t.Fatalf("ListSyncsByGame not ordered by id: %+v", list)
+	if len(list) != 3 {
+		t.Fatalf("ListSyncs len = %d, want 3", len(list))
 	}
 
-	// Update mutable fields.
+	// Update mutable fields, including the free-text label.
 	sy.Name = "Bob renamed"
+	sy.Game = "Super Metroid (relabeled)"
 	if err := s.UpdateSync(c, sy); err != nil {
 		t.Fatalf("UpdateSync: %v", err)
 	}
 	reread, _ := s.GetSync(c, "sm-bob")
-	if reread.Name != "Bob renamed" {
+	if reread.Name != "Bob renamed" || reread.Game != "Super Metroid (relabeled)" {
 		t.Fatalf("UpdateSync not applied: %+v", reread)
 	}
 	// Update missing -> not found.
-	if err := s.UpdateSync(c, store.Sync{ID: "ghost", GameID: "super-metroid"}); !errors.Is(err, store.ErrNotFound) {
+	if err := s.UpdateSync(c, store.Sync{ID: "ghost", Game: "x"}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("UpdateSync(missing): want ErrNotFound, got %v", err)
 	}
 
@@ -868,26 +721,30 @@ func testSyncs(t *testing.T, s store.Store) {
 	}
 }
 
-func testSyncInvalidReference(t *testing.T, s store.Store) {
+// testSyncFreeTextGameLabel asserts the game label is free text (no FK): create
+// and update accept ANY label — including one that names no registry row and the
+// empty string — without ErrInvalidReference.
+func testSyncFreeTextGameLabel(t *testing.T, s store.Store) {
 	c := ctx()
-	// CreateSync naming a missing game.
-	if err := s.CreateSync(c, store.Sync{ID: "orphan", GameID: "ghost-game"}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("CreateSync(missing game): want ErrInvalidReference, got %v", err)
+	// CreateSync with an arbitrary label succeeds.
+	if err := s.CreateSync(c, store.Sync{ID: "orphan", Game: "Whatever Title"}); err != nil {
+		t.Fatalf("CreateSync(free-text label): want nil, got %v", err)
 	}
-	// UpdateSync re-pointing to a missing game.
-	mustGame(t, s, "super-metroid")
-	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
-	if err := s.UpdateSync(c, store.Sync{ID: "sm", GameID: "ghost-game"}); !errors.Is(err, store.ErrInvalidReference) {
-		t.Fatalf("UpdateSync(missing game): want ErrInvalidReference, got %v", err)
+	// UpdateSync to any other label (including a brand-new one) succeeds.
+	if err := s.UpdateSync(c, store.Sync{ID: "orphan", Game: "Some Other Title"}); err != nil {
+		t.Fatalf("UpdateSync(free-text label): want nil, got %v", err)
+	}
+	got, _ := s.GetSync(c, "orphan")
+	if got.Game != "Some Other Title" {
+		t.Fatalf("relabel not applied: %+v", got)
 	}
 }
 
 func testSyncMembers(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	mustNode(t, s, "bob-mister", nil)
-	must(t, s.CreateSync(c, store.Sync{ID: "sm-bob", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sm-bob", Game: "super-metroid"}))
 
 	m := store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "retroarch/saves/Super Metroid.srm"}
 	if err := s.SetSyncMember(c, m); err != nil {
@@ -947,10 +804,9 @@ func testSyncMembers(t *testing.T, s store.Store) {
 // another sync (multi-slot); re-setting the same (sync, node) upserts its path.
 func testSyncMemberUniquePathInvariant(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateSync(c, store.Sync{ID: "sync-a", GameID: "super-metroid"}))
-	must(t, s.CreateSync(c, store.Sync{ID: "sync-b", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-a", Game: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-b", Game: "super-metroid"}))
 
 	// bob-deck's slot-1 file joins sync-a.
 	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-a", NodeID: "bob-deck", Path: "saves/slot1.srm"}))
@@ -984,9 +840,8 @@ func testSyncMemberUniquePathInvariant(t *testing.T, s store.Store) {
 
 func testSyncMemberInvalidReference(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sm", Game: "super-metroid"}))
 
 	// Missing sync (node exists).
 	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "ghost-sync", NodeID: "bob-deck", Path: "p"}); !errors.Is(err, store.ErrInvalidReference) {
@@ -998,40 +853,25 @@ func testSyncMemberInvalidReference(t *testing.T, s store.Store) {
 	}
 }
 
-// testSyncCascades asserts: delete sync -> members gone; delete the parent game
-// -> syncs + members gone; delete a node -> its sync_member rows gone.
+// testSyncCascades asserts: delete sync -> members gone; delete a node -> its
+// sync_member rows gone. (There is no games table to cascade from anymore — the
+// game label is free text on the sync.)
 func testSyncCascades(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
 	mustNode(t, s, "bob-deck", nil)
 	mustNode(t, s, "bob-mister", nil)
 
 	// Delete sync -> its members cascade.
-	must(t, s.CreateSync(c, store.Sync{ID: "sync-del", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-del", Game: "Super Metroid"}))
 	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sync-del", NodeID: "bob-deck", Path: "a"}))
 	must(t, s.DeleteSync(c, "sync-del"))
 	if mem, _ := s.ListSyncMembers(c, "sync-del"); len(mem) != 0 {
 		t.Fatalf("members after DeleteSync = %d, want 0 (cascade)", len(mem))
 	}
 	// The freed (node, path) may now be reused by a fresh sync.
-	must(t, s.CreateSync(c, store.Sync{ID: "sync-reuse", GameID: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sync-reuse", Game: "Super Metroid"}))
 	if err := s.SetSyncMember(c, store.SyncMember{SyncID: "sync-reuse", NodeID: "bob-deck", Path: "a"}); err != nil {
 		t.Fatalf("reuse freed (node,path) after cascade: want nil, got %v", err)
-	}
-
-	// Delete the parent game -> its syncs AND members cascade.
-	mustGame(t, s, "zelda")
-	must(t, s.CreateSync(c, store.Sync{ID: "z-sync", GameID: "zelda"}))
-	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "z-sync", NodeID: "bob-mister", Path: "z"}))
-	must(t, s.DeleteGame(c, "zelda"))
-	if syncs, _ := s.ListSyncsByGame(c, "zelda"); len(syncs) != 0 {
-		t.Fatalf("syncs after DeleteGame = %d, want 0 (cascade)", len(syncs))
-	}
-	if _, err := s.GetSync(c, "z-sync"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("sync after DeleteGame: want ErrNotFound, got %v", err)
-	}
-	if mem, _ := s.ListSyncMembersByNode(c, "bob-mister"); len(mem) != 0 {
-		t.Fatalf("members after DeleteGame cascade = %d, want 0", len(mem))
 	}
 
 	// Delete a node -> its sync_member rows cascade (sync itself survives).
@@ -1047,11 +887,9 @@ func testSyncCascades(t *testing.T, s store.Store) {
 
 func testSyncMembersByNode(t *testing.T, s store.Store) {
 	c := ctx()
-	mustGame(t, s, "super-metroid")
-	mustGame(t, s, "zelda")
 	mustNode(t, s, "bob-deck", nil)
-	must(t, s.CreateSync(c, store.Sync{ID: "sm", GameID: "super-metroid"}))
-	must(t, s.CreateSync(c, store.Sync{ID: "z", GameID: "zelda"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "sm", Game: "super-metroid"}))
+	must(t, s.CreateSync(c, store.Sync{ID: "z", Game: "zelda"}))
 
 	// One node, two different files, in two different syncs (multi-slot).
 	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm", NodeID: "bob-deck", Path: "sm.srm"}))
@@ -1421,19 +1259,12 @@ func mustUser(t *testing.T, s store.Store, id string) {
 	must(t, s.CreateUser(ctx(), store.User{ID: id, Display: id, PwHash: "h", Role: store.RoleUser}))
 }
 
-func mustGame(t *testing.T, s store.Store, id string) {
+// mustSync creates a sync carrying the given free-text game label so
+// manifest/sync_log rows — sync_id-keyed — have a valid parent. The label is
+// free text (no games table), so it is just set on the sync row.
+func mustSync(t *testing.T, s store.Store, syncID, gameLabel string) {
 	t.Helper()
-	must(t, s.CreateGame(ctx(), store.Game{ID: id, Display: id, System: "snes"}))
-}
-
-// mustSync creates a sync (and its parent game, tolerating one already present)
-// so binding/manifest/sync_log rows — now sync_id-keyed — have a valid parent.
-func mustSync(t *testing.T, s store.Store, syncID, gameID string) {
-	t.Helper()
-	if err := s.CreateGame(ctx(), store.Game{ID: gameID, Display: gameID, System: "snes"}); err != nil && !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("setup game %q: %v", gameID, err)
-	}
-	must(t, s.CreateSync(ctx(), store.Sync{ID: syncID, GameID: gameID}))
+	must(t, s.CreateSync(ctx(), store.Sync{ID: syncID, Game: gameLabel}))
 }
 
 func mustNode(t *testing.T, s store.Store, id string, owner *string) {

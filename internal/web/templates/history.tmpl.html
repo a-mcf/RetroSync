@@ -25,7 +25,7 @@
     </header>
 
     <section>
-      <h2>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span></h2>
+      <h2>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</h2>
       <p class="sub">Every time RetroSync is about to overwrite a save (a normal
          propagation or a conflict resolution), it snapshots the about-to-be-
          overwritten bytes here first. Restore makes a snapshot the current save

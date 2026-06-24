@@ -12,24 +12,10 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// gameIDs returns the set of game ids currently in the fixture store.
-func gameIDs(t *testing.T, f *actionFixture) map[string]bool {
-	t.Helper()
-	games, err := f.store.ListGames(context.Background(), store.GameFilter{})
-	if err != nil {
-		t.Fatalf("list games: %v", err)
-	}
-	out := make(map[string]bool, len(games))
-	for _, g := range games {
-		out[g.ID] = true
-	}
-	return out
-}
-
-// syncIDsMap returns the set of sync ids of super-metroid currently in the store.
+// syncIDsMap returns the set of all sync ids currently in the fixture store.
 func syncIDsMap(t *testing.T, f *actionFixture) map[string]bool {
 	t.Helper()
-	syncs, err := f.store.ListSyncsByGame(context.Background(), "super-metroid")
+	syncs, err := f.store.ListSyncs(context.Background())
 	if err != nil {
 		t.Fatalf("list syncs: %v", err)
 	}
@@ -50,9 +36,9 @@ func syncIDs(t *testing.T, f *actionFixture) string {
 	return strings.Join(out, ",")
 }
 
-// seedConflict marks the sync sm-bob (of game super-metroid) as conflicted, so
-// the registry delete guards (delete-game / delete-sync) have a conflicted sync
-// to refuse against. Under auto-mirror that is the only registry guard left.
+// seedConflict marks the sync sm-bob as conflicted, so the registry delete guard
+// (delete-sync) has a conflicted sync to refuse against. Under auto-mirror that
+// is the only registry guard left.
 func seedConflict(t *testing.T, f *actionFixture) {
 	t.Helper()
 	conflict := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -61,13 +47,13 @@ func seedConflict(t *testing.T, f *actionFixture) {
 	}
 }
 
-// --- GET /games (admin) --------------------------------------------------
+// --- GET /syncs (admin) --------------------------------------------------
 
-func TestGamesPage_AdminSeesRegistry(t *testing.T) {
+func TestSyncsPage_AdminSeesRegistry(t *testing.T) {
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "bob") // admin
 
-	req := httptest.NewRequest(http.MethodGet, "/games", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
@@ -75,41 +61,39 @@ func TestGamesPage_AdminSeesRegistry(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"super-metroid", "Super Metroid", "Add a game", "csrf_token", "bob-deck"} {
+	for _, want := range []string{"sm-bob", "Super Metroid", "New sync", "csrf_token", "bob-deck"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("games page missing %q", want)
+			t.Errorf("syncs page missing %q", want)
 		}
 	}
 }
 
-func TestGamesPage_NonAdminForbidden(t *testing.T) {
+func TestSyncsPage_NonAdminForbidden(t *testing.T) {
 	f := newActionFixture(t)
 	c, _ := loginAs(t, f, "carol") // regular user
 
-	req := httptest.NewRequest(http.MethodGet, "/games", nil)
+	req := httptest.NewRequest(http.MethodGet, "/syncs", nil)
 	req.AddCookie(c)
 	rec := httptest.NewRecorder()
 	f.srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("non-admin GET /games = %d, want 403", rec.Code)
+		t.Fatalf("non-admin GET /syncs = %d, want 403", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "Admins only") {
 		t.Errorf("expected an 'Admins only' page, got: %s", rec.Body.String())
 	}
 }
 
-func TestGamesPage_SearchFilter(t *testing.T) {
+func TestSyncsPage_SearchFilter(t *testing.T) {
 	f := newActionFixture(t)
 	ctx := context.Background()
-	if err := f.store.CreateGame(ctx, store.Game{ID: "zelda", Display: "Zelda", System: "nes"}); err != nil {
-		t.Fatalf("seed game: %v", err)
+	if err := f.store.CreateSync(ctx, store.Sync{ID: "z-link", Game: "Zelda", Name: "Link's stream"}); err != nil {
+		t.Fatalf("seed sync: %v", err)
 	}
 	c, _ := loginAs(t, f, "bob")
 
-	// Use the HX-Request header so the handler returns just the filtered
-	// games-list fragment (the full page embeds a placeholder "super-metroid"
-	// in the add-game form, which is not part of the result set).
-	req := httptest.NewRequest(http.MethodGet, "/games?q=zel", nil)
+	// HX-Request so the handler returns just the filtered syncs-list fragment.
+	req := httptest.NewRequest(http.MethodGet, "/syncs?q=zel", nil)
 	req.AddCookie(c)
 	req.Header.Set("HX-Request", "true")
 	rec := httptest.NewRecorder()
@@ -118,141 +102,11 @@ func TestGamesPage_SearchFilter(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "zelda") {
-		t.Error("search q=zel should match zelda")
+	if !strings.Contains(body, "z-link") {
+		t.Error("search q=zel should match the Zelda sync")
 	}
-	if strings.Contains(body, "super-metroid") {
-		t.Error("search q=zel should not match super-metroid")
-	}
-}
-
-// --- POST /api/games (create) --------------------------------------------
-
-func TestCreateGame_ExplicitID(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games", url.Values{
-		"id": {"chrono-trigger"}, "display": {"Chrono Trigger"}, "system": {"snes"},
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
-	}
-	g, err := f.store.GetGame(context.Background(), "chrono-trigger")
-	if err != nil {
-		t.Fatalf("game not created: %v", err)
-	}
-	if g.Display != "Chrono Trigger" || g.System != "snes" {
-		t.Errorf("created game wrong: %+v", g)
-	}
-}
-
-func TestCreateGame_AutoSlugFromDisplay(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	// No id; display has caps, spaces, and punctuation.
-	rec := postForm(t, f, c, csrf, "/api/games", url.Values{
-		"display": {"Super Mario Bros. 3!"}, "system": {"nes"},
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
-	}
-	if _, err := f.store.GetGame(context.Background(), "super-mario-bros-3"); err != nil {
-		t.Fatalf("auto-slug game not created as 'super-mario-bros-3': %v\nids: %v",
-			err, gameIDs(t, f))
-	}
-}
-
-func TestCreateGame_DuplicateID_409(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games", url.Values{
-		"id": {"super-metroid"}, "display": {"Dupe"}, "system": {"snes"},
-	})
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("duplicate id status = %d, want 409", rec.Code)
-	}
-}
-
-func TestCreateGame_InvalidExplicitID_400(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games", url.Values{
-		"id": {"Super Metroid"}, "display": {"Super Metroid"}, "system": {"snes"},
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid id status = %d, want 400", rec.Code)
-	}
-	if gameIDs(t, f)["Super Metroid"] {
-		t.Error("game created despite invalid id")
-	}
-}
-
-func TestCreateGame_MissingDisplay_400(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games", url.Values{
-		"id": {"x"}, "system": {"snes"}, // no display
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing display status = %d, want 400", rec.Code)
-	}
-}
-
-// --- POST /api/games/{id} (edit) -----------------------------------------
-
-func TestEditGame_HappyPath(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid", url.Values{
-		"display": {"Super Metroid (USA)"}, "system": {"snes"}, "notes": {"the good one"},
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("edit status = %d, want 200\n%s", rec.Code, rec.Body.String())
-	}
-	g, err := f.store.GetGame(context.Background(), "super-metroid")
-	if err != nil {
-		t.Fatalf("get game: %v", err)
-	}
-	if g.Display != "Super Metroid (USA)" || g.Notes != "the good one" {
-		t.Errorf("edit did not apply: %+v", g)
-	}
-}
-
-// --- POST /api/games/{id}/delete -----------------------------------------
-
-func TestDeleteGame_HappyPath(t *testing.T) {
-	f := newActionFixture(t)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/delete", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("delete status = %d, want 200\n%s", rec.Code, rec.Body.String())
-	}
-	if gameIDs(t, f)["super-metroid"] {
-		t.Error("game not deleted")
-	}
-}
-
-func TestDeleteGame_Conflicted_Friendly409(t *testing.T) {
-	f := newActionFixture(t)
-	seedConflict(t, f)
-	c, csrf := loginAs(t, f, "bob")
-
-	rec := postForm(t, f, c, csrf, "/api/games/super-metroid/delete", nil)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("conflicted delete status = %d, want 409 (not 500)", rec.Code)
-	}
-	if !strings.Contains(strings.ToLower(rec.Body.String()), "conflict") {
-		t.Errorf("expected a friendly 'conflict' message, got: %s", rec.Body.String())
-	}
-	if !gameIDs(t, f)["super-metroid"] {
-		t.Error("game deleted despite a conflicted sync")
+	if strings.Contains(body, "sm-bob") {
+		t.Error("search q=zel should not match the Super Metroid sync")
 	}
 }
 
@@ -263,12 +117,12 @@ func TestCreateSync_AutoID(t *testing.T) {
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"game_id": {"super-metroid"}, "name": {"Alice stream"},
+		"game": {"Super Metroid"}, "name": {"Alice stream"},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create sync status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
-	// Auto-id is slugify(game_id + "-" + name).
+	// Auto-id is slugify(game + "-" + name).
 	if _, err := f.store.GetSync(context.Background(), "super-metroid-alice-stream"); err != nil {
 		t.Fatalf("auto-id sync not created: %v\n%s", err, syncIDs(t, f))
 	}
@@ -279,13 +133,31 @@ func TestCreateSync_ExplicitID(t *testing.T) {
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"id": {"sm-alice"}, "game_id": {"super-metroid"}, "name": {"Alice stream"},
+		"id": {"sm-alice"}, "game": {"Super Metroid"}, "name": {"Alice stream"},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create sync status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
 	sy, err := f.store.GetSync(context.Background(), "sm-alice")
-	if err != nil || sy.Name != "Alice stream" || sy.GameID != "super-metroid" {
+	if err != nil || sy.Name != "Alice stream" || sy.Game != "Super Metroid" {
+		t.Fatalf("sync wrong: %+v err=%v", sy, err)
+	}
+}
+
+// TestCreateSync_ArbitraryGameLabel asserts the game label is free text: a label
+// naming no registry row (there is no registry) is accepted, not rejected.
+func TestCreateSync_ArbitraryGameLabel(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id": {"brand-new"}, "game": {"Some Brand New Title"}, "name": {"Stream"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("arbitrary label create status = %d, want 200 (label is free text)\n%s", rec.Code, rec.Body.String())
+	}
+	sy, err := f.store.GetSync(context.Background(), "brand-new")
+	if err != nil || sy.Game != "Some Brand New Title" {
 		t.Fatalf("sync wrong: %+v err=%v", sy, err)
 	}
 }
@@ -295,22 +167,22 @@ func TestCreateSync_DuplicateID_409(t *testing.T) {
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"id": {"sm-bob"}, "game_id": {"super-metroid"}, "name": {"Dupe"},
+		"id": {"sm-bob"}, "game": {"Super Metroid"}, "name": {"Dupe"},
 	})
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("duplicate sync id status = %d, want 409", rec.Code)
 	}
 }
 
-func TestCreateSync_MissingGame_422(t *testing.T) {
+func TestCreateSync_MissingGame_400(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"game_id": {"ghost-game"}, "name": {"Stream"},
+		"name": {"Stream"}, // no game label
 	})
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("missing game status = %d, want 422", rec.Code)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing game label status = %d, want 400", rec.Code)
 	}
 }
 
@@ -320,7 +192,7 @@ func TestCreateSync_BadSlug_400(t *testing.T) {
 
 	// Explicit id with spaces/caps -> invalid slug -> 400.
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"id": {"Bad ID"}, "game_id": {"super-metroid"}, "name": {"Stream"},
+		"id": {"Bad ID"}, "game": {"Super Metroid"}, "name": {"Stream"},
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad slug status = %d, want 400", rec.Code)
@@ -332,26 +204,38 @@ func TestCreateSync_MissingName_400(t *testing.T) {
 	c, csrf := loginAs(t, f, "bob")
 
 	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
-		"game_id": {"super-metroid"}, // no name
+		"game": {"Super Metroid"}, // no name
 	})
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing name status = %d, want 400", rec.Code)
 	}
 }
 
-// --- POST /api/syncs/{id} (rename) ---------------------------------------
+// --- POST /api/syncs/{id} (edit: rename + relabel) -----------------------
 
 func TestRenameSync_HappyPath(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
-	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob", url.Values{"name": {"Renamed stream"}})
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob", url.Values{
+		"name": {"Renamed stream"}, "game": {"Super Metroid (USA)"},
+	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("rename status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
 	sy, _ := f.store.GetSync(context.Background(), "sm-bob")
-	if sy.Name != "Renamed stream" || sy.GameID != "super-metroid" {
-		t.Errorf("rename did not apply / lost game_id: %+v", sy)
+	if sy.Name != "Renamed stream" || sy.Game != "Super Metroid (USA)" {
+		t.Errorf("rename/relabel did not apply: %+v", sy)
+	}
+}
+
+func TestRenameSync_MissingName_400(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob", url.Values{"game": {"X"}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename missing name status = %d, want 400", rec.Code)
 	}
 }
 
@@ -359,7 +243,7 @@ func TestRenameSync_Missing_404(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
-	rec := postForm(t, f, c, csrf, "/api/syncs/ghost", url.Values{"name": {"X"}})
+	rec := postForm(t, f, c, csrf, "/api/syncs/ghost", url.Values{"name": {"X"}, "game": {"X"}})
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("rename missing status = %d, want 404", rec.Code)
 	}
@@ -433,7 +317,7 @@ func TestSetSyncMember_FileInAnotherSync_409(t *testing.T) {
 	f := newActionFixture(t)
 	ctx := context.Background()
 	// Create a second sync, then claim (mister, "shared.sav") there.
-	if err := f.store.CreateSync(ctx, store.Sync{ID: "sm-other", GameID: "super-metroid", Name: "Other"}); err != nil {
+	if err := f.store.CreateSync(ctx, store.Sync{ID: "sm-other", Game: "Super Metroid", Name: "Other"}); err != nil {
 		t.Fatalf("create sync: %v", err)
 	}
 	if err := f.store.SetSyncMember(ctx, store.SyncMember{SyncID: "sm-other", NodeID: "mister", Path: "shared.sav"}); err != nil {
@@ -511,16 +395,13 @@ func TestDeleteSyncMember_AnyMemberRemovable(t *testing.T) {
 
 // --- admin-gating across every mutation ----------------------------------
 
-func TestGamesMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
+func TestSyncsMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
 	mutations := []struct {
 		name, path string
 		fields     url.Values
 	}{
-		{"create-game", "/api/games", url.Values{"id": {"hax"}, "display": {"Hax"}, "system": {"snes"}}},
-		{"edit-game", "/api/games/super-metroid", url.Values{"display": {"Hijacked"}, "system": {"snes"}}},
-		{"delete-game", "/api/games/super-metroid/delete", nil},
-		{"create-sync", "/api/syncs", url.Values{"id": {"hax-sync"}, "game_id": {"super-metroid"}, "name": {"Hax"}}},
-		{"rename-sync", "/api/syncs/sm-bob", url.Values{"name": {"Hijacked"}}},
+		{"create-sync", "/api/syncs", url.Values{"id": {"hax-sync"}, "game": {"Super Metroid"}, "name": {"Hax"}}},
+		{"rename-sync", "/api/syncs/sm-bob", url.Values{"name": {"Hijacked"}, "game": {"Hijacked"}}},
 		{"delete-sync", "/api/syncs/sm-bob/delete", nil},
 		{"set-member", "/api/syncs/sm-bob/members/mister", url.Values{"path": {"x.sav"}}},
 		{"del-member", "/api/syncs/sm-bob/members/carol-deck/delete", nil},
@@ -533,17 +414,6 @@ func TestGamesMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
 			rec := postForm(t, f, c, csrf, m.path, m.fields)
 			if rec.Code != http.StatusForbidden {
 				t.Fatalf("%s as non-admin = %d, want 403", m.name, rec.Code)
-			}
-			ids := gameIDs(t, f)
-			if ids["hax"] {
-				t.Error("non-admin created a game")
-			}
-			if !ids["super-metroid"] {
-				t.Error("non-admin deleted a game")
-			}
-			g, _ := f.store.GetGame(context.Background(), "super-metroid")
-			if g.Display == "Hijacked" {
-				t.Error("non-admin edited a game")
 			}
 			if syncIDsMap(t, f)["hax-sync"] {
 				t.Error("non-admin created a sync")
@@ -567,16 +437,13 @@ func TestGamesMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
 
 // --- CSRF across every mutation ------------------------------------------
 
-func TestGamesMutations_CSRF(t *testing.T) {
+func TestSyncsMutations_CSRF(t *testing.T) {
 	mutations := []struct {
 		name, path string
 		fields     url.Values
 	}{
-		{"create-game", "/api/games", url.Values{"id": {"csrfgame"}, "display": {"X"}, "system": {"snes"}}},
-		{"edit-game", "/api/games/super-metroid", url.Values{"display": {"X"}, "system": {"snes"}}},
-		{"delete-game", "/api/games/super-metroid/delete", nil},
-		{"create-sync", "/api/syncs", url.Values{"id": {"csrfsync"}, "game_id": {"super-metroid"}, "name": {"X"}}},
-		{"rename-sync", "/api/syncs/sm-bob", url.Values{"name": {"X"}}},
+		{"create-sync", "/api/syncs", url.Values{"id": {"csrfsync"}, "game": {"Super Metroid"}, "name": {"X"}}},
+		{"rename-sync", "/api/syncs/sm-bob", url.Values{"name": {"X"}, "game": {"X"}}},
 		{"delete-sync", "/api/syncs/sm-bob/delete", nil},
 		{"set-member", "/api/syncs/sm-bob/members/mister", url.Values{"path": {"x.sav"}}},
 		{"del-member", "/api/syncs/sm-bob/members/carol-deck/delete", nil},
@@ -593,12 +460,6 @@ func TestGamesMutations_CSRF(t *testing.T) {
 				rec := postForm(t, f, c, tc.token, m.path, m.fields)
 				if rec.Code != http.StatusForbidden {
 					t.Fatalf("%s %s = %d, want 403", m.name, tc.label, rec.Code)
-				}
-				if gameIDs(t, f)["csrfgame"] {
-					t.Error("CSRF-less create-game mutated the store")
-				}
-				if !gameIDs(t, f)["super-metroid"] {
-					t.Error("CSRF-less delete-game mutated the store")
 				}
 				if syncIDsMap(t, f)["csrfsync"] {
 					t.Error("CSRF-less create-sync mutated the store")

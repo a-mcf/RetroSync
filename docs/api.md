@@ -5,7 +5,7 @@
 > forms cannot issue `PATCH`/`PUT`/`DELETE`, and HTMX submits forms). The routes
 > below are the *actual* routes registered in `internal/web/server.go`. A JSON API
 > with proper REST verbs (`PATCH`/`PUT`/`DELETE`) is **deferred** until a non-HTMX
-> client exists to justify it; the read-only `GET /api/{status,games,nodes}`
+> client exists to justify it; the read-only `GET /api/{status,syncs,nodes}`
 > endpoints already emit JSON for that future.
 
 All non-public routes require an authenticated session (see auth.md). Auth and
@@ -17,7 +17,7 @@ authorization are enforced by middleware before any handler runs:
   **per-session** synchronizer token (minted at login, rotated on each login,
   compared in constant time). It travels in the `X-CSRF-Token` header (HTMX) or a
   `csrf_token` form field. A missing/invalid token (or no session) → `403`.
-- **Admin-gating** — all **registry** mutations (`/nodes`, `/games`, sync + member
+- **Admin-gating** — all **registry** mutations (`/nodes`, `/syncs`, sync + member
   edits, smoke-test) are admin-only; a non-admin → `403` ("admins only").
 - **Member-owner/admin-gating** — `resolve-conflict` (the only play-side action
   under auto-mirror) requires the caller to **own at least one of the sync's
@@ -128,48 +128,30 @@ HTML result fragment: "reachable" (and bumps `last_seen_at`) on success, or the
 error surfaced to the admin. For an `ssh` node the adapter is not wired yet, so the
 fragment says "not supported yet (ssh adapter pending)". Unknown node → `404`.
 
-## Registry — Games (admin-only)
-
-### `GET /games`
-
-The game registry admin page (or the list fragment for an `HX-Request`). Query
-params: `q` (substring over id/display), `system`.
-
-### `POST /api/games`
-
-Create. Form fields: `id?`, `display`, `system`, `notes?`. When `id` is omitted it
-is auto-generated as a slug from `display` (manual id overrides). Validation
-failure (bad/empty fields, invalid slug) → `400`; duplicate id → `409`.
-
-### `POST /api/games/{id}`
-
-Edit (path id authoritative). Unknown game → `404`, else same mapping as create.
-
-### `POST /api/games/{id}/delete`
-
-Delete. The game's `syncs` (and their `sync_members` / `manifest` / `sync_log`)
-cascade; a **conflicted** sync on the game blocks it → `409` ("a sync of this game
-is in conflict — resolve it first"), so an unresolved fork is never silently
-discarded. Unknown game → `404`.
-
 ## Registry — Syncs (admin-only)
 
 A *sync* is the unit of mirroring: a set of `(node, save-file path)` members that
-sync together. A game may have many independent syncs. These routes edit the
-registry (distinct from the play-side `/api/syncs/{id}/resolve-conflict` route,
-which drives the engine and is member-owner/admin-gated).
+sync together. Each sync carries a free-text **game label** (a display grouping);
+many syncs may share a label. These routes edit the registry (distinct from the
+play-side `/api/syncs/{id}/resolve-conflict` route, which drives the engine and is
+member-owner/admin-gated).
+
+### `GET /syncs`
+
+The sync registry admin page (or, for an `HX-Request`, the list fragment). Query
+param: `q` (case-insensitive substring over the game label + sync name + id).
 
 ### `POST /api/syncs`
 
-Create. Form fields: `game_id` (required), `name` (required), `id?`. When `id` is
-omitted it is auto-generated as a slug from `game_id` + `name`; a manual id
-overrides. Bad/empty fields or an invalid derived slug → `400`; missing game (FK)
-→ `422`; duplicate id → `409`.
+Create. Form fields: `game` (the free-text label, required), `name` (required),
+`id?`. When `id` is omitted it is auto-generated as a slug from `game` + `name`; a
+manual id overrides. Bad/empty fields or an invalid derived slug → `400`; duplicate
+id → `409`. (The label is free text — there is no missing-game / FK case.)
 
-### `POST /api/syncs/{id}` (rename)
+### `POST /api/syncs/{id}` (edit)
 
-Rename. Form field: `name` (required). The id and game are immutable here. Empty
-name → `400`; unknown sync → `404`.
+Edit. Form fields: `name` (required) and `game` (the label, required). The id is
+immutable; `name` and `game` are editable. Empty → `400`; unknown sync → `404`.
 
 ### `POST /api/syncs/{id}/delete`
 
@@ -202,7 +184,7 @@ These three emit JSON today (the seed of a future agent-facing API). Auth requir
 ```json
 {
   "syncs": [
-    { "sync_id": "sm-bob", "game_id": "super-metroid", "conflict": false,
+    { "sync_id": "sm-bob", "game": "Super Metroid", "conflict": false,
       "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" }
   ],
   "nodes": [
@@ -218,27 +200,22 @@ last successful mirror pass (or `null`).
 > `reachable` / backup-health are **not yet wired to Syncthing** — they are
 > cosmetic until a status poller lands (see open-questions.md).
 
-### `GET /api/games`
+### `GET /api/syncs`
 
-List games with their syncs (JSON). Each sync carries its members (node + path +
-last-known manifest mtime) and its auto-mirror `state`:
+A **flat** JSON array of syncs (not grouped under games). Each element carries its
+game label, its members (node + path + last-known manifest mtime), and its
+auto-mirror `state`. Supports the `q` filter (same substring as `GET /syncs`):
 
 ```json
 [
   {
-    "id": "super-metroid",
-    "display": "Super Metroid",
-    "system": "snes",
-    "syncs": [
-      {
-        "id": "sm-bob",
-        "name": "Bob's stream",
-        "state": { "conflict": false, "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" },
-        "members": [
-          { "node_id": "bob-deck", "path": "sm.srm", "mtime": "2026-06-21T11:30:00Z" },
-          { "node_id": "carol-deck", "path": "sm.srm", "mtime": null }
-        ]
-      }
+    "id": "sm-bob",
+    "game": "Super Metroid",
+    "name": "Bob's stream",
+    "state": { "conflict": false, "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" },
+    "members": [
+      { "node_id": "bob-deck", "path": "sm.srm", "mtime": "2026-06-21T11:30:00Z" },
+      { "node_id": "carol-deck", "path": "sm.srm", "mtime": null }
     ]
   }
 ]
@@ -256,5 +233,5 @@ List nodes (JSON).
 
 - A JSON mutation API with `PATCH`/`PUT`/`DELETE` verbs (the v1 surface is
   POST-only because it is HTMX/form-driven).
-- `GET /api/games/{id}/log` (a JSON history endpoint) — `sync_log` is written and
+- `GET /api/syncs/{id}/log` (a JSON history endpoint) — `sync_log` is written and
   read by the engine, but no dedicated history endpoint is exposed yet.

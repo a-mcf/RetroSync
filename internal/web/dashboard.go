@@ -34,11 +34,11 @@ type userView struct {
 // last-known mtime and the sync's state (in sync / conflict). A Resolve button
 // appears ONLY when the sync is in conflict.
 type mySyncRow struct {
-	SyncID      string
-	SyncName    string
-	GameDisplay string
-	System      string
-	Nodes       []nodeMtimeLine
+	SyncID   string
+	SyncName string
+	// Game is the sync's free-text game label (a display grouping; "" when unset).
+	Game  string
+	Nodes []nodeMtimeLine
 	// Conflict is true when the sync forked (conflict_at set); the row shows a
 	// red "sync paused" banner with a Resolve button.
 	Conflict bool
@@ -69,15 +69,6 @@ type nodeRow struct {
 // the page (returns the error); the handler turns that into a 500.
 func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardData, error) {
 	now := s.now()
-
-	games, err := s.store.ListGames(ctx, store.GameFilter{})
-	if err != nil {
-		return dashboardData{}, fmt.Errorf("list games: %w", err)
-	}
-	gameByID := make(map[string]store.Game, len(games))
-	for _, g := range games {
-		gameByID[g.ID] = g
-	}
 
 	nodes, err := s.store.ListNodes(ctx)
 	if err != nil {
@@ -134,19 +125,18 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		}
 		sort.Slice(lines, func(i, j int) bool { return lines[i].NodeID < lines[j].NodeID })
 		data.MySyncs = append(data.MySyncs, mySyncRow{
-			SyncID:      syncID,
-			SyncName:    sy.Name,
-			GameDisplay: displayOf(gameByID, sy.GameID),
-			System:      systemOf(gameByID, sy.GameID),
-			Nodes:       lines,
-			Conflict:    sy.ConflictAt != nil,
-			LastSync:    fmtTimeAgo(sy.LastSynced, now),
+			SyncID:   syncID,
+			SyncName: sy.Name,
+			Game:     sy.Game,
+			Nodes:    lines,
+			Conflict: sy.ConflictAt != nil,
+			LastSync: fmtTimeAgo(sy.LastSynced, now),
 		})
 	}
-	// Deterministic order: by game display then sync id.
+	// Deterministic order: by game label then sync id.
 	sort.Slice(data.MySyncs, func(i, j int) bool {
-		if data.MySyncs[i].GameDisplay != data.MySyncs[j].GameDisplay {
-			return data.MySyncs[i].GameDisplay < data.MySyncs[j].GameDisplay
+		if data.MySyncs[i].Game != data.MySyncs[j].Game {
+			return data.MySyncs[i].Game < data.MySyncs[j].Game
 		}
 		return data.MySyncs[i].SyncID < data.MySyncs[j].SyncID
 	})
@@ -162,20 +152,6 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 	}
 
 	return data, nil
-}
-
-func displayOf(m map[string]store.Game, id string) string {
-	if g, ok := m[id]; ok && g.Display != "" {
-		return g.Display
-	}
-	return id
-}
-
-func systemOf(m map[string]store.Game, id string) string {
-	if g, ok := m[id]; ok {
-		return g.System
-	}
-	return ""
 }
 
 // fmtMtime renders a manifest mtime, or the "no save yet" sentinel when unknown.

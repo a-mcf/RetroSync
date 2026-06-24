@@ -6,7 +6,6 @@ package memory
 import (
 	"context"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +19,6 @@ type Store struct {
 
 	users map[string]store.User
 	nodes map[string]store.Node
-	games map[string]store.Game
 	// manifest keyed by (sync_id, node_id).
 	manifest map[smKey]store.ManifestEntry
 	// log is the append-only sync_log, ordered by append; nextLogID assigns the
@@ -57,7 +55,6 @@ func New() *Store {
 	return &Store{
 		users:       make(map[string]store.User),
 		nodes:       make(map[string]store.Node),
-		games:       make(map[string]store.Game),
 		manifest:    make(map[smKey]store.ManifestEntry),
 		nextLogID:   1,
 		syncs:       make(map[string]store.Sync),
@@ -233,89 +230,6 @@ func (s *Store) DeleteNode(_ context.Context, id string) error {
 	return nil
 }
 
-// ---- Games ----
-
-func (s *Store) CreateGame(_ context.Context, g store.Game) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.games[g.ID]; ok {
-		return store.ErrConflict
-	}
-	s.games[g.ID] = g
-	return nil
-}
-
-func (s *Store) GetGame(_ context.Context, id string) (store.Game, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	g, ok := s.games[id]
-	if !ok {
-		return store.Game{}, store.ErrNotFound
-	}
-	return g, nil
-}
-
-func (s *Store) ListGames(_ context.Context, f store.GameFilter) ([]store.Game, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	q := strings.ToLower(f.Q)
-	out := make([]store.Game, 0, len(s.games))
-	for _, g := range s.games {
-		if f.System != "" && g.System != f.System {
-			continue
-		}
-		if q != "" &&
-			!strings.Contains(strings.ToLower(g.ID), q) &&
-			!strings.Contains(strings.ToLower(g.Display), q) {
-			continue
-		}
-		out = append(out, g)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
-}
-
-func (s *Store) UpdateGame(_ context.Context, g store.Game) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.games[g.ID]; !ok {
-		return store.ErrNotFound
-	}
-	s.games[g.ID] = g
-	return nil
-}
-
-func (s *Store) DeleteGame(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.games[id]; !ok {
-		return store.ErrNotFound
-	}
-	// Under auto-mirror every sync is mirroring; there is no "active session" to
-	// tear down. But a CONFLICTED sync is paused awaiting a human's resolution —
-	// deleting its game would silently discard that unresolved fork. Refuse in
-	// that case (ErrConflict -> friendly 409 "resolve the conflict first"); a
-	// non-conflicted game deletes and cascades freely.
-	for syncID, sy := range s.syncs {
-		if sy.GameID != id {
-			continue
-		}
-		if s.syncs[syncID].ConflictAt != nil {
-			return store.ErrConflict
-		}
-	}
-	delete(s.games, id)
-	// Cascade: syncs.game_id REFERENCES games ON DELETE CASCADE. Each deleted sync
-	// in turn cascades its members, manifest, and sync_log.
-	for syncID, sy := range s.syncs {
-		if sy.GameID != id {
-			continue
-		}
-		s.deleteSyncCascade(syncID)
-	}
-	return nil
-}
-
 // deleteSyncCascade removes a sync and every row that cascades from it:
 // sync_members, manifest, and sync_log. The caller must hold s.mu. It does NOT
 // remove the syncs entry's siblings — only the given sync. (The sync's runtime
@@ -453,9 +367,7 @@ func (s *Store) ListManifestBySync(_ context.Context, syncID string) ([]store.Ma
 func (s *Store) CreateSync(_ context.Context, sy store.Sync) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.games[sy.GameID]; !ok {
-		return store.ErrInvalidReference
-	}
+	// Game is a free-text label, not an FK: any value (including "") is allowed.
 	if _, ok := s.syncs[sy.ID]; ok {
 		return store.ErrConflict
 	}
@@ -475,19 +387,6 @@ func (s *Store) GetSync(_ context.Context, id string) (store.Sync, error) {
 		return store.Sync{}, store.ErrNotFound
 	}
 	return cloneSync(sy), nil
-}
-
-func (s *Store) ListSyncsByGame(_ context.Context, gameID string) ([]store.Sync, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]store.Sync, 0)
-	for _, sy := range s.syncs {
-		if sy.GameID == gameID {
-			out = append(out, cloneSync(sy))
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
 }
 
 func (s *Store) ListSyncs(_ context.Context) ([]store.Sync, error) {
@@ -510,13 +409,11 @@ func (s *Store) UpdateSync(_ context.Context, sy store.Sync) error {
 	if !ok {
 		return store.ErrNotFound
 	}
-	if _, ok := s.games[sy.GameID]; !ok {
-		return store.ErrInvalidReference
-	}
-	// UpdateSync rewrites the registry fields (game_id, name) only; the runtime
+	// UpdateSync rewrites the registry fields (game label, name) only; the runtime
 	// state (conflict_at, last_synced) is owned by SetSyncConflict/MarkSyncSynced
-	// and preserved across a rename, mirroring the Postgres UPDATE column list.
-	cur.GameID = sy.GameID
+	// and preserved across a rename, mirroring the Postgres UPDATE column list. The
+	// game label is free text (no FK), so there is no reference to validate.
+	cur.Game = sy.Game
 	cur.Name = sy.Name
 	s.syncs[sy.ID] = cur
 	return nil

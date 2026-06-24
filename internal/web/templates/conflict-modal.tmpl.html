@@ -1,8 +1,8 @@
 {{define "conflict-modal"}}
 <div class="modal-backdrop" id="modal-backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-label="Resolve conflict for {{.GameDisplay}}">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Resolve conflict for {{if .Game}}{{.Game}}{{else}}sync{{end}}">
     <div class="modal-head">
-      <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} — sync paused <span class="sub">{{.System}}</span></h3>
+      <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}} — sync paused</h3>
       <button class="modal-close" type="button"
               aria-label="Close"
               onclick="document.getElementById('modal').innerHTML='';">&times;</button>

@@ -212,20 +212,17 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-// handleAPIGames implements GET /api/games (docs/api.md shape). Supports the
-// documented q / system filters.
-func (s *Server) handleAPIGames(w http.ResponseWriter, r *http.Request) {
-	f := store.GameFilter{
-		Q:      r.URL.Query().Get("q"),
-		System: r.URL.Query().Get("system"),
-	}
-	games, err := s.buildGames(r.Context(), f)
+// handleAPISyncs implements GET /api/syncs (docs/api.md shape). Supports the
+// documented q filter (a case-insensitive substring over the game label, sync
+// name, and id).
+func (s *Server) handleAPISyncs(w http.ResponseWriter, r *http.Request) {
+	syncs, err := s.buildSyncs(r.Context(), strings.TrimSpace(r.URL.Query().Get("q")))
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "api/games failed", "err", err.Error())
+		s.logger.ErrorContext(r.Context(), "api/syncs failed", "err", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	writeJSON(w, http.StatusOK, games)
+	writeJSON(w, http.StatusOK, syncs)
 }
 
 // handleAPINodes implements GET /api/nodes.

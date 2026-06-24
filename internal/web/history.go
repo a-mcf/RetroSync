@@ -20,12 +20,12 @@ const historyListLimit = store.SaveVersionRetention
 // historyPageData drives the save-history page: every member of the sync with
 // its captured save versions (newest-first), each offering a Restore button.
 type historyPageData struct {
-	SyncID      string
-	SyncName    string
-	GameDisplay string
-	System      string
-	Members     []historyMember
-	CSRF        string
+	SyncID   string
+	SyncName string
+	// Game is the sync's free-text game label (a display grouping; "" when unset).
+	Game    string
+	Members []historyMember
+	CSRF    string
 }
 
 // historyMember is one member node and its captured versions on the history page.
@@ -60,13 +60,6 @@ func (s *Server) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	g, err := s.store.GetGame(r.Context(), sy.GameID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.logger.ErrorContext(r.Context(), "history: get game failed", "err", err.Error())
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
 	members, err := s.store.ListSyncMembers(r.Context(), syncID)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "history: list members failed", "err", err.Error())
@@ -76,14 +69,10 @@ func (s *Server) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	data := historyPageData{
-		SyncID:      sy.ID,
-		SyncName:    sy.Name,
-		GameDisplay: g.Display,
-		System:      g.System,
-		CSRF:        s.csrfFor(r),
-	}
-	if data.GameDisplay == "" {
-		data.GameDisplay = sy.GameID
+		SyncID:   sy.ID,
+		SyncName: sy.Name,
+		Game:     sy.Game,
+		CSRF:     s.csrfFor(r),
 	}
 	for _, m := range members {
 		vs, err := s.store.ListSaveVersions(r.Context(), syncID, m.NodeID, historyListLimit)

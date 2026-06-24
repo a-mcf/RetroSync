@@ -164,10 +164,7 @@ func newActionFixture(t *testing.T) *actionFixture {
 	mustNode("carol-deck", &carol)
 	mustNode("mister", nil)
 
-	if err := st.CreateGame(ctx, store.Game{ID: "super-metroid", Display: "Super Metroid", System: "snes"}); err != nil {
-		t.Fatalf("create game: %v", err)
-	}
-	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", GameID: "super-metroid", Name: "Bob's stream"}); err != nil {
+	if err := st.CreateSync(ctx, store.Sync{ID: "sm-bob", Game: "Super Metroid", Name: "Bob's stream"}); err != nil {
 		t.Fatalf("create sync: %v", err)
 	}
 	mtime := time.Date(2026, 6, 21, 11, 0, 0, 0, time.UTC)

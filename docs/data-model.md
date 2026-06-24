@@ -2,12 +2,18 @@
 
 > **Implemented.** All tables below exist as embedded migrations applied at
 > startup, behind the storage-agnostic `internal/store.Store` (Postgres + in-memory
-> fake, one conformance suite). The registry (users, nodes, games, syncs,
-> sync_members) is edited through the admin UI; game/node/sync ids are slugs,
+> fake, one conformance suite). The registry (users, nodes, syncs,
+> sync_members) is edited through the admin UI; node/sync ids are slugs,
 > auto-generated from the display/name when omitted (manual id overrides).
 > Per-sync runtime state (`syncs.conflict_at` / `syncs.last_synced`), `manifest`,
 > and `sync_log` are written by the engine/daemon. See the "Storage choice" note
 > below.
+>
+> **Note (flatten games, slice 21):** the `games` table was **dropped** (migration
+> 0008). The `sync` is now the atomic entity; "game" is a free-text **LABEL** on the
+> sync (`syncs.game`) — a display grouping (which a later slice will infer from save
+> filenames), **not** a stored entity. There is no games registry, no `Game` type,
+> and no game CRUD.
 >
 > **Note (auto-mirror, slice 18):** the old `active_bindings` table (one row per
 > game/sync in an explicit "play session", with a primary node + direction) was
@@ -54,29 +60,19 @@ A node is any device that holds save files. Decks, MiSTers, Anbernics, the house
 - `syncthing-share`: `{ "path": "/srv/syncthing/bob-deck-saves" }`
 - `ssh`: `{ "host": "172.16.7.12", "user": "root", "secret_ref": "mister-1" }` — `secret_ref` is a key into the host's secret store (sops file, vault, etc).
 
-### `games`
-
-| field    | type | notes                                |
-|----------|------|--------------------------------------|
-| id       | text | slug, e.g. `super-metroid`           |
-| display  | text | "Super Metroid"                      |
-| system   | text | `snes`, `n64`, etc. — informational  |
-| notes    | text | free-form                            |
-
-Note: no `mister_path` or canonical path here. A game's playable members live in
-its `syncs`' `sync_members`.
-
 ### `syncs`
 
 A *sync* is a mirror group: a specific set of `(node, save-file)` members that
-sync together. It belongs to one game, but a game may have MANY independent syncs
-(e.g. two unrelated streams of the same title) so long as they do not share a
-`(node, path)` member.
+sync together. It carries a free-text **game label** (a display grouping); many
+independent syncs may share the same label (e.g. two unrelated streams of the same
+title) so long as they do not share a `(node, path)` member. The label is **not** a
+foreign key — any text is allowed (a later slice will infer it from save
+filenames).
 
 | field        | type | notes                                                        |
 |--------------|------|--------------------------------------------------------------|
 | id           | text | slug, e.g. `sm-bob`                                           |
-| game_id      | text | FK → games, `ON DELETE CASCADE`                              |
+| game         | text | free-text label (display grouping); NOT a foreign key; defaults to `''` |
 | name         | text | free-form label, e.g. "Bob's stream"                         |
 | conflict_at  | ts   | nullable; set when the sync forked (2+ members changed) — mirroring is paused until a human resolves it |
 | last_synced  | ts   | nullable; time of the last successful mirror pass            |
@@ -115,15 +111,16 @@ This keeps registry rows portable if a path prefix moves.
 Example:
 
 ```
-games:
-  super-metroid:
-    syncs:
-      sm-bob (Bob's stream):
-        bob-deck:           retroarch/saves/Super Metroid.srm
-        living-room-mister: SNES/Super Metroid.sav
-      sm-alice (Alice's stream):
-        alice-deck:         Emulation/saves/snes9x/Super Metroid.srm
+syncs:
+  sm-bob (game: "Super Metroid", Bob's stream):
+    bob-deck:           retroarch/saves/Super Metroid.srm
+    living-room-mister: SNES/Super Metroid.sav
+  sm-alice (game: "Super Metroid", Alice's stream):
+    alice-deck:         Emulation/saves/snes9x/Super Metroid.srm
 ```
+
+(The `game:` value is just a label on each sync — two syncs sharing it is a display
+grouping, not a relationship to any stored entity.)
 
 ## Runtime state
 

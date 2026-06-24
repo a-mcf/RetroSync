@@ -251,11 +251,8 @@ func TestRestoreVersion_CrossSync_Rejected_SyncBUntouched(t *testing.T) {
 	}
 	mustN("node-a", &carol)
 	mustN("node-b", nil) // carol does NOT own node-b
-	if err := st.CreateGame(ctx, store.Game{ID: "g", Display: "G", System: "snes"}); err != nil {
-		t.Fatalf("create game: %v", err)
-	}
 	for _, id := range []string{"sync-a", "sync-b"} {
-		if err := st.CreateSync(ctx, store.Sync{ID: id, GameID: "g"}); err != nil {
+		if err := st.CreateSync(ctx, store.Sync{ID: id, Game: "G"}); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
 	}

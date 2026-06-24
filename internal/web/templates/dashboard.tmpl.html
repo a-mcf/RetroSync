@@ -16,7 +16,7 @@
         e.detail.isError = false;
       }
     });
-    // Filter the "My syncs" cards by game display + sync name (case-insensitive
+    // Filter the "My syncs" cards by game label + sync name (case-insensitive
     // substring). Purely client-side: the list is already rendered, so no
     // round-trip is needed. Wired to the search box's oninput.
     function rsFilterMySyncs(q) {
@@ -36,7 +36,7 @@
     <header class="top">
       <h1>RetroSync</h1>
       <span class="who">
-        {{if eq .User.Role "admin"}}<a href="/games">Games</a> &nbsp;<a href="/nodes">Nodes</a> &nbsp;{{end}}
+        {{if eq .User.Role "admin"}}<a href="/syncs">Syncs</a> &nbsp;<a href="/nodes">Nodes</a> &nbsp;{{end}}
         {{.User.Display}} ({{.User.Role}})
         &nbsp;
         <form class="logout" method="post" action="/logout">
@@ -50,7 +50,7 @@
       <h2>My syncs</h2>
       <p class="sub">Every sync mirrors automatically. There is nothing to start or
          stop — this is a status view. The only action is resolving a conflict.</p>
-      <!-- Client-side filter over the My-syncs cards below (by game display +
+      <!-- Client-side filter over the My-syncs cards below (by game label +
            sync name). Each card carries a data-filter string; the input hides
            non-matching cards. No round-trip — the list is already rendered. -->
       <input class="search" id="mysyncs-search" type="search"
@@ -61,8 +61,8 @@
         <p class="empty">No syncs map to your nodes yet.</p>
       {{else}}
         {{range .MySyncs}}
-        <div class="card mysync-card" data-filter="{{.GameDisplay}} {{.SyncName}}">
-          <h3>{{.GameDisplay}}{{if .SyncName}} — {{.SyncName}}{{end}} <span class="sub">{{.System}}</span>
+        <div class="card mysync-card" data-filter="{{.Game}} {{.SyncName}}">
+          <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}
             <a class="history-link sub" href="/syncs/{{.SyncID}}/history">History</a>
           </h3>
           {{if .Conflict}}

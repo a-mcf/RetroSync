@@ -23,7 +23,7 @@ There's no per-node API token because nodes don't call retrosync; retrosync call
 
 Single-tenant household — keep this minimal, two roles is enough.
 
-**Implemented gating.** Registry mutations (`/nodes`, `/games`, syncs and their
+**Implemented gating.** Registry mutations (`/nodes`, `/syncs` and their
 members, smoke-test) are admin-only — a non-admin gets a `403` before the Store
 is touched. Resolving a conflict (`/api/syncs/{id}/resolve-conflict`) requires the
 caller to **own a member node of that sync** *or* be an admin — enforced by
