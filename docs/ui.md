@@ -111,7 +111,8 @@ Per-node configuration UI. See auth.md.
 
 ## Couch ergonomics
 
-- Big tap targets. The dashboard "Play on <node>" button should be the largest thing on the page.
+- Big tap targets. The dashboard's primary action — **Resolve conflict** when a
+  sync is paused — should be the largest, most obvious thing on a conflicted card.
 - Touch-friendly modal close (×) corners.
 - Dark mode by default.
 - Keyboard nav nice-to-have, not required.

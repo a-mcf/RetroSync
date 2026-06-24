@@ -18,7 +18,8 @@
                   │  └─ retrosync      │── SFTP/SSH ──────────────┘
                   │     ├─ web UI      │
                   │     ├─ registry    │
-                  │     └─ play loop   │
+                  │     └─ auto-mirror │
+                  │        poll loop   │
                   └────────────────────┘
 ```
 
@@ -77,10 +78,15 @@ For syncthing-share nodes the writeback path is the tricky one: writing into the
 
 retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root prevents key auth without rebuilding linux.img; see the home_infra ansible role for context).
 
-## Why two channels (recap)
+## Backup vs. mirroring (recap)
 
-- **Backup** must be always-on and unidirectional (device → server). It must never push back to a device. If retrosync the service dies, backup keeps working.
-- **Play** is small, explicit, and bidirectional. Only the syncs you've configured are touched. Conflicts are surfaced, not auto-merged.
+- **Backup** (Syncthing) is always-on and unidirectional (device → server). It
+  must never push back to a device. If retrosync the service dies, backup keeps
+  working. retrosync only *reads* from these shares.
+- **Mirroring** (retrosync's auto-mirror loop) is bidirectional, but only the
+  syncs you've configured are ever touched. Every configured sync mirrors
+  automatically — there is no play session to start. Conflicts are surfaced, not
+  auto-merged.
 
 ## Deployment
 
