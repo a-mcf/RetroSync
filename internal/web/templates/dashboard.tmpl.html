@@ -96,10 +96,6 @@
         {{range .Nodes}}
         <div class="card">
           <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
-          <div class="sub">
-            {{if .Reachable}}<span class="badge ok">reachable</span>{{else}}<span class="badge bad">not seen</span>{{end}}
-            &nbsp; last seen: {{.LastSeen}}
-          </div>
         </div>
         {{end}}
       {{end}}

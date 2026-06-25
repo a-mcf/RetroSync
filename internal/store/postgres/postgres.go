@@ -152,15 +152,15 @@ func (s *Store) CreateNode(ctx context.Context, n store.Node) error {
 		return fmt.Errorf("marshal reach_config: %w", err)
 	}
 	_, err = s.db.Exec(ctx,
-		`INSERT INTO nodes (id, owner_user_id, display, kind, reach, reach_config, last_seen_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		n.ID, n.OwnerUserID, n.Display, string(n.Kind), string(n.Reach), cfg, n.LastSeenAt)
+		`INSERT INTO nodes (id, owner_user_id, display, kind, reach, reach_config)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		n.ID, n.OwnerUserID, n.Display, string(n.Kind), string(n.Reach), cfg)
 	return mapErr(err)
 }
 
 func (s *Store) GetNode(ctx context.Context, id string) (store.Node, error) {
 	row := s.db.QueryRow(ctx,
-		`SELECT id, owner_user_id, display, kind, reach, reach_config, last_seen_at
+		`SELECT id, owner_user_id, display, kind, reach, reach_config
 		 FROM nodes WHERE id = $1`, id)
 	n, err := scanNode(row)
 	if err != nil {
@@ -171,7 +171,7 @@ func (s *Store) GetNode(ctx context.Context, id string) (store.Node, error) {
 
 func (s *Store) ListNodes(ctx context.Context) ([]store.Node, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, owner_user_id, display, kind, reach, reach_config, last_seen_at
+		`SELECT id, owner_user_id, display, kind, reach, reach_config
 		 FROM nodes ORDER BY id`)
 	if err != nil {
 		return nil, mapErr(err)
@@ -195,8 +195,8 @@ func (s *Store) UpdateNode(ctx context.Context, n store.Node) error {
 	}
 	tag, err := s.db.Exec(ctx,
 		`UPDATE nodes SET owner_user_id = $2, display = $3, kind = $4, reach = $5,
-		 reach_config = $6, last_seen_at = $7 WHERE id = $1`,
-		n.ID, n.OwnerUserID, n.Display, string(n.Kind), string(n.Reach), cfg, n.LastSeenAt)
+		 reach_config = $6 WHERE id = $1`,
+		n.ID, n.OwnerUserID, n.Display, string(n.Kind), string(n.Reach), cfg)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -230,7 +230,7 @@ func scanNode(r rowScanner) (store.Node, error) {
 		rch  string
 		cfg  []byte
 	)
-	if err := r.Scan(&n.ID, &n.OwnerUserID, &n.Display, &kind, &rch, &cfg, &n.LastSeenAt); err != nil {
+	if err := r.Scan(&n.ID, &n.OwnerUserID, &n.Display, &kind, &rch, &cfg); err != nil {
 		return store.Node{}, err
 	}
 	n.Kind = store.Kind(kind)

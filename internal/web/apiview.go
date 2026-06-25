@@ -32,9 +32,7 @@ type statusSync struct {
 }
 
 type statusNode struct {
-	ID        string  `json:"id"`
-	Reachable bool    `json:"reachable"`
-	LastSeen  *string `json:"last_seen,omitempty"`
+	ID string `json:"id"`
 }
 
 func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
@@ -62,9 +60,7 @@ func (s *Server) buildStatus(ctx context.Context) (statusResponse, error) {
 	}
 	for _, n := range nodes {
 		out.Nodes = append(out.Nodes, statusNode{
-			ID:        n.ID,
-			Reachable: n.LastSeenAt != nil,
-			LastSeen:  rfc3339Ptr(n.LastSeenAt),
+			ID: n.ID,
 		})
 	}
 	return out, nil
@@ -155,7 +151,6 @@ type nodeResponse struct {
 	Display     string  `json:"display"`
 	Kind        string  `json:"kind"`
 	Reach       string  `json:"reach"`
-	LastSeen    *string `json:"last_seen,omitempty"`
 }
 
 func (s *Server) buildNodes(ctx context.Context) ([]nodeResponse, error) {
@@ -171,7 +166,6 @@ func (s *Server) buildNodes(ctx context.Context) ([]nodeResponse, error) {
 			Display:     n.Display,
 			Kind:        string(n.Kind),
 			Reach:       string(n.Reach),
-			LastSeen:    rfc3339Ptr(n.LastSeenAt),
 		})
 	}
 	return out, nil

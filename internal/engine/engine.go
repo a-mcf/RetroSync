@@ -341,9 +341,9 @@ const smokeTestRoot = "."
 //     so it never needs to import internal/reach.
 //     TODO(slice-ssh): a real ssh adapter makes this an actual reachability probe.
 //
-// SmokeTest is read-only: it never mutates the store or the node. It does NOT
-// touch last_seen_at; updating that on success is the web handler's choice (it
-// owns the store) so the engine stays a pure logic-over-ports component.
+// SmokeTest is read-only: it never mutates the store or the node. Its result is
+// transient — nothing is persisted (the web handler renders a one-off
+// reachable/error pill) — so the engine stays a pure logic-over-ports component.
 // A missing node returns store.ErrNotFound.
 func (e *Engine) SmokeTest(ctx context.Context, nodeID string) error {
 	node, err := e.store.GetNode(ctx, nodeID)
