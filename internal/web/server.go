@@ -121,7 +121,19 @@ type Server struct {
 	// failed login against it (for an unknown username) keeps login timing
 	// roughly constant, mitigating username enumeration via response time.
 	dummyHash string
+	// loginSem caps concurrent argon2id verifications (see handleLogin). Each
+	// verify pins ~64 MiB, so an uncapped burst of POST /login requests —
+	// including failures, which still burn a dummy verify — could pin N×64 MiB
+	// and OOM a memory-limited pod. Buffered-channel semaphore, capacity
+	// loginVerifyLimit.
+	loginSem chan struct{}
 }
+
+// loginVerifyLimit is the maximum number of argon2id verifications running at
+// once. 4 bounds the worst-case verify memory at ~256 MiB (4 × the 64 MiB
+// argon2id memory cost) — safe in a small pod, and far more parallelism than a
+// household's real login traffic ever needs.
+const loginVerifyLimit = 4
 
 // Options configures New. A nil Now or Logger gets a sane default.
 type Options struct {
@@ -172,6 +184,7 @@ func New(st store.Store, opts Options) (*Server, error) {
 		logger:    logger,
 		now:       now,
 		dummyHash: dummy,
+		loginSem:  make(chan struct{}, loginVerifyLimit),
 	}, nil
 }
 

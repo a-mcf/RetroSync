@@ -207,6 +207,31 @@ func TestDiscoverCreateSync_EmptySelection_400(t *testing.T) {
 	}
 }
 
+// TestDiscoverCreateSync_BadCandidatePath_400: a candidate path from the form
+// gets the same lexical member-path gate as the /syncs member routes — an
+// absolute or ".."-carrying path is 400'd before any sync is created.
+func TestDiscoverCreateSync_BadCandidatePath_400(t *testing.T) {
+	for _, bad := range []string{"../../etc/passwd", "/etc/passwd", "a\\b.srm"} {
+		t.Run(bad, func(t *testing.T) {
+			f := newActionFixture(t)
+			c, csrf := loginAs(t, f, "bob")
+
+			rec := postForm(t, f, c, csrf, "/api/discover/create-sync", url.Values{
+				"game":      {"Super Metroid"},
+				"name":      {"Main"},
+				"id":        {"sm-evil"},
+				"candidate": {candidateValue("bob-deck", bad)},
+			})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("bad candidate path %q status = %d, want 400\n%s", bad, rec.Code, rec.Body.String())
+			}
+			if syncIDsMap(t, f)["sm-evil"] {
+				t.Error("sync created despite a bad candidate path")
+			}
+		})
+	}
+}
+
 func TestDiscoverCreateSync_MissingGame_400(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")

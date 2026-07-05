@@ -140,6 +140,132 @@ func TestLoginGoodCredsSetsCookieAndRedirects(t *testing.T) {
 	}
 }
 
+// TestLoginSemaphoreFull_CancelledContextReturnsPromptly: the login verify
+// semaphore (the argon2id memory-DoS cap) must respect context cancellation.
+// With every slot held, a login request whose context is already cancelled has
+// to return promptly with an error status — not queue forever — and must not
+// mint a session.
+func TestLoginSemaphoreFull_CancelledContextReturnsPromptly(t *testing.T) {
+	srv := newTestServer(t)
+	h := srv.Handler()
+
+	// Hold every semaphore slot so acquisition can only complete via ctx.Done.
+	for i := 0; i < cap(srv.loginSem); i++ {
+		srv.loginSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(srv.loginSem); i++ {
+			<-srv.loginSem
+		}
+	}()
+
+	form := url.Values{"username": {"bob"}, "password": {testPassword}}
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel() // the client is already gone
+	req = req.WithContext(ctx)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		done <- rec
+	}()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+		if c := sessionCookie(rec.Result().Cookies()); c != nil {
+			t.Fatal("cancelled login set a session cookie")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("login deadlocked on a full verify semaphore")
+	}
+}
+
+// TestDashboard_AdminSeesAllSyncs: an admin who owns ZERO nodes still sees
+// every sync on the dashboard (docs/ui.md) — otherwise a household whose nodes
+// have no owner set has no UI path to the conflict Resolve button. The
+// conflicted sync's card must render the Resolve button, and no member line
+// gets the "(yours)" marker (the admin owns none of the nodes).
+func TestDashboard_AdminSeesAllSyncs(t *testing.T) {
+	f := newActionFixture(t)
+	ctx := context.Background()
+
+	// An admin owning no nodes at all.
+	hash, err := auth.Hash(testPassword)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if err := f.store.CreateUser(ctx, store.User{ID: "root", Display: "Root", PwHash: hash, Role: store.RoleAdmin}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// A conflicted sync whose only member is on the unowned node "mister".
+	if err := f.store.CreateSync(ctx, store.Sync{ID: "z-link", Game: "Zelda", Name: "Link's stream"}); err != nil {
+		t.Fatalf("create sync: %v", err)
+	}
+	if err := f.store.SetSyncMember(ctx, store.SyncMember{SyncID: "z-link", NodeID: "mister", Path: "zelda.srm"}); err != nil {
+		t.Fatalf("set member: %v", err)
+	}
+	conflict := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	if err := f.store.SetSyncConflict(ctx, "z-link", &conflict); err != nil {
+		t.Fatalf("set conflict: %v", err)
+	}
+
+	c, _ := loginAs(t, f, "root")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"z-link", "sm-bob", "Resolve conflict"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("admin dashboard missing %q", want)
+		}
+	}
+	if strings.Contains(body, "(yours)") {
+		t.Error("admin owning no nodes got a \"(yours)\" member marker")
+	}
+}
+
+// TestDashboard_NonAdminSeesOnlyOwnedMemberSyncs: a regular user's dashboard
+// keeps the owned-member filter — a sync with no member on any node they own
+// stays hidden.
+func TestDashboard_NonAdminSeesOnlyOwnedMemberSyncs(t *testing.T) {
+	f := newActionFixture(t)
+	ctx := context.Background()
+	if err := f.store.CreateSync(ctx, store.Sync{ID: "z-link", Game: "Zelda", Name: "Link's stream"}); err != nil {
+		t.Fatalf("create sync: %v", err)
+	}
+	if err := f.store.SetSyncMember(ctx, store.SyncMember{SyncID: "z-link", NodeID: "mister", Path: "zelda.srm"}); err != nil {
+		t.Fatalf("set member: %v", err)
+	}
+
+	c, _ := loginAs(t, f, "carol") // regular user, owns carol-deck (member of sm-bob)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "sm-bob") {
+		t.Error("carol's dashboard should show sm-bob (member on her carol-deck)")
+	}
+	if strings.Contains(body, "z-link") {
+		t.Error("carol's dashboard leaked z-link (no member on any node she owns)")
+	}
+	if !strings.Contains(body, "(yours)") {
+		t.Error("carol's own member line should carry the \"(yours)\" marker")
+	}
+}
+
 func TestRequireAuthBlocksDashboard(t *testing.T) {
 	h := newTestServer(t).Handler()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)

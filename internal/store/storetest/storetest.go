@@ -30,6 +30,7 @@ func Run(t *testing.T, newStore Factory) {
 		fn   func(t *testing.T, s store.Store)
 	}{
 		{"Users", testUsers},
+		{"DeleteUserOwningNode", testDeleteUserOwningNode},
 		{"Nodes", testNodes},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
@@ -46,6 +47,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"Syncs", testSyncs},
 		{"SyncFreeTextGameLabel", testSyncFreeTextGameLabel},
 		{"SyncMembers", testSyncMembers},
+		{"SyncMemberRepointClearsManifest", testSyncMemberRepointClearsManifest},
+		{"SyncMemberDeleteClearsManifest", testSyncMemberDeleteClearsManifest},
 		{"SyncMemberUniquePathInvariant", testSyncMemberUniquePathInvariant},
 		{"SyncMemberInvalidReference", testSyncMemberInvalidReference},
 		{"SyncCascades", testSyncCascades},
@@ -133,6 +136,45 @@ func testUsers(t *testing.T, s store.Store) {
 	}
 	if err := s.DeleteUser(c, "bob"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("DeleteUser(missing): want ErrNotFound, got %v", err)
+	}
+}
+
+// testDeleteUserOwningNode asserts DeleteUser refuses a user who still owns a
+// node: nodes.owner_user_id REFERENCES users (id) with no cascade, so the
+// delete is a foreign-key violation -> ErrInvalidReference in BOTH stores. Once
+// the node is reassigned (or deleted), the user is deletable.
+func testDeleteUserOwningNode(t *testing.T, s store.Store) {
+	c := ctx()
+	mustUser(t, s, "bob")
+	mustUser(t, s, "carol")
+	mustNode(t, s, "bob-deck", ptr("bob"))
+
+	// bob still owns bob-deck: refuse, and leave the user in place.
+	if err := s.DeleteUser(c, "bob"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("DeleteUser(owning node): want ErrInvalidReference, got %v", err)
+	}
+	if _, err := s.GetUser(c, "bob"); err != nil {
+		t.Fatalf("refused DeleteUser must not remove the user: %v", err)
+	}
+
+	// Reassign the node to carol -> bob is deletable.
+	n, err := s.GetNode(c, "bob-deck")
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	n.OwnerUserID = ptr("carol")
+	must(t, s.UpdateNode(c, n))
+	if err := s.DeleteUser(c, "bob"); err != nil {
+		t.Fatalf("DeleteUser after reassigning node: %v", err)
+	}
+
+	// carol now owns it: refused until the node itself is deleted.
+	if err := s.DeleteUser(c, "carol"); !errors.Is(err, store.ErrInvalidReference) {
+		t.Fatalf("DeleteUser(new owner): want ErrInvalidReference, got %v", err)
+	}
+	must(t, s.DeleteNode(c, "bob-deck"))
+	if err := s.DeleteUser(c, "carol"); err != nil {
+		t.Fatalf("DeleteUser after deleting node: %v", err)
 	}
 }
 
@@ -789,6 +831,76 @@ func testSyncMembers(t *testing.T, s store.Store) {
 	}
 	if err := s.DeleteSyncMember(c, "sm-bob", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("DeleteSyncMember(missing): want ErrNotFound, got %v", err)
+	}
+}
+
+// testSyncMemberRepointClearsManifest asserts the "appeared fresh" semantics of
+// a repoint: when SetSyncMember CHANGES an existing member's path, that
+// member's manifest row is cleared — so the next engine poll treats the newly
+// pointed-at file as fresh instead of comparing it against the OLD file's
+// manifest (which could fan the new content out with no conflict prompt). A
+// same-path re-upsert preserves the manifest, and other members' manifests are
+// untouched.
+func testSyncMemberRepointClearsManifest(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	mustNode(t, s, "mister", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "saves/a.srm"}))
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "mister", Path: "SNES/a.sav"}))
+
+	mtime := time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)
+	size := int64(512)
+	sha := "abc123"
+	must(t, s.SetManifest(c, store.ManifestEntry{
+		SyncID: "sm-bob", NodeID: "bob-deck", Mtime: &mtime, Size: &size, SHA256: &sha,
+	}))
+	must(t, s.SetManifest(c, store.ManifestEntry{
+		SyncID: "sm-bob", NodeID: "mister", Mtime: &mtime, Size: &size, SHA256: &sha,
+	}))
+
+	// Same-path upsert: the manifest survives (no spurious "fresh" reset).
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "saves/a.srm"}))
+	got, err := s.GetManifest(c, "sm-bob", "bob-deck")
+	if err != nil {
+		t.Fatalf("manifest after same-path upsert: %v", err)
+	}
+	if got.SHA256 == nil || *got.SHA256 != sha {
+		t.Fatalf("manifest after same-path upsert mutated: %+v", got)
+	}
+
+	// Path change: THAT member's manifest is cleared...
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "saves/b.srm"}))
+	if _, err := s.GetManifest(c, "sm-bob", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("manifest after repoint: want ErrNotFound, got %v", err)
+	}
+	// ...while the other member's manifest is untouched.
+	if _, err := s.GetManifest(c, "sm-bob", "mister"); err != nil {
+		t.Fatalf("other member's manifest must survive a repoint: %v", err)
+	}
+}
+
+// testSyncMemberDeleteClearsManifest asserts DeleteSyncMember removes the
+// member's manifest row along with the membership (manifest is keyed by
+// (sync, node) and no FK cascades it from sync_members), so a later re-add of
+// the same member — any path — starts fresh with no manifest.
+func testSyncMemberDeleteClearsManifest(t *testing.T, s store.Store) {
+	c := ctx()
+	mustSync(t, s, "sm-bob", "super-metroid")
+	mustNode(t, s, "bob-deck", nil)
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "saves/a.srm"}))
+	sha := "abc123"
+	must(t, s.SetManifest(c, store.ManifestEntry{SyncID: "sm-bob", NodeID: "bob-deck", SHA256: &sha}))
+
+	must(t, s.DeleteSyncMember(c, "sm-bob", "bob-deck"))
+	if _, err := s.GetManifest(c, "sm-bob", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("manifest after member delete: want ErrNotFound, got %v", err)
+	}
+
+	// Re-adding the member (same path, even) starts with no manifest.
+	must(t, s.SetSyncMember(c, store.SyncMember{SyncID: "sm-bob", NodeID: "bob-deck", Path: "saves/a.srm"}))
+	if _, err := s.GetManifest(c, "sm-bob", "bob-deck"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("manifest after re-add: want ErrNotFound, got %v", err)
 	}
 }
 

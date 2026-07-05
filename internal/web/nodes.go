@@ -5,6 +5,7 @@ import (
 	"errors"
 	"html/template"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -324,6 +325,11 @@ type browsePicker struct {
 	// HasParent is false at the root (no up-link there).
 	Parent    string
 	HasParent bool
+	// EncodedParent is Parent url.QueryEscape'd for embedding in the up-link's
+	// hx-get ?path= query. html/template only URL-escapes href/src attributes,
+	// NOT hx-get, so a directory named "Mario & Luigi" would otherwise misparse
+	// as a second query parameter.
+	EncodedParent string
 	// Entries are the directory's contents (dirs first, then files), metadata only.
 	Entries []browseEntry
 	// Message, when non-empty, replaces the listing with a friendly note (e.g.
@@ -336,11 +342,15 @@ type browsePicker struct {
 // entry (Dir joined with Name), which is exactly the member path a file click
 // fills in. It carries metadata only — no contents.
 type browseEntry struct {
-	Name  string
-	Rel   string
-	IsDir bool
-	Size  int64
-	Mtime time.Time
+	Name string
+	Rel  string
+	// EncodedRel is Rel url.QueryEscape'd for the folder row's hx-get ?path=
+	// query (hx-get is not an href, so html/template does no URL escaping of
+	// its own — see browsePicker.EncodedParent).
+	EncodedRel string
+	IsDir      bool
+	Size       int64
+	Mtime      time.Time
 }
 
 // handleBrowseNode implements GET /api/nodes/{id}/browse?path=<rel>. It returns
@@ -407,6 +417,7 @@ func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 			parent = ""
 		}
 		pick.Parent = parent
+		pick.EncodedParent = url.QueryEscape(parent)
 	}
 	for _, e := range entries {
 		rel := e.Name
@@ -414,11 +425,12 @@ func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 			rel = dir + "/" + e.Name
 		}
 		pick.Entries = append(pick.Entries, browseEntry{
-			Name:  e.Name,
-			Rel:   rel,
-			IsDir: e.IsDir,
-			Size:  e.Size,
-			Mtime: e.Mtime,
+			Name:       e.Name,
+			Rel:        rel,
+			EncodedRel: url.QueryEscape(rel),
+			IsDir:      e.IsDir,
+			Size:       e.Size,
+			Mtime:      e.Mtime,
 		})
 	}
 	s.renderBrowse(w, r, pick)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -78,6 +79,60 @@ func TestBrowse_SubdirRelPathPropagatesAndUpLink(t *testing.T) {
 	calls := f.act.browseCalls()
 	if len(calls) != 1 || calls[0].relPath != "saves" {
 		t.Fatalf("browse calls = %+v, want relPath saves", calls)
+	}
+}
+
+// TestBrowse_SpecialCharDirNavigates: a directory whose name contains URL
+// metacharacters ("Mario & Luigi") must render a folder link with a
+// URL-ENCODED ?path= (hx-get is not an href, so html/template does no URL
+// escaping of its own), and following that link must deliver the decoded path
+// to the engine intact.
+func TestBrowse_SpecialCharDirNavigates(t *testing.T) {
+	f := newActionFixture(t)
+	f.act.browseEntries = []engine.DirEntry{
+		{Name: "Mario & Luigi", IsDir: true},
+	}
+	c, _ := loginAs(t, f, "bob")
+
+	rec := getBrowse(t, f, c, "/api/nodes/bob-deck/browse?path=")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root browse status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	// html/template additionally HTML-escapes the attribute value (e.g. "+" ->
+	// "&#43;"); the browser decodes that before HTMX requests the URL, so
+	// assert on the browser-decoded attribute text.
+	if !strings.Contains(html.UnescapeString(rec.Body.String()), "browse?path=Mario+%26+Luigi") {
+		t.Fatalf("folder link not URL-encoded:\n%s", rec.Body.String())
+	}
+
+	// Follow the rendered link: the engine must receive the decoded directory.
+	f.act.browseEntries = []engine.DirEntry{{Name: "game.srm", Size: 8}}
+	rec = getBrowse(t, f, c, "/api/nodes/bob-deck/browse?path=Mario+%26+Luigi")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subdir browse status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	calls := f.act.browseCalls()
+	if got := calls[len(calls)-1].relPath; got != "Mario & Luigi" {
+		t.Fatalf("engine relPath = %q, want %q", got, "Mario & Luigi")
+	}
+}
+
+// TestBrowse_SpecialCharParentUpLinkEncoded: browsing a subdirectory OF a
+// special-char directory renders an up-link whose ?path= is the URL-encoded
+// parent, so the up navigation survives & + % etc. too.
+func TestBrowse_SpecialCharParentUpLinkEncoded(t *testing.T) {
+	f := newActionFixture(t)
+	f.act.browseEntries = []engine.DirEntry{{Name: "game.srm", Size: 8}}
+	c, _ := loginAs(t, f, "bob")
+
+	rec := getBrowse(t, f, c, "/api/nodes/bob-deck/browse?path=Mario+%26+Luigi%2Fsaves")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	// See TestBrowse_SpecialCharDirNavigates: compare the browser-decoded
+	// attribute text (html/template HTML-escapes "+" inside the attribute).
+	if !strings.Contains(html.UnescapeString(rec.Body.String()), "browse?path=Mario+%26+Luigi\"") {
+		t.Fatalf("up-link parent not URL-encoded:\n%s", rec.Body.String())
 	}
 }
 

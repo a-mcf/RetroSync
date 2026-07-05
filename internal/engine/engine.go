@@ -25,10 +25,13 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/reach"
@@ -46,10 +49,23 @@ type ResolveReach func(node store.Node) (reach.Reach, error)
 type Clock func() time.Time
 
 // Engine implements the play-sync operations. Construct with New.
+//
+// Concurrency: the daemon's poll sweep and the web layer's ResolveConflict /
+// RestoreVersion share ONE Engine, so the mutating operations serialize
+// per sync via lockSync — two operations on the SAME sync never interleave
+// their capture/WriteAtomic/setManifest sequences (which could leave members
+// holding different saves while the sync reports synced); operations on
+// DIFFERENT syncs run freely in parallel.
 type Engine struct {
 	store   store.Store
 	resolve ResolveReach
 	clock   Clock
+
+	// mu guards syncMu. syncMu holds one mutex per sync id, lazily created and
+	// never removed — fine for a household-scale registry (a handful of syncs,
+	// each entry a few dozen bytes).
+	mu     sync.Mutex
+	syncMu map[string]*sync.Mutex
 }
 
 // New builds an Engine. clock may be nil, in which case time.Now (UTC) is used.
@@ -57,7 +73,43 @@ func New(s store.Store, resolve ResolveReach, clock Clock) *Engine {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	return &Engine{store: s, resolve: resolve, clock: clock}
+	return &Engine{store: s, resolve: resolve, clock: clock, syncMu: make(map[string]*sync.Mutex)}
+}
+
+// lockSync acquires the per-sync mutex for syncID (creating it on first use)
+// and returns it locked, so callers can write:
+//
+//	defer e.lockSync(syncID).Unlock()
+//
+// It serializes the engine's mutating operations (Poll, ResolveConflict,
+// RestoreVersion) on one sync for their FULL duration, so e.g. a poll sweep
+// and a web-triggered restore can never interleave writes on the same sync.
+// Acquisition is deliberately not ctx-aware: waiters (including a timed-out
+// poll) block until the holder finishes, which is fine at household scale
+// with a single serial daemon; the holder itself still honors ctx.
+func (e *Engine) lockSync(syncID string) *sync.Mutex {
+	e.mu.Lock()
+	m, ok := e.syncMu[syncID]
+	if !ok {
+		m = &sync.Mutex{}
+		e.syncMu[syncID] = m
+	}
+	e.mu.Unlock()
+	m.Lock()
+	return m
+}
+
+// hashBytes returns the lowercase-hex sha256 of data — the exact string format
+// the reach adapters' Hash produces (see localfs.Hash) and the manifest /
+// save-version store compare against. Capture and fan-out hash the bytes they
+// ACTUALLY READ with this, in-process, instead of re-hashing the file on disk:
+// on a live share the file can change between a Read and a Hash, and a re-hash
+// would record a hash that does not describe the bytes in hand (poisoning the
+// content-addressed save_blobs store, whose ON CONFLICT (hash) DO NOTHING keeps
+// the first blob stored under a hash forever).
+func hashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // Sentinel errors specific to the engine. Callers compare with errors.Is.
@@ -139,6 +191,10 @@ type changedMember struct {
 // is written. The manifest and last_synced advance only after a successful write
 // (crash-safety: the manifest trails the actual write).
 func (e *Engine) Poll(ctx context.Context, syncID string) error {
+	// Serialize with any concurrent ResolveConflict/RestoreVersion (and other
+	// Polls) on this sync for the full pass.
+	defer e.lockSync(syncID).Unlock()
+
 	sy, err := e.store.GetSync(ctx, syncID)
 	if err != nil {
 		return fmt.Errorf("engine: get sync: %w", err)
@@ -253,7 +309,6 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 	// Safe to index [0]: the len(changedSet)==0 case returned earlier, so changedSet
 	// is non-empty by construction here.
 	src := changedSet[0]
-	srcHash := src.hash
 	// Every changer holds the agreed content already (one distinct hash), so they
 	// must NOT be re-written — fan out only to members that don't already have it.
 	// This also makes the multi-changer-same-content case write nothing spurious.
@@ -261,13 +316,23 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 	for _, cm := range changedSet {
 		alreadyHave[cm.sn.node.ID] = true
 	}
-	if err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], srcHash, alreadyHave, reasonPropagate, now); err != nil {
+	// fanOut hashes the source bytes it ACTUALLY reads and returns that hash, so
+	// every written member's manifest describes the propagated bytes even if the
+	// source file moved between the tier-2 Hash above and the fan-out Read.
+	actualHash, err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], alreadyHave, reasonPropagate, now)
+	if err != nil {
 		return err
 	}
 	// Record each changer's own manifest state (each already holds the agreed
-	// content), carrying the agreed hash. The source is included here.
+	// content). The source carries the hash of the bytes fanOut actually read
+	// from it; every other co-changer carries its own tier-2 hash (the bytes IT
+	// holds — equal to the agreed hash by the one-distinct-hash construction).
 	for _, cm := range changedSet {
-		if err := e.setManifest(ctx, syncID, cm.sn.node.ID, metas[cm.sn.node.ID], srcHash, now); err != nil {
+		hash := cm.hash
+		if cm.sn.node.ID == src.sn.node.ID {
+			hash = actualHash
+		}
+		if err := e.setManifest(ctx, syncID, cm.sn.node.ID, metas[cm.sn.node.ID], hash, now); err != nil {
 			return err
 		}
 	}
@@ -462,6 +527,12 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 // If any capture or fan-out write fails, conflict_at is left set (the sync stays
 // conflicted and re-resolvable) and the error is returned.
 func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID string) error {
+	// Serialize with any concurrent Poll/RestoreVersion (and a second resolve)
+	// on this sync for the full resolution. Two racing resolves therefore run
+	// one-after-another: the first clears the conflict, the second reloads the
+	// sync under the lock and fails ErrNotConflicted instead of double-fanning.
+	defer e.lockSync(syncID).Unlock()
+
 	sy, err := e.store.GetSync(ctx, syncID)
 	if err != nil {
 		return fmt.Errorf("engine: get sync: %w", err)
@@ -478,12 +549,13 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	if !ok {
 		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrNoPath)
 	}
-	// TODO(slice-daemon): TOCTOU window — the winner is stat'd here, re-read in
-	// fanOut, and each loser is independently re-stat'd/re-read for capture, so a
-	// file can change between these stats/reads. Harmless today (no concurrent
-	// poll loop drives this path), but when the timer loop lands a file mutated
-	// mid-resolution could be captured or fanned out inconsistently; revisit to
-	// snapshot each node once under the concurrency model then in place.
+	// Engine-side interleavings are gone (lockSync serializes Poll / resolve /
+	// restore on this sync), but an EXTERNAL writer — the device itself, via a
+	// live Syncthing share — can still mutate a file between the stat here and
+	// the read in fanOut. That is tolerated: capture and fan-out hash the bytes
+	// they ACTUALLY read (never a second on-disk Hash of a possibly-moving
+	// file), so manifests and captured versions always describe real bytes, and
+	// the next poll re-detects any file that moved mid-resolution.
 	winnerMeta, winnerPresent, err := e.statOpt(ctx, winner)
 	if err != nil {
 		return err
@@ -491,27 +563,23 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	if !winnerPresent {
 		return fmt.Errorf("engine: winner %q: %w", winnerNodeID, ErrSourceMissing)
 	}
-	// The winner's content hash is the authority recorded in the manifest for the
-	// winner and every node it is fanned out to.
-	winnerHash, err := winner.r.Hash(ctx, winner.path)
-	if err != nil {
-		return fmt.Errorf("engine: hash winner %s: %w", winner.node.ID, err)
-	}
 
 	now := e.clock()
 
 	// Fan out the winner to every other in-scope node, advancing the manifest
-	// (carrying the winner's hash) only after each successful write. fanOut
+	// only after each successful write. fanOut hashes the winner bytes it
+	// ACTUALLY reads (the authority recorded in every written manifest) and
 	// captures each loser-with-a-file's pre-resolution bytes into the server
 	// save-version store (reason "conflict-resolve") BEFORE overwriting them — a
 	// hard gate: a capture or write failure returns the error and (because we have
 	// NOT cleared conflict_at) leaves the sync conflicted for re-resolution. No
 	// skip set here: a resolve deliberately overwrites every loser with the winner.
-	if err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, winnerHash, nil, reasonConflictResolve, now); err != nil {
+	winnerHash, err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, nil, reasonConflictResolve, now)
+	if err != nil {
 		return err
 	}
 	// Record the winner's own manifest state (it is the authority for this pass),
-	// carrying its content hash.
+	// carrying the hash of the bytes that were actually fanned out.
 	if err := e.setManifest(ctx, syncID, winner.node.ID, winnerMeta, winnerHash, now); err != nil {
 		return err
 	}
@@ -556,6 +624,10 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 // syncID — never on the version's own ver.SyncID — so a restore can only ever
 // mutate the sync the caller was authorized against.
 func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) error {
+	// Serialize with any concurrent Poll/ResolveConflict (and other restores) on
+	// this sync for the full restore.
+	defer e.lockSync(syncID).Unlock()
+
 	ver, data, err := e.store.GetSaveVersionData(ctx, syncID, seq)
 	if err != nil {
 		return fmt.Errorf("engine: restore load version %d (sync %s): %w", seq, syncID, err)
@@ -608,8 +680,11 @@ func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) e
 
 	// Step 2: fan the restored bytes out to every OTHER member, capturing each
 	// one's pre-restore bytes before overwriting. The target is the source; it is
-	// skipped by fanOut (src == dst).
-	if err := e.fanOut(ctx, syncID, target, scoped, restoredMeta, restoredHash, nil, reasonRestore, now); err != nil {
+	// skipped by fanOut (src == dst). fanOut re-reads the target and hashes the
+	// bytes it actually reads for the written members' manifests (equal to
+	// restoredHash unless an external writer mutated the target mid-restore, in
+	// which case the manifests still describe the bytes really propagated).
+	if _, err := e.fanOut(ctx, syncID, target, scoped, restoredMeta, nil, reasonRestore, now); err != nil {
 		return err
 	}
 
@@ -655,21 +730,28 @@ func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst 
 		}
 		return fmt.Errorf("engine: capture read %s: %w", dst.node.ID, err)
 	}
-	hash, err := dst.r.Hash(ctx, dst.path)
-	if err != nil {
-		return fmt.Errorf("engine: capture hash %s: %w", dst.node.ID, err)
-	}
+	// Hash the bytes just read IN-PROCESS — never a second on-disk Hash. On a
+	// live share the file can change between the Read above and a re-hash, and
+	// PutSaveVersion storing data under a hash that is not sha256(data) would
+	// permanently poison the content-addressed blob store (ON CONFLICT (hash) DO
+	// NOTHING keeps the first blob under a hash forever) and break a later
+	// RestoreVersion's manifest hash.
+	hash := hashBytes(data)
 	if err := e.store.PutSaveVersion(ctx, syncID, dst.node.ID, hash, data, reason); err != nil {
 		return fmt.Errorf("engine: capture %s: %w", dst.node.ID, err)
 	}
 	return nil
 }
 
-// fanOut reads the source file once and WriteAtomic's it to every other
-// in-scope node (except those in skip, which already hold the agreed content),
-// advancing each written node's manifest — carrying srcHash — and appending a
-// sync_log "ok" row per copy. The destination mtime is the source's mtime so
-// the next poll sees source == peer.
+// fanOut reads the source file once, hashes THOSE bytes in-process, and
+// WriteAtomic's them to every other in-scope node (except those in skip, which
+// already hold the agreed content), advancing each written node's manifest —
+// carrying the hash/size of the bytes actually read, NOT any hash the caller
+// computed earlier (the source can change on a live share between that earlier
+// Hash and this Read; the manifest must describe the bytes really propagated).
+// It returns that hash so the caller can record it for the source member's own
+// manifest too, and appends a sync_log "ok" row per copy. The destination mtime
+// is the source's mtime so the next poll sees source == peer.
 //
 // skip names members that must NOT be overwritten because they already hold the
 // agreed content (the byte-identical co-changers in the one-distinct-hash case).
@@ -685,11 +767,14 @@ func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst 
 // error surfaced (the manifest is not advanced, the next poll retries), so no
 // recoverable bytes are ever destroyed without a snapshot. A destination with no
 // current file has nothing to capture (skip).
-func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, srcHash string, skip map[string]bool, reason string, now time.Time) error {
+func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, skip map[string]bool, reason string, now time.Time) (string, error) {
 	data, err := src.r.Read(ctx, src.path)
 	if err != nil {
-		return fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
+		return "", fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
 	}
+	// The hash of the bytes just read — computed in-process — is what every
+	// written member's manifest records.
+	srcHash := hashBytes(data)
 	for _, dst := range scoped {
 		if dst.node.ID == src.node.ID {
 			continue
@@ -709,7 +794,7 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		// aborts this write (manifest not advanced; next poll retries) so nothing
 		// recoverable is destroyed un-captured.
 		if err := e.captureBeforeOverwrite(ctx, syncID, dst, reason); err != nil {
-			return err
+			return "", err
 		}
 
 		if err := dst.r.WriteAtomic(ctx, dst.path, data, srcMeta.Mtime); err != nil {
@@ -726,17 +811,18 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 				Message:  err.Error(),
 				TS:       now,
 			})
-			return fmt.Errorf("engine: write %s: %w", dst.node.ID, err)
+			return "", fmt.Errorf("engine: write %s: %w", dst.node.ID, err)
 		}
 
-		// Advance the written node's manifest to the post-write state (mtime ==
-		// source mtime, size == source size, sha256 == source hash). The destination
-		// now holds the source's exact bytes, so it inherits the source's hash.
-		written := reach.FileMeta{Mtime: srcMeta.Mtime, Size: srcMeta.Size}
+		// Advance the written node's manifest to the post-write state. The
+		// destination now holds exactly `data`, so its manifest records data's
+		// length and in-process hash (not the possibly-stale srcMeta.Size / a
+		// caller-computed hash); the mtime is the source mtime WriteAtomic stamped.
+		written := reach.FileMeta{Mtime: srcMeta.Mtime, Size: int64(len(data))}
 		if err := e.setManifest(ctx, syncID, dst.node.ID, written, srcHash, now); err != nil {
-			return err
+			return "", err
 		}
-		bytes := srcMeta.Size
+		bytes := int64(len(data))
 		if err := e.appendLog(ctx, store.LogEntry{
 			SyncID:   syncID,
 			FromNode: src.node.ID,
@@ -747,10 +833,10 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 			Outcome:  store.OutcomeOK,
 			TS:       now,
 		}); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return nil
+	return srcHash, nil
 }
 
 // flagConflict sets conflict_at on the sync and appends a single conflict log

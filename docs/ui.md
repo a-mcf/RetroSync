@@ -10,7 +10,9 @@ HTMX + server-rendered HTML. No build step. One CSS file. Optimized for "I'm sit
 
 ### `/` — dashboard
 
-**My syncs** — a status view of every sync the user has a member node in. Search
+**My syncs** — a status view. A regular user sees every sync that has a member
+on a node they own; an **admin sees every sync** (nodes default to no owner, and
+conflict resolution must stay reachable from the dashboard regardless). Search
 box at top. Each card:
 
 - Game label and sync name
@@ -26,9 +28,8 @@ There are no Play buttons: a sync needs no human action to mirror. The only
 state-changing buttons are **Resolve conflict** (when the sync has forked) and
 **Restore** (on the history page).
 
-**Nodes** — each node lists its id/display/kind/reach/owner and offers a **Test**
-button that runs an on-demand reachability check (a transient reachable /
-not-reachable result, nothing persisted), plus **Edit** and **Delete**. There is no
+**Nodes** — a read-only list of each node's display name and id. The node
+controls (**Test**, **Edit**, **Delete**) live on `/nodes`, not here. There is no
 persistent reachability badge or last-seen timestamp.
 
 ### `/syncs/{id}/history` — save history (the recovery net)
@@ -110,7 +111,10 @@ no game CRUD — there is no games table. Most users live on `/`.
 
 ### `/nodes` — devices
 
-Per-node configuration UI. See auth.md.
+Per-node configuration UI (admin-only). Each node lists its
+id/display/kind/reach/owner and offers a **Test** button that runs an on-demand
+reachability check (a transient reachable / not-reachable result, nothing
+persisted), plus **Edit** and **Delete**. See auth.md.
 
 ## Couch ergonomics
 

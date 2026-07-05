@@ -112,6 +112,13 @@ func decodeHash(encoded string) (params, []byte, []byte, error) {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.time, &p.threads); err != nil {
 		return params{}, nil, nil, fmt.Errorf("%w: params", ErrInvalidHash)
 	}
+	// Bounds: argon2.IDKey PANICS on time < 1 or threads < 1, and requires
+	// memory >= 8*threads (KiB per lane). A hash encoding such params is
+	// malformed data, not a wrong password — per the package contract it must
+	// yield ErrInvalidHash, never a panic.
+	if p.time < 1 || p.threads < 1 || p.memory < 8*uint32(p.threads) {
+		return params{}, nil, nil, fmt.Errorf("%w: params out of range", ErrInvalidHash)
+	}
 
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {

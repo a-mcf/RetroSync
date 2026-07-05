@@ -10,3 +10,6 @@ secrets.yaml
 # Editor / OS cruft
 .DS_Store
 *.swp
+
+# Go telemetry counters written by the containerized toolchain (bind-mounted $HOME)
+/.config/

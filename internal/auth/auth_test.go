@@ -48,6 +48,11 @@ func TestVerifyTamperedHashErrors(t *testing.T) {
 		"bad-params":      "$argon2id$v=19$m=nope,t=3,p=1$c2FsdA$aGFzaA",
 		"bad-base64-salt": "$argon2id$v=19$m=65536,t=3,p=1$!!!$aGFzaA",
 		"truncated":       strings.TrimSuffix(good, "$"+strings.Split(good, "$")[5]),
+		// Out-of-range cost params: argon2.IDKey panics on t=0 or p=0 and
+		// requires m >= 8*p. These must map to ErrInvalidHash, never a panic.
+		"zero-time":     "$argon2id$v=19$m=65536,t=0,p=1$c2FsdA$aGFzaA",
+		"zero-threads":  "$argon2id$v=19$m=65536,t=3,p=0$c2FsdA$aGFzaA",
+		"absurd-memory": "$argon2id$v=19$m=4,t=3,p=1$c2FsdA$aGFzaA",
 	}
 	for name, h := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -59,6 +64,24 @@ func TestVerifyTamperedHashErrors(t *testing.T) {
 				t.Fatalf("Verify(%q): want ErrInvalidHash, got %v", h, err)
 			}
 		})
+	}
+}
+
+// TestVerifyZeroTimeParamNoPanic pins the panic-class bug: a well-formed PHC
+// string whose t (time) param is 0 used to reach argon2.IDKey, which panics on
+// time < 1. It must instead return (false, ErrInvalidHash).
+func TestVerifyZeroTimeParamNoPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Verify panicked on a t=0 hash: %v", r)
+		}
+	}()
+	ok, err := Verify("$argon2id$v=19$m=65536,t=0,p=1$c2FsdA$aGFzaA", "pw")
+	if ok {
+		t.Fatal("Verify: t=0 hash must not report a match")
+	}
+	if !errors.Is(err, ErrInvalidHash) {
+		t.Fatalf("Verify: want ErrInvalidHash, got %v", err)
 	}
 }
 

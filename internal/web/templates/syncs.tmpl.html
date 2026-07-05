@@ -112,8 +112,11 @@
   {{else}}
     <div class="browse-crumb sub">{{.NodeID}}: /{{.Dir}}</div>
     {{if .HasParent}}
+      <!-- EncodedParent/EncodedRel are url.QueryEscape'd server-side: hx-get is
+           not an href, so html/template applies NO URL escaping here and a raw
+           path containing & # % + ; = would misparse the query string. -->
       <button type="button" class="linkbtn browse-up"
-              hx-get="/api/nodes/{{.NodeID}}/browse?path={{.Parent}}"
+              hx-get="/api/nodes/{{.NodeID}}/browse?path={{.EncodedParent}}"
               hx-target="closest .browse-panel" hx-swap="innerHTML">.. (up)</button>
     {{end}}
     {{if not .Entries}}
@@ -124,7 +127,7 @@
           <li>
             {{if .IsDir}}
               <button type="button" class="linkbtn browse-dir"
-                      hx-get="/api/nodes/{{$.NodeID}}/browse?path={{.Rel}}"
+                      hx-get="/api/nodes/{{$.NodeID}}/browse?path={{.EncodedRel}}"
                       hx-target="closest .browse-panel" hx-swap="innerHTML">📁 {{.Name}}/</button>
             {{else}}
               <button type="button" class="linkbtn browse-file" data-rel="{{.Rel}}"

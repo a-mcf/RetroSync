@@ -124,6 +124,15 @@ func (s *Store) DeleteUser(_ context.Context, id string) error {
 	if _, ok := s.users[id]; !ok {
 		return store.ErrNotFound
 	}
+	// Match Postgres: nodes.owner_user_id REFERENCES users (id) with no cascade,
+	// so deleting a user who still owns a node is a foreign-key violation
+	// (23503 -> ErrInvalidReference). The caller must delete or reassign the
+	// node first.
+	for _, n := range s.nodes {
+		if n.OwnerUserID != nil && *n.OwnerUserID == id {
+			return store.ErrInvalidReference
+		}
+	}
 	delete(s.users, id)
 	return nil
 }
@@ -479,7 +488,16 @@ func (s *Store) SetSyncMember(_ context.Context, m store.SyncMember) error {
 			return store.ErrConflict
 		}
 	}
-	s.syncMembers[smKey{m.SyncID, m.NodeID}] = m
+	key := smKey{m.SyncID, m.NodeID}
+	// A repointed member is "appeared fresh": when the upsert CHANGES an existing
+	// member's path, drop that member's manifest row so the next engine poll
+	// doesn't compare the new file against the old file's manifest (which could
+	// fan the new content out with no conflict prompt). A same-path re-upsert
+	// preserves the manifest; a fresh insert has none to clear.
+	if existing, ok := s.syncMembers[key]; ok && existing.Path != m.Path {
+		delete(s.manifest, key)
+	}
+	s.syncMembers[key] = m
 	return nil
 }
 
@@ -527,6 +545,9 @@ func (s *Store) DeleteSyncMember(_ context.Context, syncID, nodeID string) error
 		return store.ErrNotFound
 	}
 	delete(s.syncMembers, k)
+	// A removed member's manifest row goes with it: if the member is later
+	// re-added (any path), it must appear fresh, not inherit stale file state.
+	delete(s.manifest, k)
 	return nil
 }
 

@@ -114,7 +114,24 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(r.PostFormValue("username"))
 	password := r.PostFormValue("password")
 
-	if !s.authenticate(r.Context(), username, password) {
+	// Memory-DoS guard: every authenticate burns an argon2id verify at ~64 MiB
+	// (including the timing-equalizing dummy verify for an unknown user), so
+	// concurrent verifications are capped by a small semaphore — capacity 4
+	// bounds the worst case at ~256 MiB, plenty of parallelism for a household
+	// tool. Acquisition respects the request context so a gone client releases
+	// its slot cleanly instead of queueing forever.
+	select {
+	case s.loginSem <- struct{}{}:
+	case <-r.Context().Done():
+		s.renderLogin(w, http.StatusServiceUnavailable, "Server busy — try again.")
+		return
+	}
+	authOK := func() bool {
+		defer func() { <-s.loginSem }()
+		return s.authenticate(r.Context(), username, password)
+	}()
+
+	if !authOK {
 		// Same message + status for unknown user and wrong password.
 		s.renderLogin(w, http.StatusUnauthorized, "Invalid username or password.")
 		return

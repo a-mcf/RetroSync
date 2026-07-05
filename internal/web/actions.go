@@ -15,20 +15,6 @@ import (
 
 // --- helpers -------------------------------------------------------------
 
-// userOwnsNode reports whether u may act on nodeID: true for an admin (any
-// node) or for the node's owner. ErrNotFound is propagated so the caller can
-// 404 a non-existent node.
-func (s *Server) userOwnsNode(ctx context.Context, u store.User, nodeID string) (bool, error) {
-	if u.Role == store.RoleAdmin {
-		return true, nil
-	}
-	n, err := s.store.GetNode(ctx, nodeID)
-	if err != nil {
-		return false, err
-	}
-	return n.OwnerUserID != nil && *n.OwnerUserID == u.ID, nil
-}
-
 // userOwnsAnyMember reports whether u has authority over a sync: true for an
 // admin, or when u owns at least one of the sync's member nodes. This is the
 // auto-mirror authority rule for conflict resolution — there is no "primary"
