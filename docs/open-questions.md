@@ -8,7 +8,7 @@ Items below are tagged **RESOLVED** (decided and, where noted, built) or left op
 
 The store is **Postgres** (CNPG in production), behind the storage-agnostic
 `internal/store.Store` interface. SQLite was the original single-file default but
-Postgres fits the k8s sidecar deployment and gives us the `UNIQUE (node_id, path)`
+Postgres fits the k8s deployment and gives us the `UNIQUE (node_id, path)`
 invariant on `sync_members`, JSONB `reach_config`, and `ON DELETE CASCADE`. Both an
 in-memory fake and the pgx v5 implementation run one conformance suite. See
 data-model.md.
@@ -54,7 +54,7 @@ Mitigations (future — none are wired today):
   threshold). Same caveat — there is no `last_seen` to gate on anymore.
 - Long term: optional retrosync agent on the node that pushes save updates direct to the server, bypassing the Syncthing-as-transport limitation.
 
-Decision: ship RetroSync as a **sidecar to Syncthing** in the same Kubernetes pod, reading the Syncthing shares off a **shared pod volume** as a local filesystem (see architecture.md). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently." The mitigations above remain open future work — last-seen tracking was dropped as misleading, so any staleness-gating feature would need to reintroduce it. The optional node-side push agent remains the v2 escape hatch.
+Decision: ship RetroSync as a **standalone Kubernetes deployment** that mounts the **same network volume** backing the Syncthing shares, reading them as a local filesystem (see architecture.md; an earlier sidecar-in-the-Syncthing-pod plan was dropped once the shares turned out to live on NFS, which any pod can mount). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently." The mitigations above remain open future work — last-seen tracking was dropped as misleading, so any staleness-gating feature would need to reintroduce it. The optional node-side push agent remains the v2 escape hatch.
 
 **Built:** the read *and* write path for `syncthing-share` nodes goes through the
 **localfs** reach adapter (atomic temp-file-then-rename), rooted at

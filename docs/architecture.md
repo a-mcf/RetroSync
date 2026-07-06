@@ -59,7 +59,7 @@ Single Go (or Python) service. Owns:
   (`GET /api/{status,syncs,nodes}`) is the seed of a future agent-facing API. See
   api.md.
 
-Runs on the same host as the Syncthing server so it has local read access to per-device backup snapshots.
+Mounts the same storage as the Syncthing server (see Deployment below) so it has local-filesystem read access to per-device backup snapshots.
 
 ### Syncthing (backup)
 
@@ -90,8 +90,8 @@ retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root pr
 
 ## Deployment
 
-RetroSync runs in **Kubernetes** as a **sidecar to Syncthing**: the `retrosync` container and the household `syncthing` container share a pod and a **shared volume** that holds the per-device Syncthing save shares. This preserves the local-side model from above — RetroSync still reads those shares as ordinary local filesystem paths (now a shared pod volume), and still writes back out of band via **SSH/SFTP** into the device, never through Syncthing.
+RetroSync runs in **Kubernetes** as a **standalone deployment** in its own namespace. The per-device Syncthing save shares live on a network volume (NFS); RetroSync mounts that same export as its own volume, which preserves the local-side model from above — RetroSync reads the shares as ordinary local filesystem paths and writes back out of band via **SSH/SFTP** into the device, never through Syncthing. It runs with the same uid/fsGroup as the Syncthing workload so files written by either stay mutually readable and writable. (An earlier plan had RetroSync as a sidecar container in the Syncthing pod; the shared network volume makes that coupling unnecessary — the two deploy and upgrade independently.)
 
 The database is **Postgres** provisioned by **CNPG** (CloudNativePG) in the cluster; RetroSync connects via `DATABASE_URL`. See data-model.md for the `Store` interface and the pgx/podman integration tests.
 
-The service is reverse-proxied behind the existing internal ingress. (The earlier single-binary + SQLite-on-a-host plan is superseded by this sidecar + CNPG layout.)
+The service is reverse-proxied behind the existing internal ingress. (The earlier single-binary + SQLite-on-a-host plan is superseded by this standalone + CNPG layout.)
