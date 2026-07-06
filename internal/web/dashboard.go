@@ -29,7 +29,8 @@ type userView struct {
 	Role    store.Role
 }
 
-// mySyncRow is one "My syncs" STATUS card: a sync with a member on a node I own.
+// mySyncRow is one "My syncs" STATUS card: for a regular user, a sync with a
+// member on a node they own; for an admin, every sync (docs/ui.md).
 // Under auto-mirror there are no Play buttons — the card shows each member's
 // last-known mtime and the sync's state (in sync / conflict). A Resolve button
 // appears ONLY when the sync is in conflict.
@@ -84,14 +85,29 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		}
 	}
 	// A sync is "mine" when at least one of its members lives on a node I own.
+	// ADMINS see EVERY sync (docs/ui.md): nodes default to no owner, so an
+	// owned-member filter alone would leave an all-admin household with no UI
+	// path to the Resolve button (the conflict modal is only reachable from a
+	// dashboard card). The "(yours)" marker below still keys off myNodes, so
+	// members on nodes the admin doesn't own simply render without it.
 	mySyncIDs := make(map[string]bool)
-	for nodeID := range myNodes {
-		members, err := s.store.ListSyncMembersByNode(ctx, nodeID)
+	if u.Role == store.RoleAdmin {
+		syncs, err := s.store.ListSyncs(ctx)
 		if err != nil {
-			return dashboardData{}, fmt.Errorf("list members by node %s: %w", nodeID, err)
+			return dashboardData{}, fmt.Errorf("list syncs: %w", err)
 		}
-		for _, m := range members {
-			mySyncIDs[m.SyncID] = true
+		for _, sy := range syncs {
+			mySyncIDs[sy.ID] = true
+		}
+	} else {
+		for nodeID := range myNodes {
+			members, err := s.store.ListSyncMembersByNode(ctx, nodeID)
+			if err != nil {
+				return dashboardData{}, fmt.Errorf("list members by node %s: %w", nodeID, err)
+			}
+			for _, m := range members {
+				mySyncIDs[m.SyncID] = true
+			}
 		}
 	}
 

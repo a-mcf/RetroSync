@@ -238,14 +238,25 @@ func sortDirEntries(entries []reach.DirEntry) {
 
 // WriteAtomic implements reach.Reach honoring the crash-safety contract: write
 // to a temp file in the SAME directory as the destination, fsync+close it,
-// os.Rename it over the destination (atomic on one filesystem), then os.Chtimes
-// the destination to the requested mtime. The destination's parent directory is
-// created (within root) if missing.
+// os.Chtimes it to the requested mtime, os.Rename it over the destination
+// (atomic on one filesystem), then fsync the destination's parent directory.
+// The destination's parent is created (within root) if missing, and each newly
+// created path component is made durable by fsyncing ITS parent.
+//
+// The directory fsyncs are what make the publish crash-durable, not just
+// atomic: a rename (or mkdir) only reaches disk once the parent directory's
+// entry list is fsynced. Without the post-rename fsync, a power loss could
+// undo the rename while the engine's subsequent Postgres manifest write
+// survives — after reboot the file would hold the OLD bytes under a manifest
+// recording the NEW hash, and the next poll would fan the stale save out as a
+// fresh change. A failed directory fsync therefore fails the write.
 //
 // On ANY failure after the temp file is created, the temp file is removed so no
 // leftover is left behind, and the existing destination (if any) is untouched —
 // the rename is the only step that replaces it, and it either fully succeeds or
-// leaves the prior file intact.
+// leaves the prior file intact. (If the final directory fsync fails, the rename
+// has already happened; reporting the write as failed is the safe direction,
+// since the engine then never records the new manifest.)
 func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime time.Time) error {
 	abs, err := safepath.Resolve(l.root, path)
 	if err != nil {
@@ -254,9 +265,25 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 	dir := filepath.Dir(abs)
 
 	// Create the destination's parent within root if missing. MkdirAll is a no-op
-	// when the dir already exists.
+	// when the dir already exists. Record which components are about to be
+	// created so each can be made durable below.
+	created, err := missingAncestors(l.root, dir)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("localfs: mkdir %q: %w", dir, err)
+	}
+	// A new directory's NAME lives in its parent's entry list, so durably
+	// creating a/b/c means fsyncing a (entry "b") and b (entry "c"); we fsync
+	// the parent of every created component, shallowest first. The deepest
+	// created directory (dir itself, when new) needs no fsync here — its entry
+	// list is fsynced after the rename below. On failure the created (empty)
+	// directories are left behind, which is harmless.
+	for _, d := range created {
+		if err := syncDir(filepath.Dir(d)); err != nil {
+			return err
+		}
 	}
 
 	// Temp file in the same directory so the rename is same-filesystem (and thus
@@ -299,6 +326,50 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 	if err := os.Rename(tmpName, abs); err != nil {
 		cleanup()
 		return fmt.Errorf("localfs: rename %q -> %q: %w", tmpName, abs, err)
+	}
+	// Make the rename itself durable: os.Rename does not persist the parent
+	// directory's entry list, so fsync it. See the crash-durability note in the
+	// function comment. No cleanup here — the temp file no longer exists.
+	return syncDir(dir)
+}
+
+// missingAncestors returns the components of dir that do not yet exist,
+// shallowest first, walking up from dir toward root. dir must be root or a
+// descendant of it (guaranteed by safepath.Resolve); root itself is assumed to
+// exist and is never returned.
+func missingAncestors(root, dir string) ([]string, error) {
+	var missing []string
+	for d := dir; len(d) > len(root); d = filepath.Dir(d) {
+		_, err := os.Stat(d)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("localfs: stat %q: %w", d, err)
+		}
+		missing = append(missing, d)
+	}
+	// Walked deepest-first; reverse to shallowest-first for the fsync order.
+	for i, j := 0, len(missing)-1; i < j; i, j = i+1, j-1 {
+		missing[i], missing[j] = missing[j], missing[i]
+	}
+	return missing, nil
+}
+
+// syncDir fsyncs a directory so its entry list (names added by mkdir/rename
+// within it) is durable across power loss. Fsyncing a FILE does not persist
+// its directory entry — only fsyncing the containing directory does.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("localfs: open dir %q for sync: %w", dir, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("localfs: sync dir %q: %w", dir, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("localfs: close dir %q after sync: %w", dir, err)
 	}
 	return nil
 }

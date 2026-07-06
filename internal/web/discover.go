@@ -250,6 +250,12 @@ func parseCandidates(raw []string) ([]candidate, string) {
 		if nodeID == "" || path == "" {
 			return nil, "a selected candidate is malformed"
 		}
+		// Candidate paths arrive from the form, so they get the same lexical
+		// member-path gate as the /syncs member routes (see validMemberPath): a
+		// persisted absolute/".." path would silently halt polling for the sync.
+		if !validMemberPath(path) {
+			return nil, memberPathError
+		}
 		c := candidate{nodeID: nodeID, path: path}
 		if seen[c] {
 			continue

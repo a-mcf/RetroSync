@@ -101,7 +101,9 @@ auth is checked **first** with the same rule as resolve-conflict
 
 ### `GET /nodes`
 
-The node registry admin page (and, for an `HX-Request`, the list fragment).
+The node registry admin page. (It always renders the full page — unlike
+`GET /syncs` it does not branch on `HX-Request`; the node-list fragment is
+returned only by the mutation routes' refresh responses.)
 
 ### `POST /api/nodes`
 

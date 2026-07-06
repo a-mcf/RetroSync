@@ -42,7 +42,7 @@ The MiSTer-specific note: root fs is read-only there; SSH key auth requires rebu
 
 ## Pairing a new device
 
-Power-user flow (admin, via `/decks` or `/nodes`):
+Power-user flow (admin, via `/nodes`):
 
 1. Add the node entry: id, kind, display, reach-config.
 2. retrosync runs a smoke test (stat the node's save root). **Implemented for

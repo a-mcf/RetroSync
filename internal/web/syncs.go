@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -329,7 +330,7 @@ func (s *Server) handleDeleteSync(w http.ResponseWriter, r *http.Request) {
 
 // handleSetSyncMember handles POST /api/syncs/{id}/members/{node_id}. Body field:
 // path. SetSyncMember upserts on (sync_id, node_id). Error mapping:
-//   - empty path (local)                                  -> 400
+//   - empty or non-relative/traversal path (local)        -> 400
 //   - missing sync or node (ErrInvalidReference)          -> 422
 //   - (node, path) already a member of ANOTHER sync       -> 409
 //     (the global UNIQUE (node_id, path) invariant)
@@ -351,6 +352,13 @@ func (s *Server) handleSetSyncMember(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimSpace(r.PostFormValue("path"))
 	if path == "" {
 		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	// Lexical fail-fast (mirrors safepath's rule; see validMemberPath): a bad
+	// path wouldn't traverse — safepath rejects it at use — but persisting it
+	// would silently halt polling for the whole sync.
+	if !validMemberPath(path) {
+		http.Error(w, memberPathError, http.StatusBadRequest)
 		return
 	}
 	err := s.store.SetSyncMember(r.Context(), store.SyncMember{SyncID: syncID, NodeID: nodeID, Path: path})
@@ -398,9 +406,17 @@ func (s *Server) handleDeleteSyncMember(w http.ResponseWriter, r *http.Request) 
 
 // refreshSyncsList re-renders the syncs-list fragment (the #syncs-list region)
 // after a successful mutation so HTMX swaps the updated list in place. It
-// preserves the active search filter so a mutation doesn't reset the view.
+// preserves the active search filter: the mutation POST's own URL never
+// carries ?q= (the forms post to /api/syncs/...), but HTMX sends the page URL
+// in the HX-Current-URL header on every request, so q is parsed from there —
+// falling back to the request URL's q for a non-HTMX submit.
 func (s *Server) refreshSyncsList(w http.ResponseWriter, r *http.Request, u store.User) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if cur := r.Header.Get("HX-Current-URL"); cur != "" {
+		if curURL, err := url.Parse(cur); err == nil {
+			q = strings.TrimSpace(curURL.Query().Get("q"))
+		}
+	}
 	data, err := s.buildSyncsPage(r.Context(), u, q)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "refresh syncs build failed", "err", err.Error())

@@ -34,9 +34,10 @@ type querier interface {
 }
 
 // txBeginner is the subset of *pgxpool.Pool that opens a transaction. The pool
-// satisfies it; PutSaveVersion type-asserts s.db to it so its multi-statement
-// blob/version/prune/GC sequence runs atomically. (A non-pool querier — e.g. a
-// test double — without Begin falls back to running the statements directly.)
+// satisfies it; withTx type-asserts s.db to it so multi-statement mutations
+// (PutSaveVersion, DeleteNode/DeleteSync + blob GC, member repoint/remove +
+// manifest clear) run atomically. (A non-pool querier — e.g. a test double —
+// without Begin falls back to running the statements directly.)
 type txBeginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
@@ -51,6 +52,26 @@ var _ store.Store = (*Store)(nil)
 // New returns a Store backed by the given pool.
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{db: pool}
+}
+
+// withTx runs fn inside a single transaction when s.db can begin one (the
+// pool), so a multi-statement mutation commits or rolls back as a unit. A
+// non-pool querier (e.g. a test double) without Begin falls back to running fn
+// directly on s.db.
+func (s *Store) withTx(ctx context.Context, fn func(q querier) error) error {
+	beginner, ok := s.db.(txBeginner)
+	if !ok {
+		return fn(s.db)
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) // no-op after a successful Commit
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return mapErr(tx.Commit(ctx))
 }
 
 // mapErr translates Postgres errors into the store's typed errors.
@@ -207,15 +228,21 @@ func (s *Store) UpdateNode(ctx context.Context, n store.Node) error {
 }
 
 func (s *Store) DeleteNode(ctx context.Context, id string) error {
-	tag, err := s.db.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, id)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	// save_versions cascades on node delete (FK), which can orphan blobs.
-	return s.gcBlobs(ctx)
+	// The DELETE (whose FK cascades save_versions, possibly orphaning blobs) and
+	// the orphan-blob GC are one logical mutation: run them in a single
+	// transaction so a failure between them can't return an error for an
+	// already-committed delete (a retry would then hit ErrNotFound) or leak
+	// orphan blobs forever after a crash.
+	return s.withTx(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx, `DELETE FROM nodes WHERE id = $1`, id)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return store.ErrNotFound
+		}
+		return s.gcBlobsWith(ctx, q)
+	})
 }
 
 // rowScanner abstracts pgx.Row and pgx.Rows for scanNode.
@@ -456,16 +483,19 @@ func scanSync(r rowScanner) (store.Sync, error) {
 }
 
 func (s *Store) DeleteSync(ctx context.Context, id string) error {
-	// sync_members.sync_id cascades, so members are removed by the DB.
-	tag, err := s.db.Exec(ctx, `DELETE FROM syncs WHERE id = $1`, id)
-	if err != nil {
-		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	// save_versions cascades on sync delete (FK), which can orphan blobs.
-	return s.gcBlobs(ctx)
+	// sync_members.sync_id cascades, so members are removed by the DB. The
+	// DELETE (whose FK also cascades save_versions, possibly orphaning blobs)
+	// and the orphan-blob GC run in one transaction — see DeleteNode.
+	return s.withTx(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx, `DELETE FROM syncs WHERE id = $1`, id)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return store.ErrNotFound
+		}
+		return s.gcBlobsWith(ctx, q)
+	})
 }
 
 // ---- SyncMembers ----
@@ -476,11 +506,47 @@ func (s *Store) SetSyncMember(ctx context.Context, m store.SyncMember) error {
 	// violates the UNIQUE (node_id, path) -> 23505 -> ErrConflict; the ON CONFLICT
 	// clause only resolves PK collisions, so the cross-sync unique violation
 	// surfaces as the conflict we want.
-	_, err := s.db.Exec(ctx,
-		`INSERT INTO sync_members (sync_id, node_id, path) VALUES ($1, $2, $3)
-		 ON CONFLICT (sync_id, node_id) DO UPDATE SET path = EXCLUDED.path`,
-		m.SyncID, m.NodeID, m.Path)
-	return mapErr(err)
+	//
+	// A repointed member is "appeared fresh": when the upsert CHANGES an existing
+	// member's path, its manifest row must be cleared so the next engine poll
+	// doesn't compare the new file against the old file's manifest (which could
+	// fan the new content out with no conflict prompt). The read-upsert-clear
+	// sequence runs in one transaction so the repoint and the manifest clear
+	// commit as a unit. A same-path re-upsert preserves the manifest; a fresh
+	// insert has none to clear.
+	//
+	// Residual race (accepted): this clear is not serialized with the engine's
+	// per-sync lock, so a Poll already past its member-list read can re-insert a
+	// manifest row describing the OLD path's file after the clear commits. The
+	// window is one poll pass, the next poll re-detects, and every overwrite is
+	// still capture-gated. Routing member mutations through the engine lock is
+	// the follow-up if this ever bites.
+	return s.withTx(ctx, func(q querier) error {
+		var oldPath string
+		havePrev := true
+		err := q.QueryRow(ctx,
+			`SELECT path FROM sync_members WHERE sync_id = $1 AND node_id = $2`,
+			m.SyncID, m.NodeID).Scan(&oldPath)
+		if errors.Is(err, pgx.ErrNoRows) {
+			havePrev = false
+		} else if err != nil {
+			return mapErr(err)
+		}
+		if _, err := q.Exec(ctx,
+			`INSERT INTO sync_members (sync_id, node_id, path) VALUES ($1, $2, $3)
+			 ON CONFLICT (sync_id, node_id) DO UPDATE SET path = EXCLUDED.path`,
+			m.SyncID, m.NodeID, m.Path); err != nil {
+			return mapErr(err)
+		}
+		if havePrev && oldPath != m.Path {
+			if _, err := q.Exec(ctx,
+				`DELETE FROM manifest WHERE sync_id = $1 AND node_id = $2`,
+				m.SyncID, m.NodeID); err != nil {
+				return mapErr(err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) GetSyncMember(ctx context.Context, syncID, nodeID string) (store.SyncMember, error) {
@@ -525,15 +591,25 @@ func (s *Store) listSyncMembers(ctx context.Context, sql, arg string) ([]store.S
 }
 
 func (s *Store) DeleteSyncMember(ctx context.Context, syncID, nodeID string) error {
-	tag, err := s.db.Exec(ctx,
-		`DELETE FROM sync_members WHERE sync_id = $1 AND node_id = $2`, syncID, nodeID)
-	if err != nil {
+	// A removed member's manifest row goes with it (manifest references syncs and
+	// nodes, NOT sync_members, so no FK cascades it): if the member is later
+	// re-added — any path — it must appear fresh, not inherit stale file state.
+	// Both deletes run in one transaction so they commit as a unit. (Same
+	// accepted residual race as SetSyncMember: an in-flight Poll can re-insert
+	// the manifest row; self-heals next poll, capture-gated throughout.)
+	return s.withTx(ctx, func(q querier) error {
+		tag, err := q.Exec(ctx,
+			`DELETE FROM sync_members WHERE sync_id = $1 AND node_id = $2`, syncID, nodeID)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return store.ErrNotFound
+		}
+		_, err = q.Exec(ctx,
+			`DELETE FROM manifest WHERE sync_id = $1 AND node_id = $2`, syncID, nodeID)
 		return mapErr(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
-	}
-	return nil
+	})
 }
 
 // ---- SaveVersions ----
@@ -542,56 +618,50 @@ func (s *Store) DeleteSyncMember(ctx context.Context, syncID, nodeID string) err
 // save_versions indexes captures per (sync_id, node_id), ordered by the
 // monotonic seq bigserial. Retention is enforced on every PutSaveVersion (keep
 // the newest store.SaveVersionRetention by seq DESC per (sync,node)), followed by
-// orphan-blob GC. save_versions cascades on sync/node delete via FKs; gcBlobs
-// then sweeps any blob left unreferenced.
+// orphan-blob GC. save_versions cascades on sync/node delete via FKs;
+// gcBlobsWith then sweeps any blob left unreferenced, inside the same
+// transaction as the delete/prune that could orphan it.
 
 func (s *Store) PutSaveVersion(ctx context.Context, syncID, nodeID, hash string, data []byte, reason string) error {
-	// Validate the FK targets up front so a missing sync/node surfaces as
-	// ErrInvalidReference (mirroring the memory store), independent of whether the
-	// blob already exists.
-	var syncOK, nodeOK bool
-	if err := s.db.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM syncs WHERE id = $1),
-		        EXISTS (SELECT 1 FROM nodes WHERE id = $2)`, syncID, nodeID,
-	).Scan(&syncOK, &nodeOK); err != nil {
-		return mapErr(err)
-	}
-	if !syncOK || !nodeOK {
-		return store.ErrInvalidReference
-	}
+	// The existence check, dedup check, blob-upsert, version-insert, prune, and
+	// GC are a single logical mutation: run them all in ONE transaction so a
+	// mid-sequence failure can't leave the table in a partial state (e.g. >
+	// retention rows, or a GC that observed a half-applied put). The tx runs at
+	// READ COMMITTED, so the dedup read-then-insert is not serialized against a
+	// concurrent writer to the SAME (sync,node) — that relies on the daemon
+	// being the single writer per member, which is the deployment model.
+	return s.withTx(ctx, func(q querier) error {
+		// Validate the FK targets up front so a missing sync/node surfaces as
+		// ErrInvalidReference (mirroring the memory store), independent of
+		// whether the blob already exists.
+		var syncOK, nodeOK bool
+		if err := q.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM syncs WHERE id = $1),
+			        EXISTS (SELECT 1 FROM nodes WHERE id = $2)`, syncID, nodeID,
+		).Scan(&syncOK, &nodeOK); err != nil {
+			return mapErr(err)
+		}
+		if !syncOK || !nodeOK {
+			return store.ErrInvalidReference
+		}
 
-	// Dedup detail: if the most recent version for this (sync,node) already has
-	// this exact hash, do NOT add a duplicate (no churn on identical re-saves).
-	var lastHash string
-	err := s.db.QueryRow(ctx,
-		`SELECT hash FROM save_versions
-		 WHERE sync_id = $1 AND node_id = $2
-		 ORDER BY seq DESC LIMIT 1`, syncID, nodeID).Scan(&lastHash)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return mapErr(err)
-	}
-	if err == nil && lastHash == hash {
-		return nil
-	}
+		// Dedup detail: if the most recent version for this (sync,node) already
+		// has this exact hash, do NOT add a duplicate (no churn on identical
+		// re-saves).
+		var lastHash string
+		err := q.QueryRow(ctx,
+			`SELECT hash FROM save_versions
+			 WHERE sync_id = $1 AND node_id = $2
+			 ORDER BY seq DESC LIMIT 1`, syncID, nodeID).Scan(&lastHash)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return mapErr(err)
+		}
+		if err == nil && lastHash == hash {
+			return nil
+		}
 
-	// The blob-upsert / version-insert / prune / GC are a single logical mutation:
-	// run them in ONE transaction so a mid-sequence failure or a concurrent caller
-	// can't leave the table in a partial state (e.g. > retention rows, or a GC that
-	// raced an interleaved insert). If the pool can't begin a tx (a non-pool test
-	// double), fall back to running them directly on s.db.
-	beginner, ok := s.db.(txBeginner)
-	if !ok {
-		return s.putSaveVersionStmts(ctx, s.db, syncID, nodeID, hash, data, reason)
-	}
-	tx, err := beginner.Begin(ctx)
-	if err != nil {
-		return mapErr(err)
-	}
-	defer tx.Rollback(ctx) // no-op after a successful Commit
-	if err := s.putSaveVersionStmts(ctx, tx, syncID, nodeID, hash, data, reason); err != nil {
-		return err
-	}
-	return mapErr(tx.Commit(ctx))
+		return s.putSaveVersionStmts(ctx, q, syncID, nodeID, hash, data, reason)
+	})
 }
 
 // putSaveVersionStmts runs the four mutating statements of a save-version put
@@ -630,14 +700,10 @@ func (s *Store) putSaveVersionStmts(ctx context.Context, q querier, syncID, node
 	return s.gcBlobsWith(ctx, q)
 }
 
-// gcBlobs deletes save_blobs rows that no save_versions row references (orphan
-// blob GC). Called after the cascade deletes that can orphan a blob
-// (sync/node/game delete); PutSaveVersion's prune uses gcBlobsWith inside its tx.
-func (s *Store) gcBlobs(ctx context.Context) error {
-	return s.gcBlobsWith(ctx, s.db)
-}
-
-// gcBlobsWith runs the orphan-blob GC on q (the pool or a transaction).
+// gcBlobsWith deletes save_blobs rows that no save_versions row references
+// (orphan blob GC) on q (the pool or a transaction). Called inside the same
+// transaction as the cascade deletes that can orphan a blob (sync/node delete)
+// and as PutSaveVersion's prune.
 func (s *Store) gcBlobsWith(ctx context.Context, q querier) error {
 	_, err := q.Exec(ctx,
 		`DELETE FROM save_blobs b

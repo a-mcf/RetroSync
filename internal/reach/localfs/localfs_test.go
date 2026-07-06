@@ -73,6 +73,79 @@ func TestWriteAtomic_MkdirAllNestedParent(t *testing.T) {
 	}
 }
 
+// TestWriteAtomic_ParentPreexistingAndCreated pins the two parent situations
+// the durable-write path must handle: the destination's parent directory
+// already exists, and it (including nested components) must be created. Both
+// must succeed, and the written bytes must read back.
+func TestWriteAtomic_ParentPreexistingAndCreated(t *testing.T) {
+	cases := []struct {
+		name string
+		prep func(t *testing.T, root string)
+		rel  string
+	}{
+		{
+			name: "parent pre-exists",
+			prep: func(t *testing.T, root string) {
+				if err := os.MkdirAll(filepath.Join(root, "have"), 0o755); err != nil {
+					t.Fatalf("prep mkdir: %v", err)
+				}
+			},
+			rel: "have/game.srm",
+		},
+		{
+			name: "parent created",
+			prep: func(t *testing.T, root string) {},
+			rel:  "made/deep/game.srm",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l, root := newRooted(t)
+			tc.prep(t, root)
+			ctx := context.Background()
+			data := []byte("payload-" + tc.name)
+			if err := l.WriteAtomic(ctx, tc.rel, data, time.Unix(42, 0)); err != nil {
+				t.Fatalf("WriteAtomic(%q): %v", tc.rel, err)
+			}
+			got, err := l.Read(ctx, tc.rel)
+			if err != nil {
+				t.Fatalf("Read(%q): %v", tc.rel, err)
+			}
+			if string(got) != string(data) {
+				t.Fatalf("Read = %q, want %q", got, data)
+			}
+		})
+	}
+}
+
+// TestWriteAtomic_ReadOnlyParentFails asserts a write into an unwritable parent
+// directory surfaces an error rather than silently succeeding. Skipped as root,
+// where permission bits do not block writes (CAP_DAC_OVERRIDE) — e.g. the
+// containerized `make test` run.
+func TestWriteAtomic_ReadOnlyParentFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not block writes")
+	}
+	l, root := newRooted(t)
+	dir := filepath.Join(root, "ro")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// Restore perms so t.TempDir cleanup can remove the tree.
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	err := l.WriteAtomic(context.Background(), "ro/game.srm", []byte("x"), time.Unix(1, 0))
+	if err == nil {
+		t.Fatal("WriteAtomic into read-only parent = nil err, want failure")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "game.srm")); !os.IsNotExist(statErr) {
+		t.Fatalf("destination unexpectedly present after failed write: %v", statErr)
+	}
+}
+
 func TestWriteAtomic_NoLeftoverTempOnSuccess(t *testing.T) {
 	l, root := newRooted(t)
 	ctx := context.Background()

@@ -163,10 +163,12 @@ Used for the UI history panel and conflict diagnostics. One row per directional 
 | mtime        | ts   | fast-path gate (with size)                         |
 | size         | int  | fast-path gate (with mtime)                        |
 | sha256       | text | content truth; recorded on every manifest write    |
-| last_checked | ts   |                                                    |
+| last_checked | ts   | set when the manifest entry is written, not on every poll |
 
-PK: (sync_id, node_id). The poll loop updates this on every write, recording the
-member's content `sha256` alongside mtime/size.
+PK: (sync_id, node_id). The poll loop writes this entry when a member's state
+changes (a content change, a touch-reconcile, or a propagation write), recording
+the member's content `sha256` alongside mtime/size; `last_checked` is stamped on
+those writes — a noop poll does not touch the row.
 
 **Hash-backed change detection.** Detection is two-tier:
 

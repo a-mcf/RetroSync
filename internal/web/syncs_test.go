@@ -361,6 +361,49 @@ func TestSetSyncMember_EmptyPath_400(t *testing.T) {
 	}
 }
 
+// TestSetSyncMember_PathValidation: member paths are lexically validated at
+// form-parse time (mirrors safepath's rule): absolute paths, ".." segments,
+// and backslashes are 400'd before the Store, since a persisted bad path would
+// silently halt polling for the whole sync. Legal-but-odd names ("Mario &
+// Luigi.srm") stay accepted.
+func TestSetSyncMember_PathValidation(t *testing.T) {
+	cases := []struct {
+		name, path string
+		wantStatus int
+	}{
+		{"plain-file", "sm2.srm", http.StatusOK},
+		{"subdir", "saves/sm2.srm", http.StatusOK},
+		{"ampersand-name", "Mario & Luigi.srm", http.StatusOK},
+		{"dotdot-prefix", "../x.srm", http.StatusBadRequest},
+		{"absolute", "/etc/passwd", http.StatusBadRequest},
+		{"dotdot-inner", "a/../../x.srm", http.StatusBadRequest},
+		{"dotdot-collapsible", "a/../b.srm", http.StatusBadRequest},
+		{"bare-dotdot", "..", http.StatusBadRequest},
+		{"backslash", "saves\\sm2.srm", http.StatusBadRequest},
+		{"dot-slash-only", "./", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newActionFixture(t)
+			c, csrf := loginAs(t, f, "bob")
+
+			rec := postForm(t, f, c, csrf, "/api/syncs/sm-bob/members/mister", url.Values{
+				"path": {tc.path},
+			})
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("path %q status = %d, want %d\n%s", tc.path, rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			_, err := f.store.GetSyncMember(context.Background(), "sm-bob", "mister")
+			if tc.wantStatus == http.StatusOK && err != nil {
+				t.Errorf("accepted path %q not stored: %v", tc.path, err)
+			}
+			if tc.wantStatus != http.StatusOK && err == nil {
+				t.Errorf("rejected path %q reached the store", tc.path)
+			}
+		})
+	}
+}
+
 // --- POST /api/syncs/{id}/members/{node_id}/delete (remove member) -------
 
 func TestDeleteSyncMember_HappyPath(t *testing.T) {
@@ -478,6 +521,41 @@ func TestSyncsMutations_CSRF(t *testing.T) {
 	}
 }
 
+// --- shared refresh ---------------------------------------------------------
+
+// TestRefreshSyncsList_PreservesFilterFromHXCurrentURL: a mutation POST's own
+// URL never carries ?q= — HTMX puts the page URL (with the live search filter)
+// in the HX-Current-URL header. The refreshed fragment must honor that filter
+// instead of silently unfiltering the list.
+func TestRefreshSyncsList_PreservesFilterFromHXCurrentURL(t *testing.T) {
+	f := newActionFixture(t)
+	ctx := context.Background()
+	if err := f.store.CreateSync(ctx, store.Sync{ID: "z-link", Game: "Zelda", Name: "Link's stream"}); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	c, csrf := loginAs(t, f, "bob")
+
+	form := url.Values{"name": {"Renamed stream"}, "game": {"Super Metroid"}}
+	req := httptest.NewRequest(http.MethodPost, "/api/syncs/sm-bob", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-CSRF-Token", csrf)
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("HX-Current-URL", "http://localhost/syncs?q=metroid")
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mutation status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "sm-bob") {
+		t.Error("filtered refresh should include the matching (metroid) sync")
+	}
+	if strings.Contains(body, "z-link") {
+		t.Error("mutation dropped the q=metroid filter: the Zelda sync leaked into the refreshed list")
+	}
+}
+
 // --- slug helper unit tests ----------------------------------------------
 
 func TestSlugify(t *testing.T) {
@@ -491,6 +569,21 @@ func TestSlugify(t *testing.T) {
 	for _, c := range cases {
 		if got := slugify(c.in); got != c.want {
 			t.Errorf("slugify(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestValidMemberPath(t *testing.T) {
+	valid := []string{"sm.srm", "saves/sm.srm", "a/b/c.srm", "Mario & Luigi.srm", "with space.sav"}
+	invalid := []string{"", "/abs.srm", "../x", "a/../../x", "a/../b", "..", "a\\b", ".", "./"}
+	for _, p := range valid {
+		if !validMemberPath(p) {
+			t.Errorf("validMemberPath(%q) = false, want true", p)
+		}
+	}
+	for _, p := range invalid {
+		if validMemberPath(p) {
+			t.Errorf("validMemberPath(%q) = true, want false", p)
 		}
 	}
 }

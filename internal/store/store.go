@@ -169,7 +169,9 @@ type ManifestEntry struct {
 	// SHA256 is computed lazily (size+mtime is the fast path); nil/"" when not
 	// yet computed.
 	SHA256 *string
-	// LastChecked is when the poll loop last stat'd this file; nil if never.
+	// LastChecked is when this manifest entry was last WRITTEN (a content
+	// change, touch-reconcile, or propagation write) — a noop poll does not
+	// update it. Nil if never written.
 	LastChecked *time.Time
 }
 

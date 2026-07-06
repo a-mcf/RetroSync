@@ -58,17 +58,28 @@ type harness struct {
 	fakes  map[string]*fakereach.Fake
 	paths  map[string]string // nodeID -> member path
 	engine *engine.Engine
+	// overrides makes the engine resolve a node to an arbitrary Reach instead of
+	// its fake (typically a wrapper AROUND the fake, e.g. lyingHashReach). The
+	// fake stays registered as the backing store for direct test assertions.
+	overrides map[string]reach.Reach
 }
+
+// overrideReach installs r as the Reach the engine resolves for nodeID.
+func (h *harness) overrideReach(nodeID string, r reach.Reach) { h.overrides[nodeID] = r }
 
 func newHarness(t *testing.T, clock engine.Clock) *harness {
 	t.Helper()
 	h := &harness{
-		t:     t,
-		store: memory.New(),
-		fakes: map[string]*fakereach.Fake{},
-		paths: map[string]string{},
+		t:         t,
+		store:     memory.New(),
+		fakes:     map[string]*fakereach.Fake{},
+		paths:     map[string]string{},
+		overrides: map[string]reach.Reach{},
 	}
 	resolve := func(n store.Node) (reach.Reach, error) {
+		if r, ok := h.overrides[n.ID]; ok {
+			return r, nil
+		}
 		f, ok := h.fakes[n.ID]
 		if !ok {
 			t.Fatalf("no fake for node %q", n.ID)
@@ -792,13 +803,16 @@ func TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced(t *testing.
 	newMtime := t0.Add(time.Hour)
 	// One member changes -> a single distinct hash -> propagate to the peer.
 	h.fake("primary").Mutate("p.srm", []byte("V2"), newMtime)
-	// Force the peer's capture to fail: captureBeforeOverwrite reads then HASHES
-	// the dst before overwriting, so a Hash failure fails the capture.
-	h.fake("peer").FailHash("", errors.New("capture boom"))
+	// Force the peer's capture to fail: captureBeforeOverwrite READS the dst
+	// before overwriting (and hashes those bytes in-process), so a Read failure
+	// fails the capture.
+	h.fake("peer").FailRead("", errors.New("capture boom"))
 
 	if err := h.engine.Poll(ctx(), syncID); err == nil {
 		t.Fatal("poll should return the capture error")
 	}
+	// Clear the injected failure so the assertions below can read the fake.
+	h.fake("peer").FailRead("", nil)
 	// The peer's original bytes survive (the WriteAtomic was aborted by the gate).
 	h.assertFile("peer", []byte("V1"), srcMtime)
 	// The peer's manifest did NOT advance past the aborted write.
@@ -814,8 +828,7 @@ func TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced(t *testing.
 		t.Fatalf("last_synced advanced despite an aborted fan-out")
 	}
 
-	// Clear the failure; the next poll re-detects and heals.
-	h.fake("peer").FailHash("", nil)
+	// The failure is already cleared; the next poll re-detects and heals.
 	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("retry poll: %v", err)
 	}
@@ -903,15 +916,17 @@ func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
 // TestResolveConflict_CaptureFails_AbortsWrite_NothingDestroyed asserts the
 // capture-before-overwrite hard gate: if the server capture fails, the loser's
 // file is NOT overwritten (its recoverable bytes survive) and the sync stays
-// conflicted (re-resolvable). The capture is forced to fail by making the loser's
-// Hash error (capture reads then hashes).
+// conflicted (re-resolvable). The capture is forced to fail by making the
+// loser's Read error (capture reads the dst and hashes those bytes in-process).
 func TestResolveConflict_CaptureFails_AbortsWrite_NothingDestroyed(t *testing.T) {
 	h, _, peerMtime := seedConflicted(t)
-	h.fake("peer").FailHash("", errors.New("hash boom"))
+	h.fake("peer").FailRead("", errors.New("read boom"))
 
 	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err == nil {
 		t.Fatal("resolve should fail when the capture fails")
 	}
+	// Clear the injected failure so the assertions below can read the fake.
+	h.fake("peer").FailRead("", nil)
 	// The loser's original file is intact (not overwritten with the winner).
 	h.assertFile("peer", []byte("PEER-WROTE"), peerMtime)
 	// Conflict stays set -> re-resolvable.
