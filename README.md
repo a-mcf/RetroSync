@@ -109,12 +109,15 @@ RetroSync is a single **Go 1.23** service backed by **Postgres**.
 
 ### Deployment
 
-RetroSync runs in **Kubernetes** as a **sidecar to Syncthing**: the `retrosync`
-and `syncthing` containers share a pod and a volume holding the per-device save
-shares, so RetroSync reads them as local filesystem paths. The database is
+RetroSync runs in **Kubernetes** as a **standalone deployment** that mounts the
+same network volume backing Syncthing's per-device save shares, so RetroSync
+reads them as local filesystem paths (and runs with Syncthing's uid/fsGroup so
+writes through the share stay mutually accessible). The database is
 **Postgres** provisioned by **CNPG** (CloudNativePG) in the cluster; RetroSync
-connects via `DATABASE_URL`. (No manifests ship in this repo yet; the shape is
-documented in [`docs/architecture.md`](docs/architecture.md).)
+connects via `DATABASE_URL`. Container images are published to
+`ghcr.io/a-mcf/retrosync` on version tags. (Manifests live in the deployment
+repo, not here; the shape is documented in
+[`docs/architecture.md`](docs/architecture.md).)
 
 ## Getting started
 
@@ -205,8 +208,8 @@ Registered as `TODO(...)` hook points in the code, not yet built:
 - **JSON mutation API** — the shipped HTTP surface is HTMX/POST-driven; only a
   small read-only `GET /api/{status,syncs,nodes}` JSON surface exists, as the seed
   of a future agent-facing API.
-- **Deploy / k8s manifests** — the CNPG + Syncthing-sidecar layout is documented
-  but no manifests ship in this repo.
+- **Deploy / k8s manifests** — the standalone + shared-volume + CNPG layout is
+  documented here, but the manifests live in the deployment repo.
 
 ## Documentation
 
