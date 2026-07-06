@@ -141,7 +141,6 @@ func testNodes(t *testing.T, s store.Store) {
 	// Owner user must exist for the FK in Postgres.
 	mustUser(t, s, "bob")
 
-	seen := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	n := store.Node{
 		ID:          "bob-deck",
 		OwnerUserID: ptr("bob"),
@@ -149,7 +148,6 @@ func testNodes(t *testing.T, s store.Store) {
 		Kind:        store.KindDeck,
 		Reach:       store.ReachSyncthingShare,
 		ReachConfig: store.ReachConfig{Path: "/srv/syncthing/bob-deck-saves"},
-		LastSeenAt:  &seen,
 	}
 	if err := s.CreateNode(c, n); err != nil {
 		t.Fatalf("CreateNode: %v", err)
@@ -168,9 +166,6 @@ func testNodes(t *testing.T, s store.Store) {
 	}
 	if got.OwnerUserID == nil || *got.OwnerUserID != "bob" {
 		t.Fatalf("OwnerUserID = %v, want bob", got.OwnerUserID)
-	}
-	if got.LastSeenAt == nil || !got.LastSeenAt.Equal(seen) {
-		t.Fatalf("LastSeenAt = %v, want %v", got.LastSeenAt, seen)
 	}
 
 	// Shared node: nil owner, ssh reach with secret_ref (no cleartext secret).
@@ -200,14 +195,13 @@ func testNodes(t *testing.T, s store.Store) {
 		t.Fatalf("GetNode(missing): want ErrNotFound, got %v", err)
 	}
 
-	// Update: clear last_seen, change display.
+	// Update: change display.
 	n.Display = "Bob Deck 2"
-	n.LastSeenAt = nil
 	if err := s.UpdateNode(c, n); err != nil {
 		t.Fatalf("UpdateNode: %v", err)
 	}
 	got, _ = s.GetNode(c, "bob-deck")
-	if got.Display != "Bob Deck 2" || got.LastSeenAt != nil {
+	if got.Display != "Bob Deck 2" {
 		t.Fatalf("UpdateNode not applied: %+v", got)
 	}
 	if err := s.UpdateNode(c, store.Node{ID: "ghost", Kind: store.KindGeneric, Reach: store.ReachSSH}); !errors.Is(err, store.ErrNotFound) {

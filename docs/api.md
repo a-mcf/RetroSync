@@ -124,8 +124,9 @@ no active-session FK to block it.
 ### `POST /api/nodes/{id}/smoke-test`
 
 Probe reachability (engine `SmokeTest` → localfs stat of the save root). Returns an
-HTML result fragment: "reachable" (and bumps `last_seen_at`) on success, or the
-error surfaced to the admin. For an `ssh` node the adapter is not wired yet, so the
+HTML result fragment with a **transient** result — "reachable" on success, or the
+error surfaced to the admin. Nothing is persisted; the fragment reflects only the
+live probe at click time. For an `ssh` node the adapter is not wired yet, so the
 fragment says "not supported yet (ssh adapter pending)". Unknown node → `404`.
 
 ## Registry — Syncs (admin-only)
@@ -221,17 +222,20 @@ These three emit JSON today (the seed of a future agent-facing API). Auth requir
       "conflict_at": null, "last_synced": "2026-06-21T11:30:00Z" }
   ],
   "nodes": [
-    { "id": "bob-deck", "reachable": true, "last_seen": "..." }
+    { "id": "bob-deck" }
   ]
 }
 ```
 
 Every sync is reported (there is no "active" subset under auto-mirror).
 `conflict` is `true` when `conflict_at` is set; `last_synced` is the time of the
-last successful mirror pass (or `null`).
+last successful mirror pass (or `null`). Status nodes carry only their `id` — there
+is no persistent `reachable` or `last_seen` field. Live reachability is available
+only via the on-demand smoke-test.
 
-> `reachable` / backup-health are **not yet wired to Syncthing** — they are
-> cosmetic until a status poller lands (see open-questions.md).
+> Always-on, Syncthing-derived node status (reachable / backup-health) is **not yet
+> wired** — it would require a status poller that does not exist yet (see
+> open-questions.md).
 
 ### `GET /api/syncs`
 

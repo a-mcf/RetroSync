@@ -35,11 +35,10 @@ func newTestServer(t *testing.T) *Server {
 	}
 
 	owner := "bob"
-	seen := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	if err := st.CreateNode(ctx, store.Node{
 		ID: "bob-deck", OwnerUserID: &owner, Display: "Bob's Deck",
 		Kind: store.KindDeck, Reach: store.ReachSyncthingShare,
-		ReachConfig: store.ReachConfig{Path: "/srv/saves"}, LastSeenAt: &seen,
+		ReachConfig: store.ReachConfig{Path: "/srv/saves"},
 	}); err != nil {
 		t.Fatalf("create node: %v", err)
 	}
@@ -251,7 +250,7 @@ func TestAPIStatusShape(t *testing.T) {
 		t.Fatalf("nodes len = %d, want 1", len(got.Nodes))
 	}
 	n := got.Nodes[0]
-	if n.ID != "bob-deck" || !n.Reachable || n.LastSeen == nil {
+	if n.ID != "bob-deck" {
 		t.Errorf("nodes[0] = %+v, unexpected", n)
 	}
 }

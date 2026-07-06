@@ -114,8 +114,6 @@ type Node struct {
 	Kind        Kind
 	Reach       Reach
 	ReachConfig ReachConfig
-	// LastSeenAt is the last time the node was observed; nil if never.
-	LastSeenAt *time.Time
 }
 
 // Outcome is the result of a single directional sync copy, recorded in

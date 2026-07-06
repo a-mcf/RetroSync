@@ -256,16 +256,13 @@ func TestDeleteNode_MemberNode_CascadesMembership(t *testing.T) {
 
 // --- POST /api/nodes/{id}/smoke-test -------------------------------------
 
-func TestSmokeTest_Reachable_BumpsLastSeen(t *testing.T) {
+// TestSmokeTest_Reachable: a reachable node returns the transient "reachable"
+// result. The smoke-test is a live probe only — it persists nothing (there is no
+// last_seen / reachable storage anymore).
+func TestSmokeTest_Reachable(t *testing.T) {
 	f := newActionFixture(t)
 	f.act.smokeErr = nil // reachable
 	c, csrf := loginAs(t, f, "bob")
-
-	// Pre-condition: bob-deck has no last_seen (fixture creates it without one).
-	before, _ := f.store.GetNode(context.Background(), "bob-deck")
-	if before.LastSeenAt != nil {
-		t.Fatalf("precondition: bob-deck already has last_seen")
-	}
 
 	rec := postForm(t, f, c, csrf, "/api/nodes/bob-deck/smoke-test", nil)
 	if rec.Code != http.StatusOK {
@@ -276,10 +273,6 @@ func TestSmokeTest_Reachable_BumpsLastSeen(t *testing.T) {
 	}
 	if got := f.act.smokeTestedNodes(); len(got) != 1 || got[0] != "bob-deck" {
 		t.Errorf("SmokeTest called for %v, want [bob-deck]", got)
-	}
-	after, _ := f.store.GetNode(context.Background(), "bob-deck")
-	if after.LastSeenAt == nil {
-		t.Error("last_seen_at not bumped after a successful smoke-test")
 	}
 }
 

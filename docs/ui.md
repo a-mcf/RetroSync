@@ -26,7 +26,10 @@ There are no Play buttons: a sync needs no human action to mirror. The only
 state-changing buttons are **Resolve conflict** (when the sync has forked) and
 **Restore** (on the history page).
 
-**Nodes** — per-node reachability status (reachable / not seen, last-seen time).
+**Nodes** — each node lists its id/display/kind/reach/owner and offers a **Test**
+button that runs an on-demand reachability check (a transient reachable /
+not-reachable result, nothing persisted), plus **Edit** and **Delete**. There is no
+persistent reachability badge or last-seen timestamp.
 
 ### `/syncs/{id}/history` — save history (the recovery net)
 

@@ -697,9 +697,5 @@ func cloneNode(n store.Node) store.Node {
 		v := *n.OwnerUserID
 		out.OwnerUserID = &v
 	}
-	if n.LastSeenAt != nil {
-		v := *n.LastSeenAt
-		out.LastSeenAt = &v
-	}
 	return out
 }

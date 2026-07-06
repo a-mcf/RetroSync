@@ -86,8 +86,6 @@ type nodeAdminRow struct {
 	Display     string
 	Kind        string
 	Reach       string
-	Reachable   bool
-	LastSeen    string
 	// reach_config fields for pre-filling the edit form (non-secret only).
 	Path      string
 	Host      string
@@ -106,9 +104,10 @@ var nodeReachOptions = []string{
 
 // --- GET /nodes ----------------------------------------------------------
 
-// handleNodesPage renders the admin node registry: a list of every node (with
-// reachability from last_seen_at) plus an add-node form and per-node edit/delete
-// /test controls. Admin-gating is enforced by the requireAdmin wrapper.
+// handleNodesPage renders the admin node registry: a list of every node plus an
+// add-node form and per-node edit/delete/test controls. There is no persistent
+// reachability badge — the on-demand Test button renders a transient result.
+// Admin-gating is enforced by the requireAdmin wrapper.
 func (s *Server) handleNodesPage(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -147,15 +146,12 @@ func (s *Server) buildNodesPage(ctx context.Context, u store.User) (nodesPageDat
 		data.Owners = append(data.Owners, usr.ID)
 	}
 	sort.Strings(data.Owners)
-	now := s.now()
 	for _, n := range nodes {
 		row := nodeAdminRow{
-			ID:        n.ID,
-			Display:   n.Display,
-			Kind:      string(n.Kind),
-			Reach:     string(n.Reach),
-			Reachable: n.LastSeenAt != nil,
-			LastSeen:  fmtTimeAgo(n.LastSeenAt, now),
+			ID:      n.ID,
+			Display: n.Display,
+			Kind:    string(n.Kind),
+			Reach:   string(n.Reach),
 			// reach_config: only non-secret fields. There is no secret to copy.
 			Path:      n.ReachConfig.Path,
 			Host:      n.ReachConfig.Host,
@@ -268,8 +264,9 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 
 // handleSmokeTest handles POST /api/nodes/{id}/smoke-test: probe reachability via
 // the engine (Actioner.SmokeTest), so the web layer never touches internal/reach
-// or a driver. Returns an HTML result fragment:
-//   - nil           -> "reachable"; also bumps last_seen_at via the Store.
+// or a driver. The result is purely transient — nothing is persisted (there is no
+// last_seen / reachable storage anymore). Returns an HTML result fragment:
+//   - nil           -> "reachable".
 //   - ErrSmokeTestUnsupported (ssh) -> "smoke-test not supported yet (ssh adapter pending)".
 //   - any other error -> the error, surfaced to the admin.
 func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
@@ -286,12 +283,6 @@ func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
 	case err == nil:
 		result.OK = true
 		result.Message = "reachable"
-		// Optionally record the successful probe (docs/auth.md pairing flow: a
-		// passing smoke test makes the node "available"). A failure to bump
-		// last_seen_at is non-fatal to the report.
-		if uerr := s.touchLastSeen(r.Context(), id); uerr != nil {
-			s.logger.ErrorContext(r.Context(), "smoke-test: last_seen update failed", "node", id, "err", uerr.Error())
-		}
 	case errors.Is(err, store.ErrNotFound):
 		// engine.SmokeTest resolves the node and returns ErrNotFound for a typo'd
 		// id, so we surface a clean 404 without a redundant pre-check GetNode.
@@ -460,19 +451,6 @@ func (s *Server) renderBrowse(w http.ResponseWriter, r *http.Request, pick brows
 	if err := s.templates.ExecuteTemplate(w, "node-browse", pick); err != nil {
 		s.logger.ErrorContext(r.Context(), "browse render failed", "err", err.Error())
 	}
-}
-
-// touchLastSeen updates a node's last_seen_at to now via UpdateNode. It re-reads
-// the node so it rewrites the existing row faithfully (UpdateNode rewrites all
-// mutable fields).
-func (s *Server) touchLastSeen(ctx context.Context, id string) error {
-	n, err := s.store.GetNode(ctx, id)
-	if err != nil {
-		return err
-	}
-	now := s.now()
-	n.LastSeenAt = &now
-	return s.store.UpdateNode(ctx, n)
 }
 
 // --- shared form parsing / error mapping ---------------------------------

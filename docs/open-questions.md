@@ -45,13 +45,16 @@ Decision: default to `all-configured`. Expose scope override in an "advanced" di
 
 For `syncthing-share` nodes, we're reading from the local Syncthing share, which means the device must have run Syncthing recently for retrosync to see updates. If the device is offline, the local share is stale, and retrosync will read stale data.
 
-Mitigations:
+Mitigations (future — none are wired today):
 
-- Show "last seen" per node prominently.
-- Refuse activation if the binding node's last_seen is too old (configurable threshold).
+- Show "last seen" per node prominently. **Note:** the backing `last_seen_at` column
+  was removed (migration 0009) along with the misleading persistent status badge, so
+  reintroducing this would mean re-adding last-seen tracking first.
+- Refuse activation if the binding node's last_seen is too old (configurable
+  threshold). Same caveat — there is no `last_seen` to gate on anymore.
 - Long term: optional retrosync agent on the node that pushes save updates direct to the server, bypassing the Syncthing-as-transport limitation.
 
-Decision: ship RetroSync as a **sidecar to Syncthing** in the same Kubernetes pod, reading the Syncthing shares off a **shared pod volume** as a local filesystem (see architecture.md). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently," so we keep the mitigations above (prominent last-seen, activation refusal past a threshold) rather than removing the transport. The optional node-side push agent remains the v2 escape hatch.
+Decision: ship RetroSync as a **sidecar to Syncthing** in the same Kubernetes pod, reading the Syncthing shares off a **shared pod volume** as a local filesystem (see architecture.md). This keeps Syncthing as the local-side transport for v1: the staleness window is inherent to "device must have synced recently." The mitigations above remain open future work — last-seen tracking was dropped as misleading, so any staleness-gating feature would need to reintroduce it. The optional node-side push agent remains the v2 escape hatch.
 
 **Built:** the read *and* write path for `syncthing-share` nodes goes through the
 **localfs** reach adapter (atomic temp-file-then-rename), rooted at
@@ -126,10 +129,11 @@ retrosync doesn't classify by content — it syncs paths the user mapped. So TGF
 
 ## Node reachability / backup-health are not yet wired to Syncthing — OPEN
 
-`reachable` and backup-health fields exist in the status surface but are **not yet
-populated from Syncthing's API** — there is no status poller. They are cosmetic
-until a future Syncthing-status poller reads each node's last-seen / sync state and
-makes them real. (The registry smoke-test *does* probe localfs reachability live;
+There is **no always-on, Syncthing-derived node status** today — no status poller
+exists, and the persistent `reachable` / `last_seen` surface (plus its backing
+`last_seen_at` column) was removed as misleading. A future Syncthing-status poller
+could read each node's last-seen / sync state and reintroduce a real persistent
+status surface. (The registry smoke-test *does* probe localfs reachability live;
 this open item is specifically about the always-on Syncthing-derived status, not
 the on-demand smoke-test.)
 

@@ -58,10 +58,8 @@ type nodeMtimeLine struct {
 
 // nodeRow is one node-status card.
 type nodeRow struct {
-	ID        string
-	Display   string
-	Reachable bool
-	LastSeen  string
+	ID      string
+	Display string
 }
 
 // buildDashboard assembles the read-only dashboard view-model for user u from
@@ -144,10 +142,8 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 	// --- Node status ---
 	for _, n := range nodes {
 		data.Nodes = append(data.Nodes, nodeRow{
-			ID:        n.ID,
-			Display:   n.Display,
-			Reachable: n.LastSeenAt != nil,
-			LastSeen:  fmtTimeAgo(n.LastSeenAt, now),
+			ID:      n.ID,
+			Display: n.Display,
 		})
 	}
 

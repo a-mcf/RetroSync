@@ -62,7 +62,6 @@ A node is any device that holds save files. Decks, MiSTers, Anbernics, the house
 | kind            | text   | `deck`, `mister`, `anbernic`, `generic`                 |
 | reach           | text   | `syncthing-share` or `ssh`                              |
 | reach_config    | json   | shape depends on `reach` (see below)                    |
-| last_seen_at    | ts     | from syncthing API or own ping                          |
 
 #### reach_config shapes
 

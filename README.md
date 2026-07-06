@@ -181,6 +181,15 @@ bind-mounted into the container needs the `:Z` (or `:z`) volume suffix so the
 container can read/write it — e.g. `-v /srv/syncthing/bob-deck:/saves/bob-deck:Z`.
 The `Makefile` already uses `:Z` on its bind mounts for the same reason.
 
+**Container write-permissions note:** the production image runs as a non-root user
+(`nonroot`), so a bind-mounted save directory must be **writable by that user** or
+the atomic write (temp-file-then-rename) propagation fails with `permission denied`.
+Under rootless podman the simplest fix is to run the container as your own uid —
+`--userns=keep-id --user "$(id -u):$(id -g)"` — or otherwise ensure the mounted save
+dirs are writable by the container user. Note that the safety design holds even on
+this failure: the write lands in a `*.retrosync-tmp-*` file first, so a failed write
+never corrupts the real save.
+
 ## What's deferred
 
 Registered as `TODO(...)` hook points in the code, not yet built:
@@ -188,9 +197,11 @@ Registered as `TODO(...)` hook points in the code, not yet built:
 - **ssh/sftp reach adapter** — `ssh` nodes resolve to `reach.ErrUnsupportedReach`;
   only `syncthing-share` (localfs) is wired. Writeback into a device that must be
   reached over SSH (MiSTer's RO root, locked-down handhelds) is blocked on this.
-- **Syncthing-status poller** — node `reachable` / backup-health are not yet read
-  from Syncthing, so those fields are cosmetic. (The on-demand smoke-test *does*
-  probe localfs reachability live.)
+- **Syncthing-status poller** — there is no always-on, Syncthing-derived node
+  status (reachability / backup-health). The only reachability check today is the
+  on-demand smoke-test, which probes localfs reachability live and persists nothing;
+  a live status poller (and any persistent reachable/last-seen surface) remains
+  deferred.
 - **JSON mutation API** — the shipped HTTP surface is HTMX/POST-driven; only a
   small read-only `GET /api/{status,syncs,nodes}` JSON surface exists, as the seed
   of a future agent-facing API.

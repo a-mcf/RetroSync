@@ -82,8 +82,8 @@ type Actioner interface {
 	// internal/reach or any persistence driver: the engine owns the resolver and
 	// the Stat. A nil return means reachable; a non-nil error is surfaced to the
 	// admin (for an ssh node it is reach.ErrUnsupportedReach — "not supported
-	// yet"). Read-only: it never mutates the node (the handler updates
-	// last_seen_at via the Store on success).
+	// yet"). Read-only: it never mutates the node, and the handler persists
+	// nothing — the result is a transient reachable/error pill.
 	SmokeTest(ctx context.Context, nodeID string) error
 	// BrowseNode lists the directory entries directly under relPath on a node, for
 	// the registry's save-file picker. relPath is node-relative ("" / "." = the
