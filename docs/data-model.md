@@ -92,7 +92,7 @@ the engine, daemon, and web all operate on a `sync` and its members. A sync with
 
 ### `sync_members`
 
-The replacement for `game_paths` (and SGM-Helper's per-system layout
+The replacement for `game_paths` (and any tool-imposed per-system layout
 assumptions). One row per `(node, save-file)` member of a sync — the thing you
 want playable.
 

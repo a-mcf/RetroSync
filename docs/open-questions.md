@@ -123,7 +123,7 @@ the sync (label prefilled to the inferred name). Read-only until that explicit
 create. No content classification, no per-system layout auto-detection (that
 remains a non-goal).
 
-## TGFX16 and other systems SGM-Helper drops
+## TGFX16 and other systems some sync tools skip
 
 retrosync doesn't classify by content — it syncs paths the user mapped. So TGFX16 is fine here as long as the user maps the path. Worth noting in README.
 
