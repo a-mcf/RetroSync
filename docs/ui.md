@@ -116,6 +116,19 @@ id/display/kind/reach/owner and offers a **Test** button that runs an on-demand
 reachability check (a transient reachable / not-reachable result, nothing
 persisted), plus **Edit** and **Delete**. See auth.md.
 
+For a **syncthing-share** node the add/edit form's **path** field (the device's
+absolute save-mount path on the server) has a **Browse…** folder picker beside it,
+rooted at the server's share mount (`RETROSYNC_SHARE_ROOT`, default `/shares`) —
+*not* at the node, since a node's picker root is the very path being configured
+(chicken-and-egg). Directory rows descend; file rows are shown (so the admin can
+confirm "yes, these are Bob's saves") but are **inert** — not selectable in this
+mode. A **Use this folder** button fills the path input with the current folder's
+**absolute** path (the server renders it, since the browser can't know the mount
+root) and collapses the panel. The manual text field stays as a fallback. A missing
+share root surfaces as a friendly in-place message, not an error. This mirrors the
+`/syncs` member **Browse** picker (which selects a save *file* on a specific node);
+the two share one fragment, parameterized folder-select vs file-select.
+
 ## Couch ergonomics
 
 - Big tap targets. The dashboard's primary action — **Resolve conflict** when a

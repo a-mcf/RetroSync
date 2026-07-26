@@ -96,6 +96,14 @@ type Actioner interface {
 	// returns engine.ErrBrowseUnsupported; a missing node returns store.ErrNotFound.
 	// Read-only.
 	BrowseNode(ctx context.Context, nodeID, relPath string) ([]engine.DirEntry, error)
+	// BrowseServer lists the directory entries directly under relPath on the
+	// SERVER's share root (the syncthing NFS mount), for the node-registry folder
+	// picker (slice-29). Unlike BrowseNode it is rooted at the server's share mount,
+	// not at any node — a node's picker root is the very path being configured. It
+	// is metadata-only and read-only, going through the same safepath containment:
+	// a traversal/unsafe relPath returns engine.ErrBrowseUnsafePath; an engine built
+	// with no share root returns engine.ErrBrowseUnsupported.
+	BrowseServer(ctx context.Context, relPath string) ([]engine.DirEntry, error)
 	// DiscoverGames scans every directory-listing-reachable node's save directory,
 	// infers a game name per save-like file, drops files already claimed by a sync
 	// member, and aggregates the survivors by inferred game name — the discovery
@@ -117,6 +125,13 @@ type Server struct {
 	static    fs.FS
 	logger    *slog.Logger
 	now       func() time.Time
+	// shareRoot is the absolute server-side path the syncthing NFS volume is mounted
+	// at. The node-registry folder picker joins it with the browsed relative dir to
+	// render the absolute "Use this folder" path the admin copies into the node's
+	// reach_config.path (the client can't know the root). Display only — the engine
+	// owns the actual containment via BrowseServer. Empty disables the picker's
+	// absolute-path rendering (the browse itself still routes through the engine).
+	shareRoot string
 	// dummyHash is a valid argon2id hash minted at construction. Verifying a
 	// failed login against it (for an unknown username) keeps login timing
 	// roughly constant, mitigating username enumeration via response time.
@@ -146,6 +161,12 @@ type Options struct {
 	// the action handlers guard against a nil Actioner with a 500 rather than
 	// panicking.
 	Actioner Actioner
+	// ShareRoot is the absolute server-side path the syncthing NFS volume is mounted
+	// at (config.ShareRoot). The node-registry folder picker joins it with the
+	// browsed relative dir to render the absolute path the admin copies into a
+	// node's reach_config.path. Empty is tolerated (the browse still routes through
+	// the engine; only the absolute-path rendering falls back to the relative dir).
+	ShareRoot string
 }
 
 // New builds a Server backed by st. It parses the embedded templates eagerly so
@@ -183,6 +204,7 @@ func New(st store.Store, opts Options) (*Server, error) {
 		static:    staticSub,
 		logger:    logger,
 		now:       now,
+		shareRoot: opts.ShareRoot,
 		dummyHash: dummy,
 		loginSem:  make(chan struct{}, loginVerifyLimit),
 	}, nil
@@ -255,6 +277,12 @@ func (s *Server) Handler() http.Handler {
 	// it is gated behind requireAdmin like the rest of the registry. No CSRF: it
 	// is a safe GET (read-only) and admin-gated.
 	mux.Handle("GET /api/nodes/{id}/browse", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleBrowseNode))))
+	// Server folder picker (slice-29): an admin-only, read-only GET that lists the
+	// SERVER's share-root directory so the operator can point-and-click the node's
+	// mount path in the add/edit-node form instead of hand-typing it. Rooted at the
+	// server share mount (not a node — a node's picker root is the very path being
+	// configured). Same gating and CSRF-free rationale as /api/nodes/{id}/browse.
+	mux.Handle("GET /api/server/browse", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleBrowseServer))))
 
 	// Syncs registry (slice-21). Admin-only per docs/auth.md, same wrapping as
 	// /nodes: the page and every mutation behind requireAuth+requireAdmin

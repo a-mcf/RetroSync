@@ -105,18 +105,32 @@
 </body>
 </html>{{end}}
 
+{{/* node-browse serves BOTH pickers off one fragment (see browsePicker):
+     - the sync member save-FILE picker (slice-17): FolderSelect is false, so file
+       rows are selectable (.browse-file + data-rel) and there is no folder button.
+     - the node-registry FOLDER picker (slice-29): FolderSelect is true, so a "Use
+       this folder" button selects the current dir by its ABSOLUTE path (AbsDir) and
+       file rows are inert (shown for confirmation, not clickable).
+     BrowseBase is the hx-get URL prefix (per-mode), CrumbLabel the breadcrumb. */}}
 {{define "node-browse"}}
 <div class="browse-list" data-node="{{.NodeID}}" data-dir="{{.Dir}}">
   {{if .Message}}
     <p class="empty">{{.Message}}</p>
   {{else}}
-    <div class="browse-crumb sub">{{.NodeID}}: /{{.Dir}}</div>
+    <div class="browse-crumb sub">{{.CrumbLabel}}: /{{.Dir}}</div>
+    {{if .FolderSelect}}
+      <!-- Folder picker: select the CURRENT directory by its absolute path. data-abs
+           is HTML-attribute-escaped by html/template; the browser decodes it before
+           JS reads getAttribute, so a path with & # % fills in intact. -->
+      <button type="button" class="btn browse-usedir" data-abs="{{.AbsDir}}"
+              title="use this folder as the node path">Use this folder</button>
+    {{end}}
     {{if .HasParent}}
       <!-- EncodedParent/EncodedRel are url.QueryEscape'd server-side: hx-get is
            not an href, so html/template applies NO URL escaping here and a raw
            path containing & # % + ; = would misparse the query string. -->
       <button type="button" class="linkbtn browse-up"
-              hx-get="/api/nodes/{{.NodeID}}/browse?path={{.EncodedParent}}"
+              hx-get="{{.BrowseBase}}?path={{.EncodedParent}}"
               hx-target="closest .browse-panel" hx-swap="innerHTML">.. (up)</button>
     {{end}}
     {{if not .Entries}}
@@ -127,8 +141,13 @@
           <li>
             {{if .IsDir}}
               <button type="button" class="linkbtn browse-dir"
-                      hx-get="/api/nodes/{{$.NodeID}}/browse?path={{.EncodedRel}}"
+                      hx-get="{{$.BrowseBase}}?path={{.EncodedRel}}"
                       hx-target="closest .browse-panel" hx-swap="innerHTML">📁 {{.Name}}/</button>
+            {{else if $.FolderSelect}}
+              <!-- Folder-picker mode: files are shown for confirmation but inert. -->
+              <span class="browse-file-inert">📄 {{.Name}}
+                <span class="sub">({{.Size}} B, {{.Mtime.Format "2006-01-02 15:04"}})</span>
+              </span>
             {{else}}
               <button type="button" class="linkbtn browse-file" data-rel="{{.Rel}}"
                       title="select this file">📄 {{.Name}}

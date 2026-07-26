@@ -92,6 +92,8 @@ retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root pr
 
 RetroSync runs in **Kubernetes** as a **standalone deployment** in its own namespace. The per-device Syncthing save shares live on a network volume (NFS); RetroSync mounts that same export as its own volume, which preserves the local-side model from above — RetroSync reads the shares as ordinary local filesystem paths and writes back out of band via **SSH/SFTP** into the device, never through Syncthing. It runs with the same uid/fsGroup as the Syncthing workload so files written by either stay mutually readable and writable. (An earlier plan had RetroSync as a sidecar container in the Syncthing pod; the shared network volume makes that coupling unnecessary — the two deploy and upgrade independently.)
 
+The mount point of that shared save volume is `RETROSYNC_SHARE_ROOT` (default `/shares`). It is the root the node-registry folder picker browses (docs/ui.md) so an admin can point-and-click a device's absolute mount path when registering a syncthing-share node, instead of hand-typing it. It is not existence-checked at startup — a missing directory surfaces as a friendly browse-time message.
+
 The database is **Postgres** provisioned by **CNPG** (CloudNativePG) in the cluster; RetroSync connects via `DATABASE_URL`. See data-model.md for the `Store` interface and the pgx/podman integration tests.
 
 The service is reverse-proxied behind the existing internal ingress. (The earlier single-binary + SQLite-on-a-host plan is superseded by this standalone + CNPG layout.)

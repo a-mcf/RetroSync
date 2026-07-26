@@ -312,16 +312,41 @@ type smokeResult struct {
 
 // --- GET /api/nodes/{id}/browse (save-file picker) -----------------------
 
-// browsePicker drives the "node-browse" fragment: the directory listing the
-// save-file picker renders. It carries the node id and the directory being
-// browsed (so folder/file links can build correct relative paths), an optional
-// up-link, the entries, and — when browsing is impossible — a friendly message.
+// browsePicker drives the "node-browse" fragment, which serves BOTH pickers:
+//   - the sync member save-FILE picker (slice-17): file rows are selectable, the
+//     hx-get base is /api/nodes/{id}/browse.
+//   - the node-registry FOLDER picker (slice-29): file rows are inert (shown so the
+//     admin can confirm the folder holds the right saves, but not clickable), a
+//     "Use this folder" button selects the current directory by its ABSOLUTE path,
+//     and the hx-get base is /api/server/browse.
+//
+// The Mode-ish fields (FolderSelect, BrowseBase, CrumbLabel, AbsDir) parameterize
+// the one fragment so neither picker duplicates it. It carries the directory being
+// browsed (so folder/file links build correct relative paths), an optional up-link,
+// the entries, and — when browsing is impossible — a friendly message.
 type browsePicker struct {
 	NodeID string
-	// Dir is the node-relative path of the directory being shown ("" = the node
-	// save root). Folder and file links join their Name onto Dir.
+	// Dir is the relative path of the directory being shown ("" = the picker root:
+	// the node save root, or the server share root). Folder and file links join
+	// their Name onto Dir.
 	Dir string
-	// Parent is the node-relative path of Dir's parent, shown as a ".." up-link.
+	// BrowseBase is the hx-get URL prefix the folder/up links target, WITHOUT the
+	// ?path= query — /api/nodes/{id}/browse for the file picker, /api/server/browse
+	// for the folder picker.
+	BrowseBase string
+	// CrumbLabel is the breadcrumb prefix shown before the current dir (the node id
+	// for the file picker; the share root for the folder picker).
+	CrumbLabel string
+	// FolderSelect turns on the node-registry folder picker's behavior: a "Use this
+	// folder" button (targeting AbsDir) and inert file rows. False renders the
+	// slice-17 save-file picker (selectable file rows, no folder button).
+	FolderSelect bool
+	// AbsDir is the ABSOLUTE server-side path of the current dir (share root joined
+	// with Dir), the value the "Use this folder" button fills into the node's path
+	// input. Only meaningful when FolderSelect is true (the client can't know the
+	// share root, so the server renders it).
+	AbsDir string
+	// Parent is the relative path of Dir's parent, shown as a ".." up-link.
 	// HasParent is false at the root (no up-link there).
 	Parent    string
 	HasParent bool
@@ -388,27 +413,123 @@ func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no such node", http.StatusNotFound)
 			return
 		case errors.Is(err, engine.ErrBrowseUnsupported):
-			s.renderBrowse(w, r, browsePicker{
-				NodeID:  id,
-				Dir:     cleanBrowseDir(raw),
-				Message: "browsing not supported for this node yet",
-			})
+			pick := nodeBrowsePicker(id, cleanBrowseDir(raw))
+			pick.Message = "browsing not supported for this node yet"
+			s.renderBrowse(w, r, pick)
 			return
 		default:
 			// A missing directory or a not-a-directory path: surface a friendly note
 			// in-place rather than a 500. reach_config holds no secret, so the engine
 			// error text leaks nothing sensitive, but we keep the message generic.
-			s.renderBrowse(w, r, browsePicker{
-				NodeID:  id,
-				Dir:     cleanBrowseDir(raw),
-				Message: "could not browse that folder",
-			})
+			pick := nodeBrowsePicker(id, cleanBrowseDir(raw))
+			pick.Message = "could not browse that folder"
+			s.renderBrowse(w, r, pick)
 			return
 		}
 	}
 
-	dir := cleanBrowseDir(raw)
-	pick := browsePicker{NodeID: id, Dir: dir}
+	pick := nodeBrowsePicker(id, cleanBrowseDir(raw))
+	fillBrowseListing(&pick, entries)
+	s.renderBrowse(w, r, pick)
+}
+
+// --- GET /api/server/browse (server folder picker) -----------------------
+
+// handleBrowseServer implements GET /api/server/browse?path=<rel>. It returns the
+// same "node-browse" HTML fragment as handleBrowseNode, but in FOLDER-select mode:
+// it lists the SERVER's share-root directory (the syncthing NFS mount) so the admin
+// can point-and-click the absolute mount path when registering a syncthing-share
+// node, instead of hand-typing it. Admin-only (mounted behind requireAdmin) and
+// read-only (a safe GET, no CSRF), exactly like handleBrowseNode.
+//
+// It mirrors handleBrowseNode's raw-query-to-engine / cleanBrowseDir discipline and
+// error mapping: the RAW ?path= goes straight to engine.BrowseServer (so the
+// adapter's safepath rejects hostile input), while cleanBrowseDir normalizes the
+// value only for display/link math. Error mapping:
+//   - unsafe/traversal path (ErrBrowseUnsafePath)        -> 400
+//   - no share root configured (ErrBrowseUnsupported)    -> 200 + friendly message
+//   - missing dir / not-a-directory (other err)          -> 200 + friendly message
+func (s *Server) handleBrowseServer(w http.ResponseWriter, r *http.Request) {
+	if s.actioner == nil {
+		http.Error(w, "browsing unavailable", http.StatusInternalServerError)
+		return
+	}
+	// "" means the share root; pass the RAW value to the engine so safepath sees the
+	// unmodified hostile input.
+	raw := r.URL.Query().Get("path")
+
+	entries, err := s.actioner.BrowseServer(r.Context(), raw)
+	if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrBrowseUnsafePath):
+			http.Error(w, "that path is not allowed", http.StatusBadRequest)
+			return
+		case errors.Is(err, engine.ErrBrowseUnsupported):
+			pick := s.serverBrowsePicker(cleanBrowseDir(raw))
+			pick.Message = "server folder browsing is not configured"
+			s.renderBrowse(w, r, pick)
+			return
+		default:
+			// A missing/not-a-directory share path: surface a friendly note in-place
+			// rather than a 500. The message is generic (no path echoed), so log the
+			// real error server-side — it is how an operator distinguishes an
+			// unmounted root from a misconfigured one or a permission problem.
+			s.logger.WarnContext(r.Context(), "server browse failed", "err", err.Error())
+			pick := s.serverBrowsePicker(cleanBrowseDir(raw))
+			pick.Message = "could not browse that folder"
+			s.renderBrowse(w, r, pick)
+			return
+		}
+	}
+
+	pick := s.serverBrowsePicker(cleanBrowseDir(raw))
+	fillBrowseListing(&pick, entries)
+	s.renderBrowse(w, r, pick)
+}
+
+// nodeBrowsePicker seeds a browsePicker for the sync member save-FILE picker: file
+// rows selectable, hx-get base /api/nodes/{id}/browse, breadcrumb the node id.
+func nodeBrowsePicker(id, dir string) browsePicker {
+	return browsePicker{
+		NodeID:     id,
+		Dir:        dir,
+		BrowseBase: "/api/nodes/" + id + "/browse",
+		CrumbLabel: id,
+	}
+}
+
+// serverBrowsePicker seeds a browsePicker for the node-registry FOLDER picker: a
+// "Use this folder" button (with the absolute path), inert file rows, hx-get base
+// /api/server/browse, breadcrumb the share root. It computes AbsDir by joining the
+// server's known share root with dir — the client can't know the root, so the
+// server renders the absolute path the admin copies into reach_config.path. dir is
+// already cleanBrowseDir'd (no leading slash, no traversal), so a plain path.Join
+// is safe and yields a forward-slash Unix path (the server runs in a Linux
+// container). Without a configured root (only possible when Options.ShareRoot was
+// left unset — the engine then answers ErrBrowseUnsupported anyway) the button is
+// suppressed rather than fabricating an absolute-looking path.
+func (s *Server) serverBrowsePicker(dir string) browsePicker {
+	pick := browsePicker{
+		Dir:        dir,
+		BrowseBase: "/api/server/browse",
+		CrumbLabel: s.shareRoot,
+	}
+	if s.shareRoot == "" {
+		pick.CrumbLabel = "server share"
+		return pick
+	}
+	pick.FolderSelect = true
+	pick.AbsDir = path.Join(s.shareRoot, dir)
+	return pick
+}
+
+// fillBrowseListing populates a seeded browsePicker's up-link and entry rows from
+// the engine's directory listing, shared by both pickers. It joins each entry's
+// name onto pick.Dir for the node-relative Rel path and URL-encodes the folder /
+// up-link ?path= values (hx-get is not an href, so html/template applies no URL
+// escaping of its own).
+func fillBrowseListing(pick *browsePicker, entries []engine.DirEntry) {
+	dir := pick.Dir
 	if dir != "" {
 		pick.HasParent = true
 		// path.Dir of a single segment is "."; normalize back to "" (the root).
@@ -433,16 +554,18 @@ func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 			Mtime:      e.Mtime,
 		})
 	}
-	s.renderBrowse(w, r, pick)
 }
 
 // cleanBrowseDir normalizes a raw query path into a node-relative directory for
 // display/link math: "" and "." both become "" (the node root); otherwise it is
 // path.Clean'd. This is purely cosmetic — the RAW value is what the engine's
 // safepath validates — but it keeps the rendered up-link/child links tidy. A
-// value that path.Clean would let escape (".." prefix) is flattened to "" so a
-// rejected request never renders an escaping link; in practice the engine has
-// already 400'd such a path before render.
+// value that path.Clean would let escape (".." itself or a "../" prefix) is
+// flattened to "" so a rejected request never renders an escaping link; in
+// practice the engine has already 400'd such a path before render. The check
+// matches what safepath actually rejects: a legitimate directory NAME that
+// merely starts with dots ("..data" — k8s volume mounts create these) is kept,
+// so the folder picker's "Use this folder" value stays correct for it.
 func cleanBrowseDir(raw string) string {
 	if raw == "" {
 		return ""
@@ -451,7 +574,7 @@ func cleanBrowseDir(raw string) string {
 	if c == "." || c == "/" {
 		return ""
 	}
-	if strings.HasPrefix(c, "..") || strings.HasPrefix(c, "/") {
+	if c == ".." || strings.HasPrefix(c, "../") || strings.HasPrefix(c, "/") {
 		return ""
 	}
 	return c

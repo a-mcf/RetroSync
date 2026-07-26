@@ -114,6 +114,44 @@ func TestParseConfigNonPositivePollTimeout(t *testing.T) {
 	}
 }
 
+func TestParseConfigDefaultShareRoot(t *testing.T) {
+	cfg, err := parseConfig(envMap(map[string]string{
+		"DATABASE_URL": "postgres://x/y",
+	}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ShareRoot != "/shares" {
+		t.Fatalf("ShareRoot = %q, want /shares default", cfg.ShareRoot)
+	}
+}
+
+func TestParseConfigRelativeShareRoot(t *testing.T) {
+	_, err := parseConfig(envMap(map[string]string{
+		"DATABASE_URL":         "postgres://x/y",
+		"RETROSYNC_SHARE_ROOT": "shares",
+	}))
+	if err == nil {
+		t.Fatal("want error for a relative share root")
+	}
+	if !strings.Contains(err.Error(), "RETROSYNC_SHARE_ROOT") {
+		t.Fatalf("error %q should name the offending var", err)
+	}
+}
+
+func TestParseConfigOverrideShareRoot(t *testing.T) {
+	cfg, err := parseConfig(envMap(map[string]string{
+		"DATABASE_URL":         "postgres://x/y",
+		"RETROSYNC_SHARE_ROOT": "/mnt/syncthing",
+	}))
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.ShareRoot != "/mnt/syncthing" {
+		t.Fatalf("ShareRoot = %q, want /mnt/syncthing", cfg.ShareRoot)
+	}
+}
+
 func TestParseConfigMissingDatabaseURL(t *testing.T) {
 	_, err := parseConfig(envMap(map[string]string{}))
 	if err == nil {

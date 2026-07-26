@@ -177,6 +177,7 @@ once with `--role admin` to bootstrap. `--role` defaults to `user`.
 | `RETROSYNC_HTTP_ADDR`     | no                | `:8080` | HTTP listen address                  |
 | `RETROSYNC_POLL_INTERVAL` | no                | `15s`   | per-sync sweep cadence               |
 | `RETROSYNC_POLL_TIMEOUT`  | no                | `60s`   | per-sync poll timeout                |
+| `RETROSYNC_SHARE_ROOT`    | no                | `/shares` | server-side mount the node-registry folder picker browses (absolute; scope it to the saves volume — pointing it at `/` lets admins browse every container file name) |
 | `RETROSYNC_PASSWORD`      | `user set` only   | —       | password for `retrosync user set <id>` |
 
 **SELinux note:** on an enforcing host (Fedora/RHEL), a save directory
