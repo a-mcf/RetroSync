@@ -45,7 +45,7 @@ func TestNodesPage_AdminSeesRegistry(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"bob-deck", "carol-deck", "mister", "Add a node", "csrf_token"} {
+	for _, want := range []string{"bob-deck", "carol-deck", "mister", "Add a device", "csrf_token"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("nodes page missing %q", want)
 		}

@@ -187,11 +187,29 @@ func (s *Server) buildSyncsPage(ctx context.Context, u store.User, q string) (sy
 
 // handleCreateSync handles POST /api/syncs. Form fields: game (the free-text
 // label, required), name (required), id (optional — auto-generated as a slug
-// from game+name when omitted). Error mapping:
-//   - bad/empty fields or invalid derived slug (local) -> 400
-//   - duplicate id (ErrConflict)                       -> 409
+// from game+name when omitted), plus optional REPEATED member rows: parallel
+// node_id + path fields, one pair per save file to add up front (the slice-30
+// one-shot form). A blank row (empty path) adds no member, so creating a sync
+// with zero members still works (the current behavior). Error mapping:
+//   - bad/empty fields, malformed member row, or invalid derived slug (local) -> 400
+//   - duplicate id (ErrConflict)                                              -> 409
+//   - a member naming a missing node (ErrInvalidReference)                    -> 422
+//   - a member (node,path) already in ANOTHER sync (ErrConflict)             -> 409
 //
-// There is no game FK anymore: any non-empty label is accepted as-is.
+// Create is one-shot but NOT transactional: on a member failure after the sync
+// row exists, the partial sync is deliberately LEFT IN PLACE (matching the
+// discover create-sync path) and the error message says so. A compensating
+// DeleteSync here would be a data-loss hazard: this handler does not hold the
+// engine's per-sync lock, so the background poll loop can mirror the partial
+// sync and capture an overwritten save into save_versions during the create
+// window — and DeleteSync cascades save_versions, permanently destroying that
+// capture. A visible partial sync is recoverable in the registry; a destroyed
+// capture is not. TODO(store-tx): a transactional create (see the twin TODO in
+// discover.go) would close the window properly.
+//
+// It reuses the same Store machinery (CreateSync + SetSyncMember) the discover
+// create-sync path uses; there is no games FK, so any non-empty label is
+// accepted as-is.
 func (s *Server) handleCreateSync(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
@@ -222,16 +240,92 @@ func (s *Server) handleCreateSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id must be a slug: lowercase letters, digits, and hyphens", http.StatusBadRequest)
 		return
 	}
+	// Optional member rows: parallel node_id[]/path[] fields. Validate them
+	// (lexical path gate + a path-without-device is malformed) BEFORE touching the
+	// store, so a bad row 400s without creating anything.
+	members, verr := parseMemberRows(r.PostForm["node_id"], r.PostForm["path"])
+	if verr != "" {
+		http.Error(w, verr, http.StatusBadRequest)
+		return
+	}
+
 	err := s.store.CreateSync(r.Context(), store.Sync{ID: id, Game: game, Name: name})
 	switch {
 	case err == nil:
-		s.refreshSyncsList(w, r, u)
+		// proceed to add members
 	case errors.Is(err, store.ErrConflict):
 		http.Error(w, "a sync with that id already exists", http.StatusConflict)
+		return
 	default:
 		s.logger.ErrorContext(r.Context(), "create sync failed", "sync", id, "err", err.Error())
 		http.Error(w, "could not create sync", http.StatusInternalServerError)
+		return
 	}
+
+	// Add each member. On a failure the sync (and any members already added)
+	// stays in place — see the handler comment for why deleting it here would
+	// risk destroying an engine capture. The message tells the admin the sync
+	// exists so they can finish or fix it in the registry list.
+	for _, m := range members {
+		merr := s.store.SetSyncMember(r.Context(), store.SyncMember{SyncID: id, NodeID: m.nodeID, Path: m.path})
+		if merr == nil {
+			continue
+		}
+		switch {
+		case errors.Is(merr, store.ErrConflict):
+			http.Error(w, "that save file is already in another sync — the sync was created without it; fix it in the list above", http.StatusConflict)
+		case errors.Is(merr, store.ErrInvalidReference):
+			http.Error(w, "no such device — the sync was created without it; fix it in the list above", http.StatusUnprocessableEntity)
+		default:
+			s.logger.ErrorContext(r.Context(), "create sync: add member failed", "sync", id, "node", m.nodeID, "err", merr.Error())
+			http.Error(w, "could not add a device — the sync was created without it; fix it in the list above", http.StatusInternalServerError)
+		}
+		return
+	}
+	s.refreshSyncsList(w, r, u)
+}
+
+// parseMemberRows decodes the parallel node_id[]/path[] form fields the one-shot
+// create form submits (one pair per member row, positionally matched). A row
+// with a blank path adds no member — so the single default row left empty yields
+// a memberless sync (creating with zero members stays valid). It returns a human
+// message on a malformed row: a path with no chosen device, or a bad/traversal
+// path (the same lexical gate as the member routes, since a persisted bad path
+// would silently halt polling for the whole sync). Identical (node,path) pairs
+// are de-duplicated so a double-filled row can't self-collide.
+func parseMemberRows(nodeIDs, paths []string) ([]candidate, string) {
+	n := len(paths)
+	if len(nodeIDs) > n {
+		n = len(nodeIDs)
+	}
+	at := func(s []string, i int) string {
+		if i < len(s) {
+			return strings.TrimSpace(s[i])
+		}
+		return ""
+	}
+	seen := make(map[candidate]bool)
+	var out []candidate
+	for i := 0; i < n; i++ {
+		nodeID := at(nodeIDs, i)
+		path := at(paths, i)
+		if path == "" {
+			continue // an unfilled row adds no member
+		}
+		if nodeID == "" {
+			return nil, "choose a device for each save file"
+		}
+		if !validMemberPath(path) {
+			return nil, memberPathError
+		}
+		c := candidate{nodeID: nodeID, path: path}
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out, ""
 }
 
 // --- POST /api/syncs/{id} (edit: rename + relabel) -----------------------
