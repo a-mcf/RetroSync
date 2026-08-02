@@ -66,12 +66,15 @@
               <div class="discover-meta">
                 <label>sync name
                   <input type="text" name="name" value="Main" placeholder="Main"></label>
+              </div>
+              <details class="advanced">
+                <summary>Advanced</summary>
                 <label>id
                   <input type="text" name="id" value="{{.DefaultSyncID}}"
                          placeholder="{{.DefaultSyncID}}"></label>
-              </div>
-              <p class="sub">Id is optional — leave blank to auto-generate a slug
-                 from the game + sync name.</p>
+                <p class="sub">Id is optional — leave blank to auto-generate a slug
+                   from the game + sync name.</p>
+              </details>
               <p><button class="btn" type="submit">Create sync</button></p>
               <div class="form-error"></div>
             </form>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Nodes</title>
+  <title>RetroSync — Devices</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -51,7 +51,7 @@
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <div class="wrap">
     <header class="top">
-      <h1>RetroSync — Nodes</h1>
+      <h1>RetroSync — Devices</h1>
       <span class="who">
         <a href="/">&larr; Dashboard</a> &nbsp;
         {{.User.Display}} ({{.User.Role}})
@@ -63,14 +63,14 @@
     </header>
 
     <section>
-      <h2>Registered nodes</h2>
+      <h2>Registered devices</h2>
       <p class="sub">Admin-only. Add a device, edit its reach config, run a
          reachability smoke-test, or remove it.</p>
       {{template "nodes-list" .}}
     </section>
 
     <section>
-      <h2>Add a node</h2>
+      <h2>Add a device</h2>
       <form class="node-form card" hx-post="/api/nodes"
             hx-target="#nodes-list" hx-swap="outerHTML">
         <input type="hidden" name="csrf_token" value="{{.CSRF}}">
@@ -111,7 +111,7 @@
           <p class="sub">secret_ref names a credential in the host secret store.
              Never paste a password or key here.</p>
         </div>
-        <p><button class="btn" type="submit">Add node</button></p>
+        <p><button class="btn" type="submit">Add device</button></p>
         <div class="form-error"></div>
       </form>
     </section>
@@ -122,7 +122,7 @@
 {{define "nodes-list"}}
 <div id="nodes-list">
   {{if not .Nodes}}
-    <p class="empty">No nodes registered yet.</p>
+    <p class="empty">No devices registered yet.</p>
   {{else}}
     {{$root := .}}
     {{range .Nodes}}
@@ -148,7 +148,7 @@
     <span id="smoke-{{.ID}}" class="smoke-result"></span>
     <form hx-post="/api/nodes/{{.ID}}/delete"
           hx-target="#nodes-list" hx-swap="outerHTML"
-          hx-confirm="Delete node {{.ID}}?">
+          hx-confirm="Delete device {{.ID}}?">
       <input type="hidden" name="csrf_token" value="{{$csrf}}">
       <button class="btn danger" type="submit">Delete</button>
     </form>

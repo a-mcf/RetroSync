@@ -36,7 +36,7 @@
     <header class="top">
       <h1>RetroSync</h1>
       <span class="who">
-        {{if eq .User.Role "admin"}}<a href="/discover">Discover</a> &nbsp;<a href="/syncs">Syncs</a> &nbsp;<a href="/nodes">Nodes</a> &nbsp;{{end}}
+        {{if eq .User.Role "admin"}}<a href="/discover">Discover</a> &nbsp;<a href="/syncs">Syncs</a> &nbsp;<a href="/nodes">Devices</a> &nbsp;{{end}}
         {{.User.Display}} ({{.User.Role}})
         &nbsp;
         <form class="logout" method="post" action="/logout">
@@ -58,7 +58,8 @@
              oninput="rsFilterMySyncs(this.value)">
       <div id="mysyncs-list">
       {{if not .MySyncs}}
-        <p class="empty">No syncs map to your nodes yet.</p>
+        <p class="empty">No syncs map to your devices yet.{{if eq .User.Role "admin"}}
+           <a href="/discover">Find your saves &rarr;</a>{{end}}</p>
       {{else}}
         {{range .MySyncs}}
         <div class="card mysync-card" data-filter="{{.Game}} {{.SyncName}}">
@@ -89,9 +90,9 @@
 
     <!-- STATUS --------------------------------------------------------- -->
     <section>
-      <h2>Nodes</h2>
+      <h2>Devices</h2>
       {{if not .Nodes}}
-        <p class="empty">No nodes registered.</p>
+        <p class="empty">No devices registered.</p>
       {{else}}
         {{range .Nodes}}
         <div class="card">

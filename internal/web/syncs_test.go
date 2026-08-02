@@ -211,6 +211,209 @@ func TestCreateSync_MissingName_400(t *testing.T) {
 	}
 }
 
+// TestCreateSync_WithMemberRows_HappyPath: the slice-30 one-shot form submits
+// game + name + repeated node_id/path rows; the sync and all its members are
+// created together in a single POST.
+func TestCreateSync_WithMemberRows_HappyPath(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+	ctx := context.Background()
+
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id":      {"sm-oneshot"},
+		"game":    {"Super Metroid"},
+		"name":    {"One shot"},
+		"node_id": {"mister", "bob-deck"},
+		"path":    {"a.srm", "b.srm"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.store.GetSync(ctx, "sm-oneshot"); err != nil {
+		t.Fatalf("sync not created: %v", err)
+	}
+	members, err := f.store.ListSyncMembers(ctx, "sm-oneshot")
+	if err != nil {
+		t.Fatalf("list members: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members len = %d, want 2: %+v", len(members), members)
+	}
+	byNode := map[string]string{}
+	for _, m := range members {
+		byNode[m.NodeID] = m.Path
+	}
+	if byNode["mister"] != "a.srm" || byNode["bob-deck"] != "b.srm" {
+		t.Errorf("members wrong: %+v", byNode)
+	}
+}
+
+// TestCreateSync_ZeroMembers_BlankRow: the single default member row left blank
+// (a node selected, empty path) must still create a memberless sync — the
+// pre-slice-30 behavior.
+func TestCreateSync_ZeroMembers_BlankRow(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+	ctx := context.Background()
+
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id":      {"sm-empty"},
+		"game":    {"Super Metroid"},
+		"name":    {"Empty"},
+		"node_id": {"mister"},
+		"path":    {""}, // blank row adds no member
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.store.GetSync(ctx, "sm-empty"); err != nil {
+		t.Fatalf("sync not created: %v", err)
+	}
+	members, err := f.store.ListSyncMembers(ctx, "sm-empty")
+	if err != nil {
+		t.Fatalf("list members: %v", err)
+	}
+	if len(members) != 0 {
+		t.Errorf("members len = %d, want 0: %+v", len(members), members)
+	}
+}
+
+// TestCreateSync_WithMemberRows_InvalidNode_422_SyncLeftInPlace: a member naming
+// a missing device 422s, and the created sync deliberately STAYS (no compensating
+// DeleteSync — it could cascade-destroy an engine capture; see handleCreateSync).
+// The message must say the sync exists so the admin can fix it in the registry.
+func TestCreateSync_WithMemberRows_InvalidNode_422_SyncLeftInPlace(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id":      {"sm-ghost"},
+		"game":    {"Super Metroid"},
+		"name":    {"Ghost"},
+		"node_id": {"ghost-node"},
+		"path":    {"a.srm"},
+	})
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid-node status = %d, want 422\n%s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.store.GetSync(context.Background(), "sm-ghost"); err != nil {
+		t.Errorf("partial sync should be left in place, err = %v", err)
+	}
+	if !strings.Contains(rec.Body.String(), "the sync was created") {
+		t.Errorf("message should say the sync was created, got: %s", rec.Body.String())
+	}
+}
+
+// TestCreateSync_WithMemberRows_DuplicateMember_409_SyncLeftInPlace: a member
+// whose (node,path) is already in ANOTHER sync 409s; the created sync stays in
+// place (see handleCreateSync for why there is no rollback) and, critically, the
+// original claiming sync's member is untouched.
+func TestCreateSync_WithMemberRows_DuplicateMember_409_SyncLeftInPlace(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	// The fixture's sm-bob already claims (bob-deck, "sm.srm").
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id":      {"sm-dupe"},
+		"game":    {"Super Metroid"},
+		"name":    {"Dupe"},
+		"node_id": {"bob-deck"},
+		"path":    {"sm.srm"},
+	})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("dup-member status = %d, want 409\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "another sync") {
+		t.Errorf("expected 'already in another sync' message, got: %s", rec.Body.String())
+	}
+	if _, err := f.store.GetSync(context.Background(), "sm-dupe"); err != nil {
+		t.Errorf("partial sync should be left in place, err = %v", err)
+	}
+	// The original member must be undisturbed.
+	if m, err := f.store.GetSyncMember(context.Background(), "sm-bob", "bob-deck"); err != nil || m.Path != "sm.srm" {
+		t.Errorf("original member disturbed: %+v err=%v", m, err)
+	}
+}
+
+// TestCreateSync_MemberRow_BadPath_400_NoSync: a member row with an absolute or
+// traversal path is rejected (lexical gate) before any sync is created.
+func TestCreateSync_MemberRow_BadPath_400_NoSync(t *testing.T) {
+	f := newActionFixture(t)
+	c, csrf := loginAs(t, f, "bob")
+
+	rec := postForm(t, f, c, csrf, "/api/syncs", url.Values{
+		"id":      {"sm-evil"},
+		"game":    {"Super Metroid"},
+		"name":    {"Evil"},
+		"node_id": {"bob-deck"},
+		"path":    {"../../etc/passwd"},
+	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad-path status = %d, want 400\n%s", rec.Code, rec.Body.String())
+	}
+	if _, err := f.store.GetSync(context.Background(), "sm-evil"); err != store.ErrNotFound {
+		t.Errorf("sync created despite a bad member path, err = %v", err)
+	}
+}
+
+// TestSyncsPage_DiscoverCalloutAndManualForm: the /syncs page fronts Discover
+// with a callout and demotes manual creation into a collapsed <details>.
+func TestSyncsPage_DiscoverCalloutAndManualForm(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "bob")
+
+	req := httptest.NewRequest(http.MethodGet, "/syncs", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Discover is the easy way",
+		"/discover",
+		"Create a sync manually",
+		"add another device",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("syncs page missing %q", want)
+		}
+	}
+}
+
+// TestSyncsPage_EmptyStatePointsToDiscover: with no syncs and no active search,
+// the empty list points at Discover; an empty *search* result stays a plain
+// "No syncs match."
+func TestSyncsPage_EmptyStatePointsToDiscover(t *testing.T) {
+	f := newActionFixture(t)
+	ctx := context.Background()
+	// Drop the seeded sync so the registry is empty.
+	if err := f.store.DeleteSync(ctx, "sm-bob"); err != nil {
+		t.Fatalf("delete sync: %v", err)
+	}
+	c, _ := loginAs(t, f, "bob")
+
+	// No query: point at Discover.
+	req := httptest.NewRequest(http.MethodGet, "/syncs", nil)
+	req.AddCookie(c)
+	rec := httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if body := rec.Body.String(); !strings.Contains(body, "No syncs yet") || !strings.Contains(body, "/discover") {
+		t.Errorf("empty (no-query) state should point at Discover, got: %s", body)
+	}
+
+	// Active search with no match: stay a plain "No syncs match."
+	req = httptest.NewRequest(http.MethodGet, "/syncs?q=zzz", nil)
+	req.AddCookie(c)
+	req.Header.Set("HX-Request", "true")
+	rec = httptest.NewRecorder()
+	f.srv.Handler().ServeHTTP(rec, req)
+	if body := rec.Body.String(); !strings.Contains(body, "No syncs match.") {
+		t.Errorf("empty search result should stay a plain no-match, got: %s", body)
+	}
+}
+
 // --- POST /api/syncs/{id} (edit: rename + relabel) -----------------------
 
 func TestRenameSync_HappyPath(t *testing.T) {

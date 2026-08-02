@@ -33,7 +33,11 @@
       // here — this only fires for the top-level Browse button).
       var bbase = el.getAttribute && el.getAttribute('data-browse-base');
       if (bbase) {
-        var form = el.closest('.member-add');
+        // The node <select> lives in the per-sync "add" form (.member-add) OR, on
+        // the one-shot manual create form, in the enclosing member row
+        // (.member-row-new) — closest() picks whichever is nearer so each row
+        // browses its OWN selected device.
+        var form = el.closest('.member-add, .member-row-new');
         var sel = form && form.querySelector('[name=node_id]');
         if (sel && sel.value) {
           e.detail.path = bbase + '/' + encodeURIComponent(sel.value) + '/browse';
@@ -48,13 +52,31 @@
       if (!t) return;
       e.preventDefault();
       var rel = t.getAttribute('data-rel') || '';
-      var form = t.closest('.member-add');
+      var form = t.closest('.member-add, .member-row-new');
       var panel = t.closest('.browse-panel');
       if (form) {
         var pathInput = form.querySelector('[name=path]');
         if (pathInput) pathInput.value = rel;
       }
       if (panel) panel.innerHTML = '';
+    });
+    // Progressive enhancement for the one-shot manual create form: "+ add another
+    // device" clones the last member row (device <select> + path input + Browse
+    // picker), clears the clone's path + any open picker, and appends it. htmx.process
+    // rebinds the cloned Browse button's hx-get. With no JS the single server-rendered
+    // row still submits — the server accepts repeated node_id/path fields.
+    document.addEventListener('click', function (e) {
+      var t = e.target.closest && e.target.closest('.add-member-row');
+      if (!t) return;
+      e.preventDefault();
+      var rows = t.closest('.sync-create').querySelector('.member-rows');
+      var last = rows && rows.querySelector('.member-row-new:last-child');
+      if (!last) return;
+      var clone = last.cloneNode(true);
+      clone.querySelectorAll('[name=path]').forEach(function (i) { i.value = ''; });
+      clone.querySelectorAll('.browse-panel').forEach(function (p) { p.innerHTML = ''; });
+      rows.appendChild(clone);
+      if (window.htmx) htmx.process(clone);
     });
   </script>
 </head>
@@ -74,10 +96,18 @@
     </header>
 
     <section>
+      <div class="card callout">
+        <h2>Discover is the easy way</h2>
+        <p>Play the game once on each device, then Discover finds the save files
+           and links them for you — no ids or paths to type.</p>
+        <p><a class="btn" href="/discover">Find your saves &rarr;</a></p>
+      </div>
+    </section>
+
+    <section>
       <h2>Sync registry</h2>
-      <p class="sub">Admin-only. A <em>sync</em> is the unit of mirroring: a set of
-         members (a node + the save-file path on it). "Game" is just a free-text
-         label used to group syncs for display.</p>
+      <p class="sub">Admin-only. A <em>sync</em> keeps one save file per device in
+         step. "Game" is just a free-text label used to group syncs for display.</p>
 
       <form class="search-form" hx-get="/syncs" hx-target="#syncs-list"
             hx-swap="outerHTML" hx-trigger="submit, input delay:300ms from:[name=q]">
@@ -89,17 +119,47 @@
     </section>
 
     <section>
-      <h2>New sync</h2>
-      <form class="sync-form card" hx-post="/api/syncs"
-            hx-target="#syncs-list" hx-swap="outerHTML">
-        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-        <label>game label <input type="text" name="game" required placeholder="Super Metroid"></label>
-        <label>sync name <input type="text" name="name" required placeholder="Bob's stream"></label>
-        <label>id <input type="text" name="id" placeholder="super-metroid-bob"></label>
-        <p class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</p>
-        <p><button class="btn" type="submit">+ New sync</button></p>
-        <div class="form-error"></div>
-      </form>
+      <details class="manual-create">
+        <summary>Create a sync manually (advanced)</summary>
+        <form class="sync-form sync-create card" hx-post="/api/syncs"
+              hx-target="#syncs-list" hx-swap="outerHTML">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <label>game label <input type="text" name="game" required placeholder="Super Metroid"></label>
+          <label>sync name <input type="text" name="name" required placeholder="Bob's stream"></label>
+
+          <!-- One or more member rows submitted together: each is a device +
+               save-file path (with the slice-17 Browse picker). "+ add another
+               device" clones a row (progressive enhancement); the server accepts
+               repeated node_id/path fields, so the single row works with no JS. A
+               row left blank simply adds no save file. -->
+          <div class="member-rows">
+            {{$nodes := .Nodes}}
+            <div class="member-row-new">
+              <label>device
+                <select name="node_id">
+                  {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
+                </select>
+              </label>
+              <label>save file <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm"></label>
+              <button class="btn member-browse" type="button"
+                      hx-get="/api/nodes/_/browse"
+                      data-browse-base="/api/nodes"
+                      hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+              <div class="browse-panel"></div>
+            </div>
+          </div>
+          <p><button class="btn add-member-row" type="button">+ add another device</button></p>
+
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <label>id <input type="text" name="id" placeholder="super-metroid-bob"></label>
+            <p class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</p>
+          </details>
+
+          <p><button class="btn" type="submit">+ New sync</button></p>
+          <div class="form-error"></div>
+        </form>
+      </details>
     </section>
   </div>
 </body>
@@ -165,7 +225,13 @@
 {{define "syncs-list"}}
 <div id="syncs-list">
   {{if not .Games}}
-    <p class="empty">No syncs match.</p>
+    {{if .Q}}
+      <p class="empty">No syncs match.</p>
+    {{else}}
+      <p class="empty">No syncs yet. The easy way to make one is
+         <a href="/discover">Discover</a> — play the game once on each device and
+         it finds the save files for you.</p>
+    {{end}}
   {{else}}
     {{$root := .}}
     {{range .Games}}
@@ -191,7 +257,7 @@
         <div class="members">
           {{$syncID := .ID}}
           {{if not .Members}}
-            <p class="empty">No members yet.</p>
+            <p class="empty">No save files yet.</p>
           {{else}}
             {{range .Members}}
               <div class="member-row">
@@ -204,7 +270,7 @@
                 </form>
                 <form class="member-del" hx-post="/api/syncs/{{$syncID}}/members/{{.NodeID}}/delete"
                       hx-target="#syncs-list" hx-swap="outerHTML"
-                      hx-confirm="Remove {{.NodeID}} from this sync?">
+                      hx-confirm="Stop syncing this save file on {{.NodeID}}?">
                   <input type="hidden" name="csrf_token" value="{{$csrf}}">
                   <button class="btn danger" type="submit">Remove</button>
                 </form>
@@ -222,12 +288,12 @@
                 data-member-base="/api/syncs/{{$syncID}}/members"
                 hx-target="#syncs-list" hx-swap="outerHTML">
             <input type="hidden" name="csrf_token" value="{{$csrf}}">
-            <label>node
+            <label>device
               <select name="node_id">
                 {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
               </select>
             </label>
-            <label>path <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm" required></label>
+            <label>save file <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm" required></label>
             <!-- Save-file picker (slice-17): Browse the SELECTED node's mounted
                  save directory and click the real file to fill the path input,
                  instead of typing it by hand. The hx-get's node id is spliced in
@@ -240,7 +306,7 @@
                     data-browse-base="/api/nodes"
                     hx-target="next .browse-panel" hx-swap="innerHTML">Browse…</button>
             <div class="browse-panel"></div>
-            <button class="btn" type="submit">Add member</button>
+            <button class="btn" type="submit">Add device to sync</button>
           </form>
         </div>
 

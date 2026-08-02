@@ -67,6 +67,9 @@ section > h2 {
 .card h3 { margin: 0 0 0.25rem; font-size: 1.15rem; }
 .card .sub { color: var(--muted); font-size: 0.95rem; }
 
+/* The /syncs "Discover is the easy way" pointer card. */
+.callout { border-left: 3px solid var(--accent); }
+
 .peers, .node-lines { list-style: none; margin: 0.5rem 0 0; padding: 0; }
 .peers li, .node-lines li { padding: 0.15rem 0; color: var(--muted); }
 
