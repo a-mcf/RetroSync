@@ -307,6 +307,34 @@ func TestSmokeTest_SSHUnsupportedMessage(t *testing.T) {
 
 // --- admin-gating across every mutation ----------------------------------
 
+// cleanBrowseDir must flatten only genuinely escaping values: ".." itself or a
+// "../" prefix. A directory NAME that merely starts with dots ("..data" — k8s
+// volume mounts create these) is legitimate under safepath and must survive, or
+// the folder picker's "Use this folder" value silently points at the wrong
+// directory (the share root instead of root/..data).
+func TestCleanBrowseDir(t *testing.T) {
+	cases := map[string]string{
+		"":                   "",
+		".":                  "",
+		"/":                  "",
+		"..":                 "",
+		"../etc":             "",
+		"a/../../etc":        "",
+		"/etc/passwd":        "",
+		"saves":              "saves",
+		"saves/deep":         "saves/deep",
+		"saves/./deep":       "saves/deep",
+		"..data":             "..data",
+		"..data/saves":       "..data/saves",
+		"saves/..2025_01_01": "saves/..2025_01_01",
+	}
+	for raw, want := range cases {
+		if got := cleanBrowseDir(raw); got != want {
+			t.Errorf("cleanBrowseDir(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestNodesMutations_NonAdminForbidden_StoreUntouched(t *testing.T) {
 	mutations := []struct {
 		name, path string

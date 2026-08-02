@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/a-mcf/retrosync/internal/reach"
+	"github.com/a-mcf/retrosync/internal/reach/localfs"
 	"github.com/a-mcf/retrosync/internal/reach/safepath"
 	"github.com/a-mcf/retrosync/internal/store"
 )
@@ -61,6 +62,14 @@ type Engine struct {
 	resolve ResolveReach
 	clock   Clock
 
+	// shareRoot is the absolute server-side path the syncthing NFS volume is
+	// mounted at, browsed by BrowseServer for the node-registry folder picker
+	// (slice-29). Empty means the capability is not configured — BrowseServer then
+	// returns ErrBrowseUnsupported. It is NOT a node reach: it is rooted at the
+	// SERVER's share mount, not at any registered node (a node's picker root is the
+	// very path being configured). Set via WithShareRoot.
+	shareRoot string
+
 	// mu guards syncMu. syncMu holds one mutex per sync id, lazily created and
 	// never removed — fine for a household-scale registry (a handful of syncs,
 	// each entry a few dozen bytes).
@@ -68,12 +77,27 @@ type Engine struct {
 	syncMu map[string]*sync.Mutex
 }
 
+// Option customizes an Engine at construction. Options are variadic so existing
+// callers (New(store, resolve, clock)) keep compiling unchanged.
+type Option func(*Engine)
+
+// WithShareRoot configures the absolute server-side path the syncthing NFS volume
+// is mounted at, enabling BrowseServer (the node-registry folder picker). An empty
+// root leaves the capability off (BrowseServer returns ErrBrowseUnsupported).
+func WithShareRoot(root string) Option {
+	return func(e *Engine) { e.shareRoot = root }
+}
+
 // New builds an Engine. clock may be nil, in which case time.Now (UTC) is used.
-func New(s store.Store, resolve ResolveReach, clock Clock) *Engine {
+func New(s store.Store, resolve ResolveReach, clock Clock, opts ...Option) *Engine {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	return &Engine{store: s, resolve: resolve, clock: clock, syncMu: make(map[string]*sync.Mutex)}
+	e := &Engine{store: s, resolve: resolve, clock: clock, syncMu: make(map[string]*sync.Mutex)}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // lockSync acquires the per-sync mutex for syncID (creating it on first use)
@@ -131,10 +155,11 @@ var (
 	// that still want the underlying cause).
 	ErrSmokeTestUnsupported = errors.New("engine: smoke-test not supported for this reach")
 	// ErrBrowseUnsupported is returned by BrowseNode when the node's reach
-	// strategy has no adapter wired yet (today: ssh). Like ErrSmokeTestUnsupported
-	// it is the engine's own sentinel so the web save-file picker can render
-	// "browsing not supported for this node" WITHOUT importing internal/reach; the
-	// underlying reach.ErrUnsupportedReach stays in the chain.
+	// strategy has no adapter wired yet (today: ssh), and by BrowseServer when no
+	// share root is configured (WithShareRoot unset). Like ErrSmokeTestUnsupported
+	// it is the engine's own sentinel so the web pickers can render a friendly
+	// "browsing not supported" note WITHOUT importing internal/reach; for the
+	// BrowseNode case the underlying reach.ErrUnsupportedReach stays in the chain.
 	// TODO(slice-ssh): ssh nodes become browsable once the ssh/sftp adapter lands.
 	ErrBrowseUnsupported = errors.New("engine: browsing not supported for this reach")
 	// ErrBrowseUnsafePath is returned by BrowseNode when the requested relPath is
@@ -494,11 +519,61 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 	}
 	// Map reach.DirEntry -> engine.DirEntry so callers (the web picker) depend on
 	// engine alone, not internal/reach.
+	return toDirEntries(entries), nil
+}
+
+// BrowseServer lists the directory entries directly under relPath on the SERVER's
+// configured share root — the syncthing NFS mount — for the node-registry folder
+// picker (slice-29). Unlike BrowseNode it is not rooted at any registered node: a
+// node's picker root is the very path being configured (chicken-and-egg), so the
+// admin browses the server's share mount instead and copies the absolute path.
+// relPath is share-root-relative (empty / "." names the share root); the same
+// safepath containment as BrowseNode resolves and contains it. It returns metadata
+// only — names, types, sizes, mtimes — never file contents.
+//
+//   - configured share root: resolves to a localfs adapter rooted at that path and
+//     lists the directory (safepath rejects any traversal/escape path before any
+//     I/O). A missing/not-a-directory path is the adapter's error, surfaced to the
+//     caller (the web layer renders a friendly in-place message).
+//   - no share root (WithShareRoot unset, e.g. tests): returns ErrBrowseUnsupported.
+//
+// A traversal/unsafe relPath surfaces the adapter's safepath rejection
+// (safepath.ErrUnsafePath) wrapped as ErrBrowseUnsafePath — the same sentinel as
+// BrowseNode — so the web layer maps it to a 400 without importing internal/reach.
+// Read-only.
+func (e *Engine) BrowseServer(ctx context.Context, relPath string) ([]DirEntry, error) {
+	if e.shareRoot == "" {
+		// The capability is not configured (no WithShareRoot). Reuse the browse
+		// "unsupported" sentinel so the web picker renders a friendly note without
+		// importing internal/reach.
+		return nil, fmt.Errorf("engine: browse server: %w", ErrBrowseUnsupported)
+	}
+	// Construct the localfs reach lazily rooted at the share mount. localfs.New only
+	// validates that the root is absolute — it does NOT stat it — so a share root
+	// that does not yet exist surfaces as a browse-time List error (a friendly
+	// message), never a startup failure.
+	r, err := localfs.New(e.shareRoot)
+	if err != nil {
+		return nil, fmt.Errorf("engine: browse server root %q: %w", e.shareRoot, err)
+	}
+	entries, err := r.List(ctx, relPath)
+	if err != nil {
+		if errors.Is(err, safepath.ErrUnsafePath) {
+			return nil, fmt.Errorf("engine: browse server path %q: %w: %w", relPath, ErrBrowseUnsafePath, err)
+		}
+		return nil, fmt.Errorf("engine: browse server list %q: %w", relPath, err)
+	}
+	return toDirEntries(entries), nil
+}
+
+// toDirEntries maps reach.DirEntry values to the engine's own DirEntry type so
+// callers (the web picker) depend on internal/engine alone, not internal/reach.
+func toDirEntries(entries []reach.DirEntry) []DirEntry {
 	out := make([]DirEntry, len(entries))
 	for i, de := range entries {
 		out[i] = DirEntry{Name: de.Name, IsDir: de.IsDir, Size: de.Size, Mtime: de.Mtime}
 	}
-	return out, nil
+	return out
 }
 
 // ResolveConflict resolves a flagged conflict by making winnerNodeID's current

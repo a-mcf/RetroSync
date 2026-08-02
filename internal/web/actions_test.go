@@ -46,6 +46,13 @@ type stubActioner struct {
 	browseEntries []engine.DirEntry
 	browsed       []browseCall
 
+	// serverBrowseErr / serverBrowseEntries program BrowseServer; serverBrowsed
+	// records each rel-path call so the folder-picker tests assert the handler
+	// reached the engine with the right server-relative path.
+	serverBrowseErr     error
+	serverBrowseEntries []engine.DirEntry
+	serverBrowsed       []string
+
 	// discoverErr / discoverGames program DiscoverGames; discoverCalls counts the
 	// calls so discovery tests assert the handler reached the engine (and that the
 	// scan ran exactly once per page render).
@@ -122,6 +129,22 @@ func (s *stubActioner) browseCalls() []browseCall {
 	return append([]browseCall(nil), s.browsed...)
 }
 
+func (s *stubActioner) BrowseServer(_ context.Context, relPath string) ([]engine.DirEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.serverBrowsed = append(s.serverBrowsed, relPath)
+	if s.serverBrowseErr != nil {
+		return nil, s.serverBrowseErr
+	}
+	return append([]engine.DirEntry(nil), s.serverBrowseEntries...), nil
+}
+
+func (s *stubActioner) serverBrowseCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.serverBrowsed...)
+}
+
 func (s *stubActioner) DiscoverGames(_ context.Context) ([]engine.DiscoveredGame, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,7 +218,7 @@ func newActionFixture(t *testing.T) *actionFixture {
 	}
 
 	act := &stubActioner{}
-	srv, err := New(st, Options{Actioner: act})
+	srv, err := New(st, Options{Actioner: act, ShareRoot: "/shares"})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
