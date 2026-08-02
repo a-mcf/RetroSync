@@ -1,17 +1,27 @@
 {{define "conflict-modal"}}
 <div class="modal-backdrop" id="modal-backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-label="Resolve conflict for {{if .Game}}{{.Game}}{{else}}sync{{end}}">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="{{if .FirstSync}}Choose your starting save for{{else}}Resolve conflict for{{end}} {{if .Game}}{{.Game}}{{else}}sync{{end}}">
     <div class="modal-head">
-      <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}} — sync paused</h3>
+      <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}} — {{if .FirstSync}}choose your starting save{{else}}sync paused{{end}}</h3>
       <button class="modal-close" type="button"
               aria-label="Close"
               onclick="document.getElementById('modal').innerHTML='';">&times;</button>
     </div>
-    <p>More than one node changed since the last sync.
+    {{if .FirstSync}}
+    <p>Your devices hold different saves for this game. That's expected — playing
+       it once on each device is how the save files got here. Pick the one to
+       continue from:</p>
+    <p class="sub">That save becomes the starting point on every device. Each
+       other device's current save is snapshotted to RetroSync's save history
+       first, so you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if
+       you picked wrong.</p>
+    {{else}}
+    <p>More than one device changed since the last sync.
        <strong>retrosync won't choose for you.</strong> Pick a winner:</p>
-    <p class="sub">The winner's save is copied to every other node. Each other
-       node's current save is snapshotted to RetroSync's save history first, so
+    <p class="sub">The winner's save is copied to every other device. Each other
+       device's current save is snapshotted to RetroSync's save history first, so
        you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if needed.</p>
+    {{end}}
     <ul class="source-list">
       {{range .Nodes}}
       <li>

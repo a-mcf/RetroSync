@@ -41,8 +41,15 @@ type mySyncRow struct {
 	Game  string
 	Nodes []nodeMtimeLine
 	// Conflict is true when the sync forked (conflict_at set); the row shows a
-	// red "sync paused" banner with a Resolve button.
+	// conflict banner with a Resolve button (red "sync paused", or the amber
+	// first-sync variant — see FirstSync).
 	Conflict bool
+	// FirstSync is true when the sync has never completed a mirror pass
+	// (LastSynced == nil). Combined with Conflict it selects the amber "almost
+	// there — pick your starting save" banner instead of the red paused one: the
+	// setup path (play once on each device, then Discover) guarantees the members
+	// differ, so the first conflict is the expected last setup step, not a fault.
+	FirstSync bool
 	// LastSync is the coarse "all in sync N ago" relative time, or "never". Only
 	// meaningful when !Conflict.
 	LastSync string
@@ -139,12 +146,13 @@ func (s *Server) buildDashboard(ctx context.Context, u store.User) (dashboardDat
 		}
 		sort.Slice(lines, func(i, j int) bool { return lines[i].NodeID < lines[j].NodeID })
 		data.MySyncs = append(data.MySyncs, mySyncRow{
-			SyncID:   syncID,
-			SyncName: sy.Name,
-			Game:     sy.Game,
-			Nodes:    lines,
-			Conflict: sy.ConflictAt != nil,
-			LastSync: fmtTimeAgo(sy.LastSynced, now),
+			SyncID:    syncID,
+			SyncName:  sy.Name,
+			Game:      sy.Game,
+			Nodes:     lines,
+			Conflict:  sy.ConflictAt != nil,
+			FirstSync: sy.LastSynced == nil,
+			LastSync:  fmtTimeAgo(sy.LastSynced, now),
 		})
 	}
 	// Deterministic order: by game label then sync id.

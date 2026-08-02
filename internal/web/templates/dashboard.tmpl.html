@@ -67,8 +67,22 @@
             <a class="history-link sub" href="/syncs/{{.SyncID}}/history">History</a>
           </h3>
           {{if .Conflict}}
+            {{if .FirstSync}}
+            <!-- Never-synced sync: the setup path leaves each device with a
+                 different save, so this first conflict is the last setup step,
+                 not a fault. Amber, not red; same Resolve endpoint. -->
+            <div class="conflict first-sync">
+              <strong>Almost there — pick your starting save.</strong>
+              Your devices have different saves for this game.
+              <button class="btn conflict-btn"
+                      hx-get="/syncs/{{.SyncID}}/conflict"
+                      hx-target="#modal" hx-swap="innerHTML">
+                Choose starting save
+              </button>
+            </div>
+            {{else}}
             <div class="conflict">
-              <strong>Sync paused — more than one node changed.</strong>
+              <strong>Sync paused — more than one device changed.</strong>
               retrosync won't choose for you.
               <button class="btn conflict-btn"
                       hx-get="/syncs/{{.SyncID}}/conflict"
@@ -76,6 +90,7 @@
                 Resolve conflict
               </button>
             </div>
+            {{end}}
           {{else}}
             <div class="sub"><span class="badge ok">in sync</span> &nbsp; last synced: {{.LastSync}}</div>
           {{end}}

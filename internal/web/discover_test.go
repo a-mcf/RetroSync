@@ -56,6 +56,9 @@ func TestDiscoverPage_AdminRendersGroups(t *testing.T) {
 		"Super Metroid", "Chrono Trigger",
 		"bob-deck", "carol-deck",
 		"Super Metroid (USA).srm", "Create sync", "csrf_token",
+		// Sets the expectation for the first-sync "choose your starting save" step
+		// that follows creation (slice 31).
+		"ask which one to start from",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("discover page missing %q", want)

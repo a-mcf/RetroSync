@@ -187,9 +187,10 @@ func TestLoginSemaphoreFull_CancelledContextReturnsPromptly(t *testing.T) {
 
 // TestDashboard_AdminSeesAllSyncs: an admin who owns ZERO nodes still sees
 // every sync on the dashboard (docs/ui.md) — otherwise a household whose nodes
-// have no owner set has no UI path to the conflict Resolve button. The
-// conflicted sync's card must render the Resolve button, and no member line
-// gets the "(yours)" marker (the admin owns none of the nodes).
+// have no owner set has no UI path to the conflict modal. The conflicted
+// sync's card must render its modal-opening button (asserted via the hx-get,
+// which both banner variants share), and no member line gets the "(yours)"
+// marker (the admin owns none of the nodes).
 func TestDashboard_AdminSeesAllSyncs(t *testing.T) {
 	f := newActionFixture(t)
 	ctx := context.Background()
@@ -223,7 +224,9 @@ func TestDashboard_AdminSeesAllSyncs(t *testing.T) {
 		t.Fatalf("dashboard status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"z-link", "sm-bob", "Resolve conflict"} {
+	// The conflict-modal opener, not its label: z-link has never synced, so it
+	// renders the first-sync ("Choose starting save") variant of the same button.
+	for _, want := range []string{"z-link", "sm-bob", `hx-get="/syncs/z-link/conflict"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("admin dashboard missing %q", want)
 		}

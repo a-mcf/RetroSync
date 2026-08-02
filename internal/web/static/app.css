@@ -92,6 +92,14 @@ section > h2 {
   padding: 0.5rem 0.75rem;
   margin-top: 0.5rem;
 }
+/* A never-synced sync's first conflict is the expected last setup step ("pick
+   your starting save"), not breakage — amber/informational, not red. */
+.conflict.first-sync {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: rgba(224, 179, 65, 0.08);
+}
+
 /* The "Resolve conflict" button inside the red banner. */
 .conflict-btn {
   display: block;
@@ -99,6 +107,10 @@ section > h2 {
   border-color: var(--bad);
   background: var(--bad);
   color: #0b0d10;
+}
+.conflict.first-sync .conflict-btn {
+  border-color: var(--warn);
+  background: var(--warn);
 }
 
 /* Big tap targets. The "Play on <node>" action is meant to be the largest

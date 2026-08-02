@@ -36,11 +36,12 @@
          Pick the copies you want to keep together (uncheck any that are really a
          different person's save) and one-click create a sync. This scan is
          read-only — nothing changes until you create a sync.</p>
-
       {{if not .Games}}
         <p class="empty">No un-synced save files were found. (Files already in a
            sync are not shown; ssh nodes aren't scanned yet.)</p>
       {{else}}
+        <p class="sub">When two devices each have their own save, RetroSync will
+           ask which one to start from before it mirrors anything.</p>
         {{$csrf := .CSRF}}
         {{range .Games}}
           <div class="card game-card">
