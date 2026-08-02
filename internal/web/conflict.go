@@ -20,9 +20,16 @@ type conflictModalData struct {
 	SyncID   string
 	SyncName string
 	// Game is the sync's free-text game label (a display grouping; "" when unset).
-	Game  string
-	Nodes []conflictNode
-	CSRF  string
+	Game string
+	// FirstSync is true when the sync has never completed a mirror pass
+	// (LastSynced == nil). The engine flags a conflict identically either way, but
+	// the copy differs: for a never-synced sync "more than one device changed since
+	// the last sync" is literally false — the members simply hold the different
+	// saves the setup path (play once on each device, then Discover) produced. The
+	// modal then frames the pick as the last setup step rather than as breakage.
+	FirstSync bool
+	Nodes     []conflictNode
+	CSRF      string
 }
 
 // conflictNode is one in-scope node's live state in the conflict modal.
@@ -66,10 +73,11 @@ func (s *Server) handleConflictModal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := conflictModalData{
-		SyncID:   sy.ID,
-		SyncName: sy.Name,
-		Game:     sy.Game,
-		CSRF:     s.csrfFor(r),
+		SyncID:    sy.ID,
+		SyncName:  sy.Name,
+		Game:      sy.Game,
+		FirstSync: sy.LastSynced == nil,
+		CSRF:      s.csrfFor(r),
 	}
 	for _, st := range states {
 		cn := conflictNode{NodeID: st.NodeID, Present: st.Present}

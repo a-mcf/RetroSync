@@ -4,7 +4,8 @@ HTMX + server-rendered HTML. No build step. One CSS file. Optimized for "I'm sit
 
 > **Auto-mirror (slice 18).** There are **no Play / Done / Take-over buttons** and
 > **no activation modal**. Every sync mirrors automatically; the dashboard is a
-> **status view**. The only action on the dashboard is **Resolve conflict**.
+> **status view**. The only action on the dashboard is **Resolve conflict**
+> (labelled **Choose starting save** on a sync's first conflict).
 
 ## Screens
 
@@ -21,12 +22,22 @@ box at top. Each card:
 - A **History** link (opens the sync's save-history page)
 - The sync's **state**:
   - in sync → `in sync` badge + "last synced `<time ago>`"
-  - conflicted → a red **Sync paused** banner with a **Resolve conflict** button
-    (opens the conflict modal)
+  - conflicted, **never synced** (`last_synced` is null) → an amber **Almost
+    there — pick your starting save** banner with a **Choose starting save**
+    button (opens the conflict modal). The recommended setup path — play the game
+    once on each device, then Discover — guarantees the members hold different
+    bytes, so the engine's first poll always flags a conflict. That is expected,
+    not breakage, and the card says so.
+  - conflicted, **synced before** → a red **Sync paused** banner with a **Resolve
+    conflict** button (opens the conflict modal)
+
+  Both banners open the same modal and post to the same
+  `/api/syncs/{id}/resolve-conflict`; only the copy and colour differ.
 
 There are no Play buttons: a sync needs no human action to mirror. The only
-state-changing buttons are **Resolve conflict** (when the sync has forked) and
-**Restore** (on the history page).
+state-changing buttons are **Resolve conflict** (when the sync has forked;
+labelled **Choose starting save** on a first conflict) and **Restore** (on the
+history page).
 
 **Nodes** — a read-only list of each node's display name and id. The node
 controls (**Test**, **Edit**, **Delete**) live on `/nodes`, not here. There is no
@@ -54,10 +65,32 @@ device-side `.retrosync-conflict-<ts>` sibling backups.
 
 ### Conflict modal
 
+Two variants, chosen by whether the sync has ever completed a mirror pass
+(`last_synced`). Identical mechanics — same per-device rows, same winner buttons,
+same `POST /api/syncs/{id}/resolve-conflict` — only the framing differs.
+
+**First sync (`last_synced` is null)** — the last setup step, not an error:
+
 ```
-  Super Metroid — sync paused                     [×]
+  Super Metroid — choose your starting save        [×]
   ─────────────────────────────────────────────────
-  More than one node changed since the last sync.
+  Your devices hold different saves for this game.
+  That's expected — playing it once on each device
+  is how the save files got here. Pick the one to
+  continue from:
+
+    bob-deck:            4 minutes ago, 65 KB
+    living-room-mister:  7 minutes ago, 64 KB
+
+  [Use bob-deck]                  [Use living-room-mister]
+```
+
+**Mid-life fork (`last_synced` set)** — two devices really did diverge:
+
+```
+  Super Metroid — sync paused                      [×]
+  ─────────────────────────────────────────────────
+  More than one device changed since the last sync.
   retrosync won't choose for you. Pick a winner:
 
     bob-deck:            4 minutes ago, 65 KB
@@ -65,6 +98,10 @@ device-side `.retrosync-conflict-<ts>` sibling backups.
 
   [Use bob-deck]                  [Use living-room-mister]
 ```
+
+Either way the losing devices' current saves are snapshotted to the save history
+before being overwritten, and the modal links there so a wrong pick is
+recoverable.
 
 ### `/discover` — discovery (the on-ramp)
 
@@ -79,7 +116,10 @@ honor the Bob-vs-Alice split — uncheck a copy that is really a different perso
 save — then **Create sync** one-click-creates the sync (game label prefilled to
 the inferred name, sync **name** editable, defaulting to "Main"; the optional id
 lives behind an **Advanced** `<details>` and auto-slugs from game + name). On
-success the admin lands on `/syncs` with the new sync showing.
+success the admin lands on `/syncs` with the new sync showing. The page sets the
+expectation up front — since each device has its own save right now, RetroSync
+will ask which one to start from before it mirrors anything (the first-sync
+conflict modal above).
 
 Scan rules (all in the engine, read-only):
 
@@ -168,5 +208,6 @@ the two share one fragment, parameterized folder-select vs file-select.
 - A node is reachable / not.
 - A sync has no save on any node ("haven't played yet — when you do, it'll be picked up").
 - A node's save is from a different person's last session (show whose, with timestamp).
-- Sync paused due to conflict.
+- Sync paused due to conflict (mid-life fork), vs. a never-synced sync awaiting
+  its starting save (same mechanism, expected-setup framing).
 - Sync currently in flight (transient spinner).

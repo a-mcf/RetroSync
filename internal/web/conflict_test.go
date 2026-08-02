@@ -25,6 +25,18 @@ func seedConflictedSync(t *testing.T, f *actionFixture) {
 	}
 }
 
+// seedSyncedSync marks sync sm-bob as having completed a mirror pass
+// (last_synced set), which is what distinguishes a MID-LIFE fork from a
+// never-synced sync's first conflict in the UI copy. The fixture's sync is
+// freshly created, so last_synced is nil unless a test calls this.
+func seedSyncedSync(t *testing.T, f *actionFixture) {
+	t.Helper()
+	synced := time.Date(2026, 6, 21, 11, 30, 0, 0, time.UTC)
+	if err := f.store.MarkSyncSynced(context.Background(), "sm-bob", synced); err != nil {
+		t.Fatalf("seed synced sync: %v", err)
+	}
+}
+
 // --- Conflict modal ------------------------------------------------------
 
 // TestConflictModal_RendersLiveStatePerNode_WinnerButtonOnlyWhenPresent asserts
@@ -33,6 +45,7 @@ func seedConflictedSync(t *testing.T, f *actionFixture) {
 // button (you cannot pick an empty file).
 func TestConflictModal_RendersLiveStatePerNode_WinnerButtonOnlyWhenPresent(t *testing.T) {
 	f := newActionFixture(t)
+	seedSyncedSync(t, f) // mid-life fork: exercises the "won't choose for you" copy
 	mtime := time.Date(2026, 6, 21, 11, 56, 0, 0, time.UTC)
 	f.act.nodeStates = []engine.NodeState{
 		{NodeID: "bob-deck", Present: true, Mtime: mtime, Size: 65 * 1024},
@@ -95,6 +108,90 @@ func TestConflictModal_ViewableByNonOwner(t *testing.T) {
 	f.srv.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("non-owner conflict modal status = %d, want 200", rec.Code)
+	}
+}
+
+// TestConflictModal_FirstSyncVsMidLifeCopy asserts the modal reframes the FIRST
+// conflict of a never-synced sync (LastSynced == nil) as the last setup step —
+// "choose your starting save" — instead of the (literally false) "more than one
+// device changed since the last sync". A sync that HAS synced keeps the paused
+// fork copy. Same forms, same winner buttons in both.
+func TestConflictModal_FirstSyncVsMidLifeCopy(t *testing.T) {
+	tests := []struct {
+		name       string
+		everSynced bool
+		want       []string
+		absent     []string
+	}{
+		{
+			name:       "never synced",
+			everSynced: false,
+			want: []string{
+				"choose your starting save",
+				"different saves for this game",
+				"Pick the one to",
+				`aria-label="Choose your starting save for`,
+			},
+			absent: []string{"sync paused", "since the last sync", "won't choose for you"},
+		},
+		{
+			name:       "mid-life fork",
+			everSynced: true,
+			want:       []string{"sync paused", "More than one device changed since the last sync", "won't choose for you"},
+			absent:     []string{"choose your starting save"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newActionFixture(t)
+			seedConflictedSync(t, f)
+			if tc.everSynced {
+				seedSyncedSync(t, f)
+			}
+			f.act.nodeStates = []engine.NodeState{
+				{NodeID: "bob-deck", Present: true, Mtime: time.Date(2026, 6, 21, 11, 56, 0, 0, time.UTC), Size: 1024},
+				{NodeID: "carol-deck", Present: true, Mtime: time.Date(2026, 6, 21, 11, 58, 0, 0, time.UTC), Size: 2048},
+			}
+			c, _ := loginAs(t, f, "carol")
+
+			req := httptest.NewRequest(http.MethodGet, "/syncs/sm-bob/conflict", nil)
+			req.AddCookie(c)
+			rec := httptest.NewRecorder()
+			f.srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("modal status = %d, want 200\n%s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Errorf("modal missing %q\n%s", want, body)
+				}
+			}
+			for _, bad := range tc.absent {
+				if strings.Contains(body, bad) {
+					t.Errorf("modal should not contain %q\n%s", bad, body)
+				}
+			}
+			// Both variants keep the identical per-device winner forms.
+			for _, want := range []string{
+				`hx-post="/api/syncs/sm-bob/resolve-conflict"`,
+				`name="winner_node_id" value="bob-deck"`,
+				`name="winner_node_id" value="carol-deck"`,
+				"Use bob-deck",
+				`href="/syncs/sm-bob/history"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("modal missing %q\n%s", want, body)
+				}
+			}
+			// Display strings say "device", never "node" (slice-30 wording rule).
+			// The identifiers (winner_node_id, node ids) are exempt.
+			for _, prose := range []string{"one node", "every other node", "other node's"} {
+				if strings.Contains(body, prose) {
+					t.Errorf("modal prose still says %q (should say device)\n%s", prose, body)
+				}
+			}
+		})
 	}
 }
 
@@ -266,10 +363,12 @@ func TestResolveConflict_NoSuchSync_409(t *testing.T) {
 // --- Dashboard conflict banner -------------------------------------------
 
 // TestDashboard_ConflictBanner_ShownWhenConflicted asserts the red banner and a
-// modal-open button render when conflict_at is set.
+// modal-open button render when conflict_at is set on a sync that has synced
+// before (a mid-life fork).
 func TestDashboard_ConflictBanner_ShownWhenConflicted(t *testing.T) {
 	f := newActionFixture(t)
 	seedConflictedSync(t, f)
+	seedSyncedSync(t, f)
 	c, _ := loginAs(t, f, "carol")
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -308,5 +407,69 @@ func TestDashboard_NoConflictBanner_WhenClean(t *testing.T) {
 	}
 	if strings.Contains(body, `hx-get="/syncs/sm-bob/conflict"`) {
 		t.Errorf("modal-open button should be absent for a clean game\n%s", body)
+	}
+}
+
+// TestDashboard_ConflictBanner_FirstSyncVsMidLife asserts the card banner splits
+// on last_synced: a never-synced sync's first conflict gets the amber
+// "almost there — pick your starting save" framing (the setup path guarantees
+// the devices differ), while a sync that has synced before keeps the red
+// "sync paused" one. Both open the SAME conflict modal.
+func TestDashboard_ConflictBanner_FirstSyncVsMidLife(t *testing.T) {
+	tests := []struct {
+		name       string
+		everSynced bool
+		want       []string
+		absent     []string
+	}{
+		{
+			name:       "never synced",
+			everSynced: false,
+			want:       []string{`class="conflict first-sync"`, "Almost there", "pick your starting save", "Choose starting save"},
+			absent:     []string{"Sync paused", "Resolve conflict"},
+		},
+		{
+			name:       "mid-life fork",
+			everSynced: true,
+			want:       []string{`class="conflict"`, "Sync paused", "Resolve conflict"},
+			absent:     []string{"first-sync", "Almost there", "Choose starting save"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newActionFixture(t)
+			seedConflictedSync(t, f)
+			if tc.everSynced {
+				seedSyncedSync(t, f)
+			}
+			c, _ := loginAs(t, f, "carol")
+
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.AddCookie(c)
+			rec := httptest.NewRecorder()
+			f.srv.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("dashboard status = %d, want 200", rec.Code)
+			}
+			body := rec.Body.String()
+			for _, want := range tc.want {
+				if !strings.Contains(body, want) {
+					t.Errorf("dashboard missing %q\n%s", want, body)
+				}
+			}
+			for _, bad := range tc.absent {
+				if strings.Contains(body, bad) {
+					t.Errorf("dashboard should not contain %q\n%s", bad, body)
+				}
+			}
+			// Same modal-open button either way.
+			if !strings.Contains(body, `hx-get="/syncs/sm-bob/conflict"`) {
+				t.Errorf("conflict banner missing modal-open button\n%s", body)
+			}
+			// Banner prose says "device", not "node".
+			if strings.Contains(body, "more than one node") {
+				t.Errorf("banner prose still says node\n%s", body)
+			}
+		})
 	}
 }
