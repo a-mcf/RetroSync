@@ -146,6 +146,66 @@ func TestWriteAtomic_ReadOnlyParentFails(t *testing.T) {
 	}
 }
 
+// TestWriteAtomic_PublishesSaveFileMode: a published save must be 0644, not the
+// 0600 os.CreateTemp hands out (os.Rename carries the temp file's mode to the
+// destination). The REPLACE case is the regression that matters: a save already
+// sitting at 0600 — every file written before this fix — must come back 0644,
+// so the fix self-heals rather than preserving the damaged mode. A 0600 save can
+// be unreadable to an emulator or syncthing daemon running as another user, and
+// syncthing silently stops noticing files it cannot read.
+func TestWriteAtomic_PublishesSaveFileMode(t *testing.T) {
+	l, root := newRooted(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		// seedMode is applied to a pre-existing destination; 0 means "no
+		// destination, create fresh".
+		seedMode os.FileMode
+	}{
+		{name: "fresh create", seedMode: 0},
+		{name: "replaces 0600 left by an older write", seedMode: 0o600},
+		{name: "replaces 0644 written by the emulator", seedMode: 0o644},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := "dir/" + strings.ReplaceAll(tc.name, " ", "_") + ".srm"
+			abs := filepath.Join(root, rel)
+			if tc.seedMode != 0 {
+				if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				if err := os.WriteFile(abs, []byte("OLD"), tc.seedMode); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+				// os.WriteFile applies umask; force the exact mode we are testing.
+				if err := os.Chmod(abs, tc.seedMode); err != nil {
+					t.Fatalf("seed chmod: %v", err)
+				}
+			}
+
+			if err := l.WriteAtomic(ctx, rel, []byte("NEW"), time.Unix(20, 0)); err != nil {
+				t.Fatalf("WriteAtomic: %v", err)
+			}
+
+			fi, err := os.Stat(abs)
+			if err != nil {
+				t.Fatalf("stat published file: %v", err)
+			}
+			if got := fi.Mode().Perm(); got != 0o644 {
+				t.Errorf("published mode = %04o, want 0644", got)
+			}
+			got, err := os.ReadFile(abs)
+			if err != nil {
+				t.Fatalf("read published file: %v", err)
+			}
+			if string(got) != "NEW" {
+				t.Errorf("published content = %q, want %q", got, "NEW")
+			}
+		})
+	}
+}
+
 func TestWriteAtomic_NoLeftoverTempOnSuccess(t *testing.T) {
 	l, root := newRooted(t)
 	ctx := context.Background()
