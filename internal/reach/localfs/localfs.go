@@ -42,6 +42,16 @@ type LocalFS struct {
 // crash is recognizable.
 const tempSuffix = ".retrosync-tmp"
 
+// saveFileMode is the permission WriteAtomic publishes saves with. os.CreateTemp
+// hardcodes 0600 and os.Rename carries the temp file's mode to the destination,
+// so without an explicit chmod every fan-out would downgrade a save the emulator
+// created as 0644. That downgrade is not cosmetic: on a device whose syncthing
+// folder syncs permissions, a 0600 save becomes unreadable to whichever of the
+// emulator or the syncthing daemon is not its owner — and syncthing responds to
+// a file it cannot read by silently never noticing it changed, which is
+// indistinguishable from "the save never synced". Saves hold no secrets.
+const saveFileMode = 0o644
+
 // maxListEntries is a generous per-call cap on how many directory entries a single
 // List will accumulate. List backs BOTH the discovery scan and the slice-17
 // picker; without a cap, a save directory with a pathological number of entries
@@ -236,10 +246,12 @@ func sortDirEntries(entries []reach.DirEntry) {
 	})
 }
 
-// WriteAtomic implements reach.Reach honoring the crash-safety contract: write
-// to a temp file in the SAME directory as the destination, fsync+close it,
-// os.Chtimes it to the requested mtime, os.Rename it over the destination
-// (atomic on one filesystem), then fsync the destination's parent directory.
+// WriteAtomic implements reach.Reach honoring the crash-safety contract: create
+// a temp file in the SAME directory as the destination, chmod it to
+// saveFileMode, write and fsync+close it, os.Chtimes it to the requested mtime,
+// os.Rename it over the destination (atomic on one filesystem), then fsync the
+// destination's parent directory. The mode and mtime are both set BEFORE the
+// rename so the published file is correct at the instant it becomes visible.
 // The destination's parent is created (within root) if missing, and each newly
 // created path component is made durable by fsyncing ITS parent.
 //
@@ -296,6 +308,15 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 
 	// From here, any error path must remove the temp file. cleanup is idempotent.
 	cleanup := func() { _ = os.Remove(tmpName) }
+
+	// Set the published mode while the file is still private: fchmod on the open
+	// handle rather than a path-based chmod, so there is no window in which the
+	// name could be swapped between the two operations. See saveFileMode.
+	if err := tmp.Chmod(saveFileMode); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("localfs: chmod temp %q: %w", tmpName, err)
+	}
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
