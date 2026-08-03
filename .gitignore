@@ -13,3 +13,6 @@ secrets.yaml
 
 # Go telemetry counters written by the containerized toolchain (bind-mounted $HOME)
 /.config/
+
+# Scratch tree for the syncthing end-to-end test mesh (make test-syncthing).
+.syncthing-test/

@@ -19,7 +19,12 @@ GORUN = podman run --rm \
 	-w /src \
 	$(GO_IMAGE)
 
-.PHONY: build test test-integration vet fmt-check tidy clean ci verify
+# Outside the repo on purpose: the repo is mounted :Z (private SELinux label)
+# into the Go containers, and nesting the mesh trees inside it makes that
+# relabel collide with the per-instance mounts. See scripts/syncthing-env.sh.
+ST_ROOT ?= /tmp/retrosync-syncthing-test
+
+.PHONY: build test test-integration test-syncthing vet fmt-check tidy clean ci verify
 
 ## ci: run every gate in order (fmt, vet, unit, integration, image build). The one command that verifies a slice.
 ci: fmt-check vet test test-integration build
@@ -79,6 +84,30 @@ test-integration:
 	podman rm -f $(PG_NAME) >/dev/null 2>&1; \
 	exit $$status
 
-## clean: remove the test Postgres container if present.
+## test-syncthing: spin up a throwaway syncthing mesh, run syncthing-tagged
+## end-to-end tests against it, tear down. NOT part of `ci` — it is slower than
+## the rest of the suite and pulls a container image. Run it when touching the
+## write path, the fan-out, or anything about how RetroSync and syncthing share
+## a directory; that boundary is where the failures CI cannot see live.
+test-syncthing:
+	@echo ">> starting syncthing test mesh"
+	@ST_ROOT="$(ST_ROOT)" ./scripts/syncthing-env.sh up
+	@echo ">> running syncthing end-to-end tests"
+	@set -e; \
+	podman run --rm \
+		--network host \
+		-v $(PWD):/src:Z \
+		-v retrosync-gocache:/go/pkg/mod \
+		-v $(ST_ROOT):$(ST_ROOT):z \
+		-w /src \
+		-e ST_ROOT="$(ST_ROOT)" \
+		$(GO_IMAGE) go test -tags syncthing -count=1 -v ./internal/syncthinge2e/... ; \
+	status=$$?; \
+	echo ">> tearing down syncthing test mesh"; \
+	ST_ROOT="$(ST_ROOT)" ./scripts/syncthing-env.sh down; \
+	exit $$status
+
+## clean: remove test containers and scratch trees if present.
 clean:
 	-podman rm -f $(PG_NAME) >/dev/null 2>&1
+	-ST_ROOT="$(ST_ROOT)" ./scripts/syncthing-env.sh down >/dev/null 2>&1
