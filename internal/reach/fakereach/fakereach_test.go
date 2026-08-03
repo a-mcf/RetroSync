@@ -45,7 +45,7 @@ func TestReadNotExist(t *testing.T) {
 func TestWriteAtomicStoresMtimeFaithfully(t *testing.T) {
 	mt := time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC)
 	f := fakereach.New()
-	if err := f.WriteAtomic(ctx(), "b.srm", []byte("data"), mt); err != nil {
+	if _, err := f.WriteAtomic(ctx(), "b.srm", []byte("data"), mt); err != nil {
 		t.Fatal(err)
 	}
 	fm, err := f.Stat(ctx(), "b.srm")
@@ -61,6 +61,57 @@ func TestWriteAtomicStoresMtimeFaithfully(t *testing.T) {
 	writes := f.Writes()
 	if len(writes) != 1 || writes[0].Path != "b.srm" {
 		t.Fatalf("writes = %+v", writes)
+	}
+}
+
+// TestWriteAtomic_MtimeCollisionRule pins that the fake models the production
+// adapter's issue-#33 rule: a published mtime is never allowed to collide with
+// (or predate) the destination's current mtime, because engine tests rely on the
+// fake to behave like localfs here. The returned mtime is what was published.
+func TestWriteAtomic_MtimeCollisionRule(t *testing.T) {
+	base := time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		// seed is the destination's existing mtime; zero means no destination.
+		seed     time.Time
+		request  time.Time
+		want     time.Time
+		wantSame bool // want == request (no bump)
+	}{
+		{name: "fresh create keeps the requested mtime", request: base, want: base, wantSame: true},
+		{name: "newer request is kept", seed: base, request: base.Add(time.Hour), want: base.Add(time.Hour), wantSame: true},
+		{name: "colliding request is bumped", seed: base, request: base, want: base.Add(time.Microsecond)},
+		{name: "older request is bumped", seed: base, request: base.Add(-time.Hour), want: base.Add(time.Microsecond)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := fakereach.New()
+			if !tc.seed.IsZero() {
+				f.Put("g.srm", []byte("OLD"), tc.seed)
+			}
+			got, err := f.WriteAtomic(ctx(), "g.srm", []byte("NEW"), tc.request)
+			if err != nil {
+				t.Fatalf("WriteAtomic: %v", err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("returned mtime = %v, want %v", got, tc.want)
+			}
+			// The stored file, and the recorded write, both carry the PUBLISHED mtime.
+			fm, err := f.Stat(ctx(), "g.srm")
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+			if !fm.Mtime.Equal(got) {
+				t.Errorf("stored mtime = %v, but WriteAtomic returned %v", fm.Mtime, got)
+			}
+			writes := f.Writes()
+			if len(writes) != 1 || !writes[0].Mtime.Equal(got) {
+				t.Errorf("write record = %+v, want one record at %v", writes, got)
+			}
+			if !tc.wantSame && !fm.Mtime.After(tc.seed) {
+				t.Errorf("published mtime %v is not strictly newer than the destination's previous %v", fm.Mtime, tc.seed)
+			}
+		})
 	}
 }
 
@@ -107,7 +158,7 @@ func TestFailWriteLeavesPriorFile(t *testing.T) {
 	f := fakereach.New().Put("a", []byte("old"), mt)
 	boom := errors.New("disk full")
 	f.FailWriteAtomic("a", boom)
-	if err := f.WriteAtomic(ctx(), "a", []byte("new"), time.Now()); !errors.Is(err, boom) {
+	if _, err := f.WriteAtomic(ctx(), "a", []byte("new"), time.Now()); !errors.Is(err, boom) {
 		t.Fatalf("want injected error, got %v", err)
 	}
 	got, _ := f.Get("a")
@@ -122,7 +173,7 @@ func TestFailWriteLeavesPriorFile(t *testing.T) {
 func TestDataIsCopied(t *testing.T) {
 	buf := []byte("abc")
 	f := fakereach.New()
-	if err := f.WriteAtomic(ctx(), "p", buf, time.Now()); err != nil {
+	if _, err := f.WriteAtomic(ctx(), "p", buf, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	buf[0] = 'X'

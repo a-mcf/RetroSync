@@ -79,7 +79,7 @@ func TestPreExistingFile_FanOutReachesDevice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("localfs.New: %v", err)
 	}
-	if err := fs.WriteAtomic(ctx, saveName, incomingContent, time.Now()); err != nil {
+	if _, err := fs.WriteAtomic(ctx, saveName, incomingContent, time.Now()); err != nil {
 		t.Fatalf("fan-out WriteAtomic: %v", err)
 	}
 	// RetroSync writes through a mount syncthing's watcher may not observe, so

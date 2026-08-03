@@ -29,7 +29,7 @@ func TestResolveReach_SyncthingShare(t *testing.T) {
 	// file under root.
 	ctx := context.Background()
 	mtime := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
-	if err := r.WriteAtomic(ctx, "saves/g.srm", []byte("payload"), mtime); err != nil {
+	if _, err := r.WriteAtomic(ctx, "saves/g.srm", []byte("payload"), mtime); err != nil {
 		t.Fatalf("WriteAtomic via resolved reach: %v", err)
 	}
 	fm, err := r.Stat(ctx, "saves/g.srm")

@@ -208,6 +208,22 @@ type changedMember struct {
 //     count it as changed.
 //     - hash DIFFERS -> a real content change.
 //
+// PERIODIC VERIFICATION (the backstop, issue #33). Tier 1 is mtime+size, and a
+// save is a fixed size for a given game — so a member whose BYTES changed while
+// its mtime stayed put is invisible to the gate, permanently rather than until
+// the next poll, and the manifest keeps a hash that no longer describes the file.
+// RetroSync's own writes can no longer do that (the reach adapters never publish
+// a colliding mtime), but RetroSync is not the only writer: Syncthing PRESERVES
+// mtimes when it delivers a file, so it can restore an older save carrying
+// exactly the mtime already in the manifest. Pure mtime+size cannot be made safe
+// for fixed-size files written by other processes. So a member whose manifest
+// LastChecked is older than verifyInterval is hashed REGARDLESS of the stat gate.
+// LastChecked advances only when the manifest is written — i.e. it means "the
+// last time we actually looked at the bytes" — so this costs one hash per member
+// per interval and a quiet poll in between stays hash-free, preserving the
+// two-tier intent. A forced hash that matches the manifest is NOT a change: it
+// takes the same touch-reconciliation path (which advances LastChecked).
+//
 // There is no primary: when a single distinct hash exists among the changers,
 // any one of them is the source (they are byte-identical). Crucially, every
 // OTHER member is then unchanged-since-manifest, so the fan-out only overwrites
@@ -256,14 +272,21 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 		present[sn.node.ID] = ok
 
 		me := manifest[sn.node.ID]
-		// Tier 1: fast stat gate. Equal stat => unchanged, no hash.
-		if !statDiffers(me, meta, ok) {
+		// Tier 1: fast stat gate. Equal stat => unchanged, no hash — UNLESS this
+		// member is due for periodic verification, which hashes it anyway so a
+		// collision an external writer inflicted cannot hide bytes forever.
+		differs := statDiffers(me, meta, ok)
+		if !differs && !dueForVerify(me, now) {
 			continue
 		}
 		// A member that vanished (manifest had a file, now absent) is a change with
-		// no current content. Surface it (handled below as the vanished case).
+		// no current content. Surface it (handled below as the vanished case). A
+		// member that is absent and RECORDED absent has no bytes to verify — it only
+		// got here on the verification sweep, so it is not a change.
 		if !ok {
-			changedSet = append(changedSet, changedMember{sn: sn})
+			if differs {
+				changedSet = append(changedSet, changedMember{sn: sn})
+			}
 			continue
 		}
 		// Tier 2: hash truth. Compute the current content hash and compare to the
@@ -275,7 +298,10 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 		if me.SHA256 != nil && *me.SHA256 == curHash {
 			// A touch: mtime/size moved but the bytes are identical. Reconcile the
 			// manifest's mtime/size to current (keeping the SAME hash) so the next
-			// poll fast-paths it. NOT counted as changed; nothing propagates.
+			// poll fast-paths it. NOT counted as changed; nothing propagates. This is
+			// also where a verification sweep that found nothing wrong lands: the
+			// write advances LastChecked, so the member is not re-verified until the
+			// next interval.
 			if err := e.setManifest(ctx, syncID, sn.node.ID, meta, curHash, now); err != nil {
 				return err
 			}
@@ -688,9 +714,12 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 //
 // Capture-before-overwrite is a hard gate throughout (a capture failure aborts
 // the write); a partial restore leaves the manifest trailing the actual writes
-// and is retried/re-driven safely. The restored bytes' mtime is set to the
-// resolution time (the injected clock) so every member converges to one mtime and
-// the next poll is a clean noop.
+// and is retried/re-driven safely. The restored bytes are published with the
+// resolution time (the injected clock), so every member normally converges to one
+// mtime and the next poll is a clean noop; a member whose file already carried a
+// mtime at or past the resolution time gets a slightly newer one instead (the
+// issue #33 collision rule) and its manifest records what was really published,
+// so that member is still a noop next poll.
 //
 // AUTHORIZATION: seq is loaded BOUND to syncID (the caller's authorized sync) via
 // GetSaveVersionData(ctx, syncID, seq). A seq belonging to a DIFFERENT sync is
@@ -732,10 +761,16 @@ func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) e
 	if err := e.captureBeforeOverwrite(ctx, syncID, target, reasonRestore); err != nil {
 		return err
 	}
-	if err := target.r.WriteAtomic(ctx, target.path, data, now); err != nil {
+	publishedMtime, err := target.r.WriteAtomic(ctx, target.path, data, now)
+	if err != nil {
 		return fmt.Errorf("engine: restore write target %s: %w", target.node.ID, err)
 	}
-	restoredMeta := reach.FileMeta{Mtime: now, Size: int64(len(data))}
+	// The manifest records the mtime the adapter reports it PUBLISHED — normally
+	// the resolution time, but bumped past the target's previous mtime if that was
+	// somehow not older (a device clock ahead of the server's, say). Recording the
+	// requested time instead would leave the manifest describing a file that
+	// carries a different mtime (issue #33).
+	restoredMeta := reach.FileMeta{Mtime: publishedMtime, Size: int64(len(data))}
 	if err := e.setManifest(ctx, syncID, target.node.ID, restoredMeta, restoredHash, now); err != nil {
 		return err
 	}
@@ -745,7 +780,7 @@ func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) e
 		FromNode: target.node.ID,
 		ToNode:   target.node.ID,
 		Bytes:    &bytes,
-		SrcMtime: tptr(now),
+		SrcMtime: tptr(restoredMeta.Mtime),
 		Outcome:  store.OutcomeOK,
 		Message:  fmt.Sprintf("restore version %d", seq),
 		TS:       now,
@@ -825,8 +860,13 @@ func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst 
 // computed earlier (the source can change on a live share between that earlier
 // Hash and this Read; the manifest must describe the bytes really propagated).
 // It returns that hash so the caller can record it for the source member's own
-// manifest too, and appends a sync_log "ok" row per copy. The destination mtime
-// is the source's mtime so the next poll sees source == peer.
+// manifest too, and appends a sync_log "ok" row per copy. The destination is
+// asked to publish the SOURCE's mtime so the next poll sees source == peer; the
+// adapter may publish a slightly newer one instead when the source mtime would
+// not be strictly newer than what that destination already had (the issue #33
+// collision rule), and each written member's manifest records the mtime the
+// adapter reports it actually published — so members can legitimately end a
+// fan-out on slightly different mtimes, each matching its own file.
 //
 // skip names members that must NOT be overwritten because they already hold the
 // agreed content (the byte-identical co-changers in the one-distinct-hash case).
@@ -872,7 +912,8 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 			return "", err
 		}
 
-		if err := dst.r.WriteAtomic(ctx, dst.path, data, srcMeta.Mtime); err != nil {
+		publishedMtime, err := dst.r.WriteAtomic(ctx, dst.path, data, srcMeta.Mtime)
+		if err != nil {
 			// Crash-safety: the write failed, so we do NOT advance dst's manifest.
 			// Log the error and abort the pass; the next poll re-detects and
 			// retries.
@@ -892,8 +933,16 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		// Advance the written node's manifest to the post-write state. The
 		// destination now holds exactly `data`, so its manifest records data's
 		// length and in-process hash (not the possibly-stale srcMeta.Size / a
-		// caller-computed hash); the mtime is the source mtime WriteAtomic stamped.
-		written := reach.FileMeta{Mtime: srcMeta.Mtime, Size: int64(len(data))}
+		// caller-computed hash). The mtime is the one WriteAtomic REPORTS having
+		// published, which is the source mtime only when that was strictly newer
+		// than what the destination already had — the adapter bumps it otherwise so
+		// the write cannot be invisible to a stat gate (issue #33). Recording the
+		// requested mtime instead would leave the manifest describing a file that
+		// carries a different mtime, re-arming the false "unchanged" the bump
+		// exists to prevent; and re-stating the file here (rather than trusting the
+		// adapter's report) could pick up an external writer's mtime and file it
+		// under OUR hash.
+		written := reach.FileMeta{Mtime: publishedMtime, Size: int64(len(data))}
 		if err := e.setManifest(ctx, syncID, dst.node.ID, written, srcHash, now); err != nil {
 			return "", err
 		}
@@ -1076,6 +1125,41 @@ func statDiffers(me store.ManifestEntry, cur reach.FileMeta, present bool) bool 
 		return true // appeared
 	}
 	return !mtimeEqual(*me.Mtime, cur.Mtime) || *me.Size != cur.Size
+}
+
+// verifyInterval is how long a member may go without its bytes being looked at
+// before Poll hashes it regardless of the tier-1 stat gate. It is the backstop
+// for the mtime collision of issue #33: mtime+size over fixed-size save files
+// cannot detect a change an EXTERNAL writer made without moving the mtime
+// (Syncthing preserves mtimes when it delivers a file, so it can restore an older
+// save carrying exactly the manifest's mtime), and such a change would otherwise
+// be invisible forever rather than merely late.
+//
+// Five minutes trades a bounded amount of hashing — one hash per member per
+// interval, over household-scale save files — for a bounded window of silent
+// divergence. It must stay comfortably larger than the daemon's poll interval so
+// the common poll remains hash-free, which is the whole point of tier 1.
+const verifyInterval = 5 * time.Minute
+
+// dueForVerify reports whether a member whose stat gate said "unchanged" must be
+// hashed anyway, because its manifest has not been WRITTEN (i.e. its bytes have
+// not been looked at) for verifyInterval. See the Poll doc comment.
+//
+// It only forces a hash for a member the manifest describes completely —
+// mtime/size AND a stored sha256. Without a stored hash there is nothing to
+// compare against, so a forced hash could only manufacture a false "content
+// change" out of a member whose hash was simply never recorded; those members
+// are already picked up by the normal stat gate the first time anything moves. A
+// nil LastChecked on an otherwise complete entry means "written by something that
+// did not stamp it", which is treated as due.
+func dueForVerify(me store.ManifestEntry, now time.Time) bool {
+	if me.Mtime == nil || me.Size == nil || me.SHA256 == nil {
+		return false
+	}
+	if me.LastChecked == nil {
+		return true
+	}
+	return now.Sub(*me.LastChecked) >= verifyInterval
 }
 
 func byID(scoped []scopedNode, id string) (scopedNode, bool) {

@@ -143,6 +143,23 @@ func (h *harness) seedManifestHash(nodeID string, mtime time.Time, size int64, s
 	}
 }
 
+// seedManifestHashChecked is seedManifestHash with an explicit LastChecked, so a
+// test can put a member either side of the engine's periodic-verification
+// interval: an OLD LastChecked makes the next Poll hash the member regardless of
+// the stat gate (the issue #33 backstop), a RECENT one leaves the poll hash-free.
+func (h *harness) seedManifestHashChecked(nodeID string, mtime time.Time, size int64, sha string, lastChecked time.Time) {
+	h.t.Helper()
+	mt := mtime.UTC()
+	sz := size
+	checked := lastChecked.UTC()
+	s := sha
+	if err := h.store.SetManifest(ctx(), store.ManifestEntry{
+		SyncID: syncID, NodeID: nodeID, Mtime: &mt, Size: &sz, SHA256: &s, LastChecked: &checked,
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
 // hashOf returns the fakereach content hash a node currently reports for its
 // member path (the lowercase-hex sha256 of the stored bytes).
 func (h *harness) hashOf(nodeID string) string {
@@ -347,59 +364,193 @@ func TestPoll_OneChanged_Propagates(t *testing.T) {
 	}
 }
 
-// TestPoll_SameMtimeAndSize_ContentChangeIsMissed pins a KNOWN BLIND SPOT, the
-// mirror of the syncthing bug in issue #33.
+// TestPoll_SameMtimeAndSize_ContentChangeIsDetected closes the blind spot of
+// issue #33 on the READ side.
 //
-// Poll's tier-1 gate is stat-only (statDiffers: mtime + size). A member whose
-// BYTES changed while its mtime and size stayed equal to the manifest is never
-// hashed, so the change is invisible — permanently, not just until the next
-// poll. Save files are a fixed size per game, so size never rescues us; mtime
-// is the only discriminator.
+// Poll's tier-1 gate is stat-only (statDiffers: mtime + size), and save files
+// are a fixed size per game, so a member whose BYTES changed while its mtime
+// stayed put slips through it. RetroSync's own writes can no longer produce that
+// state (the adapters never publish a colliding mtime), but an external writer
+// can: syncthing PRESERVES mtimes when it delivers a file, so it can restore an
+// older save carrying exactly the mtime already in the manifest. Left to the
+// stat gate alone the change would be invisible PERMANENTLY, not merely late,
+// and the manifest would keep a hash that no longer describes the file.
 //
-// This is reachable in production because RetroSync is not the only writer.
-// Syncthing PRESERVES mtimes when it delivers a file, so it can restore an
-// older copy of a save carrying exactly the mtime already recorded in the
-// manifest. RetroSync then holds a manifest hash that does not describe the
-// bytes on disk and will not re-examine them.
-//
-// The assertion below deliberately encodes the CURRENT (wrong) behavior so the
-// blind spot is pinned rather than merely known. When the stat gate is fixed,
-// invert it: the change should be detected and propagated.
-func TestPoll_SameMtimeAndSize_ContentChangeIsMissed(t *testing.T) {
+// The periodic verification backstop catches it: a member whose manifest has not
+// been written for verifyInterval is hashed regardless of the stat gate. Here
+// the manifest was last checked an hour ago, so the poll hashes and finds the
+// change.
+func TestPoll_SameMtimeAndSize_ContentChangeIsDetected(t *testing.T) {
 	h := newHarness(t, steppingClock(t0, time.Second))
 	base := t0.Add(-time.Hour)
 	h.addNode("primary", "p.srm", []byte("V1"), base, true)
 	h.addNode("peer", "q.srm", []byte("V1"), base, true)
 	v1hash := h.hashOf("primary")
-	h.seedManifestHash("primary", base, int64(len("V1")), v1hash)
-	h.seedManifestHash("peer", base, int64(len("V1")), v1hash)
+	// Last verified an hour ago: both members are due for a forced hash.
+	h.seedManifestHashChecked("primary", base, int64(len("V1")), v1hash, base)
+	h.seedManifestHashChecked("peer", base, int64(len("V1")), v1hash, base)
 
 	// Change the primary's CONTENT while leaving mtime and size exactly as the
 	// manifest records them. "V1" and "V2" are the same length on purpose: size
 	// must not be able to betray the change, mirroring real saves.
 	h.fake("primary").Mutate("p.srm", []byte("V2"), base)
+	v2hash := h.hashOf("primary")
 
-	writesBefore := len(h.fake("peer").Writes())
 	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 
-	// CURRENT BEHAVIOR: the stat gate says "unchanged", so nothing is hashed and
-	// nothing propagates. The peer keeps the stale bytes.
-	if got := len(h.fake("peer").Writes()); got != writesBefore {
-		t.Fatalf("blind spot appears to be FIXED (peer writes %d -> %d): "+
-			"invert this test — the change is now detected", writesBefore, got)
-	}
-	h.assertFileContent("peer", []byte("V1"))
-
-	// And the manifest still claims the OLD hash, so RetroSync's recorded state
-	// no longer describes the file on disk.
-	m := h.manifest("primary")
-	if m.SHA256 == nil || *m.SHA256 != v1hash {
-		t.Fatalf("primary manifest hash = %v, want the stale %q", m.SHA256, v1hash)
+	// The change is found and propagated despite the identical stat.
+	h.assertFileContent("peer", []byte("V2"))
+	// Both manifests now describe the bytes actually on disk.
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.SHA256 == nil || *m.SHA256 != v2hash {
+			t.Fatalf("%s manifest hash = %v, want the current %q", id, m.SHA256, v2hash)
+		}
 	}
 	if h.sync().ConflictAt != nil {
-		t.Fatalf("missed change must not have produced a conflict")
+		t.Fatalf("a single detected change must not conflict")
+	}
+	if h.sync().LastSynced == nil {
+		t.Fatalf("a detected+propagated change should advance last_synced")
+	}
+}
+
+// TestPoll_RecentlyChecked_StaysHashFree pins the OTHER half of the backstop's
+// contract: it must not turn every poll into a hashing sweep. A member whose
+// manifest was written moments ago is inside verifyInterval, so a stat-equal
+// poll must not hash it at all — that hash-free fast path is the entire point of
+// tier 1.
+//
+// It is asserted the only way that cannot be faked: Hash is injected to FAIL on
+// every member, so any hash attempt would surface as a Poll error.
+func TestPoll_RecentlyChecked_StaysHashFree(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("V1"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), base, true)
+	v1hash := h.hashOf("primary")
+	// Checked just now (well inside verifyInterval): not due.
+	h.seedManifestHashChecked("primary", base, int64(len("V1")), v1hash, t0)
+	h.seedManifestHashChecked("peer", base, int64(len("V1")), v1hash, t0)
+
+	h.fake("primary").FailHash("", errors.New("hash must not be called"))
+	h.fake("peer").FailHash("", errors.New("hash must not be called"))
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("a stat-equal poll inside verifyInterval must not hash: %v", err)
+	}
+	if h.sync().ConflictAt != nil || h.sync().LastSynced != nil {
+		t.Fatalf("a hash-free noop poll must not touch sync state")
+	}
+}
+
+// TestPoll_VerificationSweep_IdenticalBytes_IsNotAChange asserts the forced hash
+// is a VERIFICATION, not a change: when the bytes still match the manifest the
+// sweep reconciles (advancing last_checked so the member is not re-verified
+// until the next interval) and propagates nothing. Without this, the backstop
+// would re-fan-out every member every interval.
+func TestPoll_VerificationSweep_IdenticalBytes_IsNotAChange(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("V1"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), base, true)
+	v1hash := h.hashOf("primary")
+	h.seedManifestHashChecked("primary", base, int64(len("V1")), v1hash, base)
+	h.seedManifestHashChecked("peer", base, int64(len("V1")), v1hash, base)
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	// Nothing changed: no writes, no conflict, no last_synced advance.
+	for _, id := range []string{"primary", "peer"} {
+		if n := len(h.fake(id).Writes()); n != 0 {
+			t.Fatalf("%s was written %d times by a verification sweep, want 0", id, n)
+		}
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("a verification sweep that found nothing wrong must not conflict")
+	}
+	if h.sync().LastSynced != nil {
+		t.Fatalf("a verification sweep that found nothing wrong must not advance last_synced")
+	}
+	// last_checked advanced to the poll time, and mtime/size/hash are unchanged.
+	for _, id := range []string{"primary", "peer"} {
+		m := h.manifest(id)
+		if m.LastChecked == nil || !m.LastChecked.Equal(t0) {
+			t.Fatalf("%s last_checked = %v, want the poll time %v", id, m.LastChecked, t0)
+		}
+		if m.SHA256 == nil || *m.SHA256 != v1hash {
+			t.Fatalf("%s manifest hash = %v, want the unchanged %q", id, m.SHA256, v1hash)
+		}
+		if m.Mtime == nil || !m.Mtime.Equal(base) {
+			t.Fatalf("%s manifest mtime = %v, want the unchanged %v", id, m.Mtime, base)
+		}
+	}
+
+	// And the member is now inside the interval: the next poll is hash-free again
+	// (a hash attempt would surface as an error).
+	h.fake("primary").FailHash("", errors.New("hash must not be called"))
+	h.fake("peer").FailHash("", errors.New("hash must not be called"))
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll right after a sweep must be hash-free: %v", err)
+	}
+}
+
+// TestPoll_FanOut_NeverPublishesCollidingMtime is the WRITE-side half of issue
+// #33 seen from the engine: fanning a source out onto a destination whose file
+// is NEWER than the source must not leave the destination carrying an mtime that
+// is unchanged (or moved backwards) — that is what makes the new bytes invisible
+// to the next stat gate, here and in syncthing. The manifest must record what was
+// really published, not what was requested.
+func TestPoll_FanOut_NeverPublishesCollidingMtime(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-time.Hour)
+	// The peer's file is NEWER than the primary's, but only the primary's content
+	// changed (the peer still holds the agreed V1 bytes under a later mtime — e.g.
+	// a touch, or a copy delivered late).
+	peerMtime := base.Add(30 * time.Minute)
+	h.addNode("primary", "p.srm", []byte("V1"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), peerMtime, true)
+	v1hash := h.hashOf("primary")
+	h.seedManifestHash("primary", base, int64(len("V1")), v1hash)
+	h.seedManifestHash("peer", peerMtime, int64(len("V1")), v1hash)
+
+	// The primary changes; its mtime moves but stays OLDER than the peer's file.
+	srcMtime := base.Add(time.Minute)
+	h.fake("primary").Mutate("p.srm", []byte("V2"), srcMtime)
+
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	// The peer got the bytes, under an mtime strictly NEWER than what it had —
+	// never the source's older mtime, which would look unchanged to every gate.
+	fm, err := h.fake("peer").Stat(ctx(), "q.srm")
+	if err != nil {
+		t.Fatalf("stat peer: %v", err)
+	}
+	if !fm.Mtime.After(peerMtime) {
+		t.Fatalf("peer published mtime = %v, want strictly after its previous %v", fm.Mtime, peerMtime)
+	}
+	h.assertFileContent("peer", []byte("V2"))
+
+	// The manifest records the mtime actually published, so the peer's file and
+	// its manifest agree and the next poll is a clean noop for it.
+	m := h.manifest("peer")
+	if m.Mtime == nil || !m.Mtime.Equal(fm.Mtime.UTC().Truncate(time.Microsecond)) {
+		t.Fatalf("peer manifest mtime = %v, want the published %v", m.Mtime, fm.Mtime)
+	}
+	writesBefore := len(h.fake("peer").Writes())
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("re-poll: %v", err)
+	}
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("re-poll wrote to the peer again: %d -> %d (manifest does not describe the file)", writesBefore, got)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("re-poll must not conflict")
 	}
 }
 
@@ -894,7 +1045,7 @@ func TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced(t *testing.
 // --- ResolveConflict -----------------------------------------------------
 
 func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
-	h, primaryMtime, _ := seedConflicted(t)
+	h, primaryMtime, peerMtime := seedConflicted(t)
 
 	// Capture the loser's pre-resolution content+hash so we can assert the
 	// server-side snapshot is its exact bytes.
@@ -930,14 +1081,25 @@ func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
 		}
 	}
 
-	// Every other member now holds the WINNER's bytes + mtime.
-	h.assertFile("peer", []byte("PRIMARY"), primaryMtime)
+	// Every other member now holds the WINNER's bytes. The loser's file was NEWER
+	// than the winner's (seedConflicted: the peer changed last), so publishing the
+	// winner's mtime verbatim would move the peer's mtime BACKWARDS onto a file of
+	// the same size — the invisible-write state of issue #33. The adapter instead
+	// publishes just past what the peer had; the peer's own manifest below must
+	// record that, not the winner's mtime.
+	wantPeerMtime := peerMtime.Add(time.Microsecond)
+	h.assertFile("peer", []byte("PRIMARY"), wantPeerMtime)
 
-	// Manifest updated for winner + every written node to the winner's mtime/size.
+	// Manifest updated for winner + every written node to the mtime each member's
+	// file actually carries, and to the winner's size.
 	for _, id := range []string{"primary", "peer"} {
+		wantMtime := primaryMtime
+		if id == "peer" {
+			wantMtime = wantPeerMtime
+		}
 		m := h.manifest(id)
-		if m.Mtime == nil || !m.Mtime.Equal(primaryMtime) {
-			t.Fatalf("%s manifest mtime = %v want %v", id, m.Mtime, primaryMtime)
+		if m.Mtime == nil || !m.Mtime.Equal(wantMtime) {
+			t.Fatalf("%s manifest mtime = %v want %v", id, m.Mtime, wantMtime)
 		}
 		if m.Size == nil || *m.Size != int64(len("PRIMARY")) {
 			t.Fatalf("%s manifest size = %v want %d", id, m.Size, len("PRIMARY"))

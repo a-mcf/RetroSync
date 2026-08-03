@@ -163,7 +163,7 @@ Used for the UI history panel and conflict diagnostics. One row per directional 
 | mtime        | ts   | fast-path gate (with size)                         |
 | size         | int  | fast-path gate (with mtime)                        |
 | sha256       | text | content truth; recorded on every manifest write    |
-| last_checked | ts   | set when the manifest entry is written, not on every poll |
+| last_checked | ts   | set when the manifest entry is written, not on every poll — i.e. "when we last looked at the bytes"; drives periodic verification |
 
 PK: (sync_id, node_id). The poll loop writes this entry when a member's state
 changes (a content change, a touch-reconcile, or a propagation write), recording
@@ -173,7 +173,11 @@ those writes — a noop poll does not touch the row.
 **Hash-backed change detection.** Detection is two-tier:
 
 1. **mtime+size fast gate.** `Stat` vs the manifest. Equal → unchanged, *no hash
-   computed* (a noop poll stays hash-free).
+   computed* (a noop poll stays hash-free) — **unless** the entry's `last_checked`
+   is older than 5 minutes, in which case the member is hashed anyway. That
+   periodic verification is the backstop for a change an external writer made
+   without moving the mtime (saves are a fixed size, and syncthing preserves
+   mtimes when it delivers a file), which mtime+size alone would hide forever.
 2. **sha256 truth, only when the stat differs.** The member's current content hash
    vs the manifest's stored `sha256`:
    - **equal** → a *touch* (mtime moved, bytes identical): reconcile the manifest's
