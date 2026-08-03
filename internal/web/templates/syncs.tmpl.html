@@ -161,9 +161,11 @@
             <p class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</p>
           </details>
 
-          <!-- "Create sync", matching the Discover flow's button, so the same
-               action reads the same way wherever you reach it. -->
-          <p><button class="btn" type="submit">Create sync</button></p>
+          <!-- "Save", not "Create sync": inside a form you are filling in, the
+               commit button should say it commits what is in front of you.
+               Anything phrased as creating/adding reads like it starts ANOTHER
+               one, which is the confusion this whole section is fixing. -->
+          <p><button class="btn" type="submit">Save</button></p>
           <div class="form-error"></div>
         </form>
       </details>
@@ -313,7 +315,12 @@
                     data-browse-base="/api/nodes"
                     hx-target="next .browse-panel" hx-swap="innerHTML">Browse…</button>
             <div class="browse-panel"></div>
-            <button class="btn" type="submit">Add device to sync</button>
+            <!-- Commits immediately, so it says "Save" like every other
+                 committing button. "Save device" rather than bare "Save"
+                 because this form sits alongside the sync's own Save changes;
+                 the noun says WHICH thing is being saved, without reverting to
+                 the add/create phrasing that reads as "start another one". -->
+            <button class="btn" type="submit">Save device</button>
           </form>
         </div>
 

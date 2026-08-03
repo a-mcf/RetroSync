@@ -61,7 +61,7 @@ func TestSyncsPage_AdminSeesRegistry(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"sm-bob", "Super Metroid", "Create sync", "csrf_token", "bob-deck"} {
+	for _, want := range []string{"sm-bob", "Super Metroid", ">Save</button>", "csrf_token", "bob-deck"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("syncs page missing %q", want)
 		}
@@ -386,6 +386,11 @@ func TestSyncsPage_DiscoverCalloutAndManualForm(t *testing.T) {
 		`class="sync-form sync-create card"`,
 		`name="game" required`,
 		`name="name" required`,
+		// Committing buttons say "Save"; only the row cloner is phrased as
+		// adding. Pin both sides of that split — it is the whole point of the
+		// wording, and either half drifting back re-creates the ambiguity.
+		">Save</button>",
+		">Save device</button>",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("syncs page missing %q", want)
