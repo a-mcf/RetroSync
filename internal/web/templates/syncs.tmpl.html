@@ -148,7 +148,12 @@
               <div class="browse-panel"></div>
             </div>
           </div>
-          <p><button class="btn add-member-row" type="button">+ add another device</button></p>
+          <!-- Row cloner, NOT a save. Deliberately link-styled and worded
+               without a verb, so it cannot be mistaken for the submit below or
+               for the "Add device to sync" button on an existing sync (which
+               does commit immediately). Only committing actions get a filled
+               button here. -->
+          <p><button class="linkbtn add-member-row" type="button">+ another device</button></p>
 
           <details class="advanced">
             <summary>Advanced</summary>
@@ -156,7 +161,9 @@
             <p class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</p>
           </details>
 
-          <p><button class="btn" type="submit">+ New sync</button></p>
+          <!-- "Create sync", matching the Discover flow's button, so the same
+               action reads the same way wherever you reach it. -->
+          <p><button class="btn" type="submit">Create sync</button></p>
           <div class="form-error"></div>
         </form>
       </details>

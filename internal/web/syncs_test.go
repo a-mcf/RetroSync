@@ -61,7 +61,7 @@ func TestSyncsPage_AdminSeesRegistry(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"sm-bob", "Super Metroid", "New sync", "csrf_token", "bob-deck"} {
+	for _, want := range []string{"sm-bob", "Super Metroid", "Create sync", "csrf_token", "bob-deck"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("syncs page missing %q", want)
 		}
@@ -374,7 +374,18 @@ func TestSyncsPage_DiscoverCalloutAndManualForm(t *testing.T) {
 		"Discover is the easy way",
 		"/discover",
 		"Create a sync manually",
-		"add another device",
+		// The row cloner is link-styled and verb-less so it cannot be read as a
+		// save; assert the class too, since the wording alone is the thing that
+		// confused a real user.
+		`class="linkbtn add-member-row"`,
+		"+ another device",
+		// The greyed-until-valid submit is a CSS rule keyed on
+		// `.sync-create:has(:invalid)`, so it only works while the form carries
+		// that class AND its two required fields are marked required. Pin both;
+		// dropping either silently disables the affordance.
+		`class="sync-form sync-create card"`,
+		`name="game" required`,
+		`name="name" required`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("syncs page missing %q", want)
