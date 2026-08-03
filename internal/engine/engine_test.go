@@ -347,6 +347,62 @@ func TestPoll_OneChanged_Propagates(t *testing.T) {
 	}
 }
 
+// TestPoll_SameMtimeAndSize_ContentChangeIsMissed pins a KNOWN BLIND SPOT, the
+// mirror of the syncthing bug in issue #33.
+//
+// Poll's tier-1 gate is stat-only (statDiffers: mtime + size). A member whose
+// BYTES changed while its mtime and size stayed equal to the manifest is never
+// hashed, so the change is invisible — permanently, not just until the next
+// poll. Save files are a fixed size per game, so size never rescues us; mtime
+// is the only discriminator.
+//
+// This is reachable in production because RetroSync is not the only writer.
+// Syncthing PRESERVES mtimes when it delivers a file, so it can restore an
+// older copy of a save carrying exactly the mtime already recorded in the
+// manifest. RetroSync then holds a manifest hash that does not describe the
+// bytes on disk and will not re-examine them.
+//
+// The assertion below deliberately encodes the CURRENT (wrong) behavior so the
+// blind spot is pinned rather than merely known. When the stat gate is fixed,
+// invert it: the change should be detected and propagated.
+func TestPoll_SameMtimeAndSize_ContentChangeIsMissed(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-time.Hour)
+	h.addNode("primary", "p.srm", []byte("V1"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), base, true)
+	v1hash := h.hashOf("primary")
+	h.seedManifestHash("primary", base, int64(len("V1")), v1hash)
+	h.seedManifestHash("peer", base, int64(len("V1")), v1hash)
+
+	// Change the primary's CONTENT while leaving mtime and size exactly as the
+	// manifest records them. "V1" and "V2" are the same length on purpose: size
+	// must not be able to betray the change, mirroring real saves.
+	h.fake("primary").Mutate("p.srm", []byte("V2"), base)
+
+	writesBefore := len(h.fake("peer").Writes())
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	// CURRENT BEHAVIOR: the stat gate says "unchanged", so nothing is hashed and
+	// nothing propagates. The peer keeps the stale bytes.
+	if got := len(h.fake("peer").Writes()); got != writesBefore {
+		t.Fatalf("blind spot appears to be FIXED (peer writes %d -> %d): "+
+			"invert this test — the change is now detected", writesBefore, got)
+	}
+	h.assertFileContent("peer", []byte("V1"))
+
+	// And the manifest still claims the OLD hash, so RetroSync's recorded state
+	// no longer describes the file on disk.
+	m := h.manifest("primary")
+	if m.SHA256 == nil || *m.SHA256 != v1hash {
+		t.Fatalf("primary manifest hash = %v, want the stale %q", m.SHA256, v1hash)
+	}
+	if h.sync().ConflictAt != nil {
+		t.Fatalf("missed change must not have produced a conflict")
+	}
+}
+
 // TestPoll_Touch_NotChanged_ReconcilesManifest pins the tier-2 touch path: a
 // member whose mtime moved but whose BYTES are identical (a `touch`) is NOT a
 // change — nothing propagates, no conflict, and the manifest's mtime/size is
