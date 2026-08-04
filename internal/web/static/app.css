@@ -134,6 +134,17 @@ section > h2 {
 }
 .btn.big { font-size: 1.25rem; padding: 1rem 1.6rem; width: 100%; }
 
+/* The manual create form's submit reads as inert until its required fields
+   (game label, sync name) are filled. Pure CSS, keyed on the form's own
+   validity — no JS, so it degrades to a normally-styled button rather than a
+   stuck one if :has() is unsupported.
+   It stays CLICKABLE on purpose: clicking a greyed-out button surfaces the
+   browser's own "please fill in this field" hint pointing at the offending
+   input, which is more helpful than a dead control that explains nothing. */
+.sync-create:has(:invalid) button[type="submit"] {
+  opacity: 0.45;
+}
+
 .search {
   width: 100%;
   padding: 0.8rem 1rem;

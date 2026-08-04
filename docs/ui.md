@@ -151,9 +151,20 @@ there too. An empty *search* result stays a plain "No syncs match."
 Manual creation is demoted to a collapsed **"Create a sync manually (advanced)"**
 `<details>`. It is **one-shot**: a game label, a sync name, and one or more member
 rows — each a device + save-file path (with the **Browse** picker) — submitted
-together; **"+ add another device"** clones a row (progressive enhancement; the
-single row still works with no JS, and the server accepts repeated `node_id`/`path`
-fields). Member rows are validated lexically *before* anything is created (a bad
+together with **Save**; **"+ another device"** clones a row (progressive
+enhancement; the single row still works with no JS, and the server accepts
+repeated `node_id`/`path` fields).
+
+**Button wording rule.** A button that COMMITS says *Save* (`Save`, `Save
+device`, `Save changes`); a button that only adds UI is phrased as adding and is
+link-styled (`+ another device`). The two were previously near-identical in
+wording but opposite in effect ("+ add another device" saved nothing, "Add
+device to sync" committed immediately), which is genuinely confusing in use.
+`/discover` keeps **Create sync**: there you are accepting a suggested sync
+rather than committing a form you filled in, and nothing on that page competes
+with it. The manual form's submit greys out (CSS `:has(:invalid)`, no JS) until
+the required fields are filled, but stays clickable so a click surfaces the
+browser's own "fill this in" hint. Member rows are validated lexically *before* anything is created (a bad
 path → 400, no sync). A member failure at the store (missing device → 422; a
 `(node, path)` already in another sync → 409) leaves the created sync **in
 place** with the members that succeeded — the error says so, and the admin
