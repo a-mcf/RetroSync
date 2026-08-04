@@ -1,7 +1,9 @@
 // Package fakereach is an in-memory implementation of reach.Reach for unit
 // tests. It backs each node's filesystem with a map keyed by path, honors
-// reach.ErrNotExist, and stores the exact mtime handed to WriteAtomic so tests
-// can assert mtime-faithful fan-out copies.
+// reach.ErrNotExist, and — like the real localfs adapter — publishes the mtime
+// handed to WriteAtomic unless that would collide with (or predate) the
+// destination's current mtime, so tests can assert both mtime-faithful fan-out
+// copies and the collision rule that issue #33 turned on.
 //
 // A Fake models ONE node's save filesystem (the engine resolves one reach.Reach
 // per node). Tests typically hold a Fake per node and let the engine's resolver
@@ -22,6 +24,13 @@ import (
 	"github.com/a-mcf/retrosync/internal/reach"
 )
 
+// mtimeBump mirrors localfs.mtimeBump: how far past the destination's PREVIOUS
+// mtime WriteAtomic publishes when the requested mtime would not be strictly
+// newer. The fake models the rule so engine tests exercise the same behavior the
+// production adapter has (issue #33) — without it, the engine's manifest
+// bookkeeping around a colliding fan-out would be untested.
+const mtimeBump = time.Microsecond
+
 // File is one stored file's state.
 type File struct {
 	Data  []byte
@@ -30,8 +39,10 @@ type File struct {
 
 // WriteRecord captures one WriteAtomic call, in order, for test assertions.
 type WriteRecord struct {
-	Path  string
-	Data  []byte
+	Path string
+	Data []byte
+	// Mtime is the mtime actually PUBLISHED (what WriteAtomic returned), which is
+	// the requested mtime except when the collision rule bumped it.
 	Mtime time.Time
 }
 
@@ -294,18 +305,28 @@ func (f *Fake) List(_ context.Context, relPath string) ([]reach.DirEntry, error)
 // WriteAtomic implements reach.Reach. It honors any injected failure BEFORE
 // mutating state, so a simulated failure leaves the prior file untouched
 // (modeling the temp+rename crash-safety guarantee). On success it stores the
-// data with exactly the given mtime and records the call.
-func (f *Fake) WriteAtomic(_ context.Context, path string, data []byte, mtime time.Time) error {
+// data with the PUBLISHED mtime, records the call, and returns that mtime.
+//
+// The published mtime follows the same rule as localfs: the requested mtime when
+// the destination is absent or has a strictly older mtime, otherwise the
+// destination's previous mtime + mtimeBump. Publishing a colliding mtime is what
+// made a fan-out invisible to every mtime+size gate in issue #33, so the fake
+// must not be able to do it either.
+func (f *Fake) WriteAtomic(_ context.Context, path string, data []byte, publish time.Time) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.injected(f.failWrite, path); err != nil {
-		return err
+		return time.Time{}, err
+	}
+	if prev, ok := f.files[path]; ok && !publish.Truncate(mtimeBump).After(prev.Mtime.Truncate(mtimeBump)) {
+		// Not newer at the resolution the manifest stores (see localfs.publishMtime).
+		publish = prev.Mtime.Add(mtimeBump)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	f.files[path] = File{Data: cp, Mtime: mtime}
-	f.writes = append(f.writes, WriteRecord{Path: path, Data: cp, Mtime: mtime})
-	return nil
+	f.files[path] = File{Data: cp, Mtime: publish}
+	f.writes = append(f.writes, WriteRecord{Path: path, Data: cp, Mtime: publish})
+	return publish, nil
 }
 
 // Paths returns the sorted set of currently-present paths (test convenience).

@@ -3,33 +3,41 @@
 package syncthinge2e
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/a-mcf/retrosync/internal/reach/localfs"
 )
 
-// TestMtimeCollision_ContentChangeIsInvisible probes the third candidate for
-// issue #33, and the first one that implicates RetroSync rather than syncthing.
+// TestMtimeCollision_ContentChangeIsInvisible is the reproduction of issue #33 —
+// the candidate that implicated RetroSync rather than syncthing, and the one that
+// was right.
 //
-// WriteAtomic stamps the published file with the SOURCE file's mtime
-// (localfs.go, os.Chtimes before the rename) so the manifest stays consistent.
-// Syncthing's scanner is stat-gated: it only rehashes a file when mtime or size
-// changed. Save files are a fixed size for a given game. So if a fan-out ever
-// writes content carrying an mtime that matches what syncthing already has
-// indexed for that path, the new content is invisible to syncthing — not
-// delayed, invisible. It will never be hashed, never propagate, and the file
-// will report as in sync forever.
+// WriteAtomic stamps the published file with the SOURCE file's mtime (os.Chtimes
+// before the rename) so the manifest stays consistent. Syncthing's scanner is
+// stat-gated: it only rehashes a file when mtime or size changed. Save files are
+// a fixed size for a given game. So a fan-out whose source mtime happens to equal
+// what syncthing already has indexed for that path used to be invisible to
+// syncthing — not delayed, invisible: never hashed, never propagated, reporting
+// in sync forever.
 //
-// That requires files with pre-existing mtimes on both sides being copied
-// between each other, which is precisely the "sync created over a file that
-// already exists on both members" setup that stalls in production.
+// That requires files with pre-existing mtimes on both sides being copied between
+// each other, which is precisely the "sync created over a file that already
+// exists on both members" setup that stalled in production.
 //
-// This test writes new content while restoring the previously indexed mtime and
-// asserts the change still reaches the device. If it FAILS, the stall is
-// reproduced and the cause is RetroSync's mtime preservation, not syncthing.
+// The test drives the PRODUCTION write path — localfs.WriteAtomic, with a source
+// mtime deliberately equal to the destination's current one — and asserts the
+// bytes still reach the device. It is deliberately not a hand-rolled
+// os.WriteFile + os.Chtimes: that would characterize syncthing's scanner (which
+// will always behave this way, by design) instead of RetroSync's write path,
+// which is where the fix lives. The fix is that WriteAtomic refuses to publish a
+// colliding mtime, so the write is visible to the scanner again.
 func TestMtimeCollision_ContentChangeIsInvisible(t *testing.T) {
 	m := newMesh(t)
+	ctx := context.Background()
 
 	const (
 		folder   = "folder-mtime"
@@ -68,14 +76,27 @@ func TestMtimeCollision_ContentChangeIsInvisible(t *testing.T) {
 	}
 	indexedMtime := fi.ModTime()
 
-	// A fan-out that happens to carry a source mtime equal to the indexed one.
-	// Written the same way WriteAtomic publishes — new content, then the mtime
-	// restored — so syncthing sees identical stat metadata over new bytes.
-	if err := os.WriteFile(serverPath, replacement, 0o644); err != nil {
-		t.Fatalf("write replacement: %v", err)
+	// THE FAN-OUT, through the production write path, carrying a source mtime
+	// equal to the destination's indexed one — the collision itself.
+	fs, err := localfs.New(filepath.Join(m.Server.SharesDir, folder))
+	if err != nil {
+		t.Fatalf("localfs.New: %v", err)
 	}
-	if err := os.Chtimes(serverPath, indexedMtime, indexedMtime); err != nil {
-		t.Fatalf("restore mtime: %v", err)
+	published, err := fs.WriteAtomic(ctx, saveName, replacement, indexedMtime)
+	if err != nil {
+		t.Fatalf("fan-out WriteAtomic: %v", err)
+	}
+	// The write path must not have published the colliding mtime; if it did, the
+	// scanner cannot possibly see the change and the rest of this test is moot.
+	if !published.After(indexedMtime) {
+		t.Fatalf("WriteAtomic published mtime %v, which is not newer than the indexed %v: "+
+			"a colliding mtime is invisible to syncthing's stat gate (issue #33)", published, indexedMtime)
+	}
+	if got, err := os.Stat(serverPath); err != nil {
+		t.Fatalf("stat published file: %v", err)
+	} else if !got.ModTime().Equal(published) {
+		t.Fatalf("on-disk mtime %v does not match the mtime WriteAtomic reported publishing (%v)",
+			got.ModTime(), published)
 	}
 	if err := m.Server.scan(folder, ""); err != nil {
 		t.Fatalf("server scan: %v", err)
@@ -86,16 +107,16 @@ func TestMtimeCollision_ContentChangeIsInvisible(t *testing.T) {
 	for {
 		got, readErr := os.ReadFile(devicePath)
 		if readErr == nil && string(got) == string(replacement) {
-			return // syncthing noticed despite the identical stat; no bug here
+			return // delivered: the stat gate saw the change
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("content change with a colliding mtime never reached the device.\n"+
+			t.Errorf("content change with a colliding SOURCE mtime never reached the device.\n"+
 				"  device holds: %q\n  want:         %q\n"+
 				"REPRODUCTION of the issue #33 stall: syncthing's stat gate (mtime+size) "+
 				"never saw a change, so the new bytes were never hashed or propagated. "+
-				"RetroSync stamps published saves with the SOURCE file's mtime, so any "+
-				"fan-out whose source mtime matches the destination's indexed mtime is "+
-				"silently invisible.", got, replacement)
+				"RetroSync must never publish a save whose mtime is not strictly newer "+
+				"than the one the destination already carried (published %v, destination had %v).",
+				got, replacement, published, indexedMtime)
 			if c, cerr := m.Server.completion(folder, m.DeviceA.deviceID); cerr == nil {
 				t.Logf("server's view of device A: completion=%.2f needBytes=%d needItems=%d",
 					c.Completion, c.NeedBytes, c.NeedItems)

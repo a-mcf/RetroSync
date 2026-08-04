@@ -222,7 +222,9 @@ func (l listFailReach) Hash(context.Context, string) (string, error) { return ""
 func (l listFailReach) List(context.Context, string) ([]reach.DirEntry, error) {
 	return nil, l.err
 }
-func (l listFailReach) WriteAtomic(context.Context, string, []byte, time.Time) error { return l.err }
+func (l listFailReach) WriteAtomic(context.Context, string, []byte, time.Time) (time.Time, error) {
+	return time.Time{}, l.err
+}
 
 // TestDiscoverGames_SkipsBadNode confirms a node whose scan errors is skipped
 // (recorded via the test hook), not fatal to the whole discovery: the good node

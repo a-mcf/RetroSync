@@ -43,6 +43,16 @@ For each sync, every N seconds (default 15s):
    - **Tier 1 — stat gate (cheap).** `Stat` (mtime+size) vs the `manifest`, via
      the microsecond `mtimeEqual` compare. If they are equal the member is
      **unchanged** and is *not hashed* — so a noop poll stays hash-free.
+     - **Periodic verification (the backstop).** mtime+size cannot detect a
+       change an *external* writer made without moving the mtime, and saves are a
+       fixed size per game — syncthing preserves mtimes when it delivers a file,
+       so it can restore an older save carrying exactly the manifest's mtime.
+       Such a change would be invisible **forever**, not merely late. So a member
+       whose `manifest.last_checked` is older than `verifyInterval` (5 min) is
+       hashed regardless of the stat gate. Bytes that still match take the touch
+       path below (reconcile, not a change), which re-stamps `last_checked` — so
+       this costs one hash per member per interval and every poll in between
+       stays hash-free.
    - **Tier 2 — content hash (truth), only when the stat differs.** Compute the
      member's current `sha256` and compare it to the manifest's stored `sha256`:
      - **hash equal** → a **touch** (mtime/size moved, bytes identical). NOT a
@@ -154,6 +164,16 @@ current save everywhere" — a one-click undo for a bad propagation/resolve.
 - `manifest` is only updated *after* the rename. So a crash mid-copy leaves the
   manifest pointing at the previous good state, and the next poll re-detects
   divergence and retries.
+- **A published save's mtime is never a collision.** A fan-out asks the adapter to
+  stamp the SOURCE file's mtime (so the copy stays mtime-faithful and the
+  dashboard still shows when the save was made), but the adapter publishes
+  `previous mtime + 1µs` instead whenever that would not be strictly newer than
+  what the destination already carried. A same-size file republished under its own
+  indexed mtime is invisible to *every* mtime+size gate — syncthing's scanner and
+  the poll's tier 1 alike — so the bytes change while every layer above believes
+  nothing happened. `WriteAtomic` **returns** the mtime it published and the
+  manifest records that (never a follow-up stat, which could pick up an external
+  writer's mtime and file it under our hash).
 - On resolve, `last_synced` is marked **before** `conflict_at` is cleared, so a
   crash between the two leaves the sync conflicted (re-resolvable) rather than
   un-paused-but-unsynced.

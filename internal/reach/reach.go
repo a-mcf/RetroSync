@@ -102,8 +102,10 @@ type Reach interface {
 	// node root is rejected by the adapter's containment check (safepath).
 	List(ctx context.Context, relPath string) ([]DirEntry, error)
 
-	// WriteAtomic writes data to path crash-safely and sets the file's mtime to
-	// the given mtime. The contract (from docs/state-machine.md "Crash safety"):
+	// WriteAtomic writes data to path crash-safely, stamps the published file
+	// with an mtime derived from the requested mtime, and RETURNS the mtime it
+	// actually published. The contract (from docs/state-machine.md "Crash
+	// safety"):
 	//
 	//   1. Write the bytes to a temporary sibling (e.g. <path>.retrosync-tmp).
 	//   2. Atomically rename the temp file over path.
@@ -113,9 +115,25 @@ type Reach interface {
 	// advances the manifest AFTER WriteAtomic returns nil — manifest trails the
 	// actual write.
 	//
-	// The destination mtime is set to the SOURCE file's mtime so a fan-out copy
-	// is byte-and-mtime faithful: the next poll then sees primary == peer rather
-	// than a spurious "peer changed" (the just-written peer would otherwise have
-	// a wall-clock mtime that differs from the source's manifest mtime).
-	WriteAtomic(ctx context.Context, path string, data []byte, mtime time.Time) error
+	// The requested mtime is the SOURCE file's mtime, so a fan-out copy is
+	// byte-and-mtime faithful: the next poll then sees source == peer rather than
+	// a spurious "peer changed", and the dashboard keeps showing when the save was
+	// really made.
+	//
+	// MTIME COLLISIONS (issue #33). Adapters MUST NOT publish an mtime that is
+	// not strictly newer than the mtime the destination already had. Both
+	// Syncthing's scanner and the engine's own tier-1 stat gate decide "did this
+	// change?" from mtime+size alone, and saves are a fixed size per game — so a
+	// published file whose mtime equals the destination's previous mtime is
+	// PERMANENTLY invisible to both: never hashed, never propagated, with a
+	// manifest hash that no longer describes the bytes on disk. When the requested
+	// mtime is not strictly newer than the destination's current mtime, the
+	// adapter must publish a slightly newer one instead (see localfs.mtimeBump).
+	//
+	// The published mtime is RETURNED rather than left for the caller to stat back
+	// off the file: an external writer (Syncthing, an emulator) can change the
+	// file between the rename and any follow-up stat, and recording THEIR mtime
+	// against OUR hash would manufacture exactly the invisible divergence above.
+	// On error the returned time is unspecified (callers must ignore it).
+	WriteAtomic(ctx context.Context, path string, data []byte, mtime time.Time) (time.Time, error)
 }

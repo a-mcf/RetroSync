@@ -52,6 +52,21 @@ const tempSuffix = ".retrosync-tmp"
 // indistinguishable from "the save never synced". Saves hold no secrets.
 const saveFileMode = 0o644
 
+// mtimeBump is how far past the destination's PREVIOUS mtime WriteAtomic
+// publishes when the requested (source) mtime would not be strictly newer —
+// the fix for issue #33.
+//
+// Publishing a colliding mtime is silent data divergence: Syncthing's scanner
+// and the engine's tier-1 stat gate both decide "did this change?" from
+// mtime+size, and a save is a fixed size for a given game, so an mtime equal to
+// the one already on the destination makes the new bytes permanently invisible —
+// never hashed, never propagated, with a manifest hash that no longer describes
+// the file. One microsecond is the smallest bump that survives the round trip:
+// the engine truncates manifest mtimes to microsecond precision (its
+// mtimeResolution, which is all Postgres timestamptz stores), so a smaller nudge
+// could vanish on the way to the manifest and re-create the collision.
+const mtimeBump = time.Microsecond
+
 // maxListEntries is a generous per-call cap on how many directory entries a single
 // List will accumulate. List backs BOTH the discovery scan and the slice-17
 // picker; without a cap, a save directory with a pathological number of entries
@@ -246,14 +261,33 @@ func sortDirEntries(entries []reach.DirEntry) {
 	})
 }
 
-// WriteAtomic implements reach.Reach honoring the crash-safety contract: create
-// a temp file in the SAME directory as the destination, chmod it to
-// saveFileMode, write and fsync+close it, os.Chtimes it to the requested mtime,
-// os.Rename it over the destination (atomic on one filesystem), then fsync the
-// destination's parent directory. The mode and mtime are both set BEFORE the
-// rename so the published file is correct at the instant it becomes visible.
-// The destination's parent is created (within root) if missing, and each newly
-// created path component is made durable by fsyncing ITS parent.
+// WriteAtomic implements reach.Reach honoring the crash-safety contract: stat
+// the existing destination (for the mtime rule below), create a temp file in the
+// SAME directory as the destination, chmod it to saveFileMode, write and
+// fsync+close it, os.Chtimes it to the mtime being published, os.Rename it over
+// the destination (atomic on one filesystem), then fsync the destination's
+// parent directory. The mode and mtime are both set BEFORE the rename so the
+// published file is correct at the instant it becomes visible. The destination's
+// parent is created (within root) if missing, and each newly created path
+// component is made durable by fsyncing ITS parent. It returns the mtime it
+// actually published.
+//
+// THE PUBLISHED MTIME IS NEVER A COLLISION (issue #33). When the destination
+// already exists with mtime prev, the file is published with:
+//
+//   - the requested (source) mtime, when it is strictly newer than prev — the
+//     common case, which keeps the copy mtime-faithful so the dashboard still
+//     shows when the save was really made; or
+//   - prev + mtimeBump otherwise.
+//
+// A destination that does not exist yet gets the requested mtime unchanged (no
+// prior mtime, so nothing to collide with); a missing destination is NOT an
+// error. The stat happens BEFORE the temp file is created so the temp file's own
+// name can never be what we stat, and so nothing has been written when the stat
+// fails. Without this rule a fan-out carrying the destination's own indexed
+// mtime is invisible to Syncthing's scanner AND to the engine's tier-1 stat
+// gate — the bytes on disk change while every layer above believes nothing
+// happened (see reach.Reach.WriteAtomic and mtimeBump).
 //
 // The directory fsyncs are what make the publish crash-durable, not just
 // atomic: a rename (or mkdir) only reaches disk once the parent directory's
@@ -269,22 +303,32 @@ func sortDirEntries(entries []reach.DirEntry) {
 // leaves the prior file intact. (If the final directory fsync fails, the rename
 // has already happened; reporting the write as failed is the safe direction,
 // since the engine then never records the new manifest.)
-func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime time.Time) error {
+func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, publish time.Time) (time.Time, error) {
 	abs, err := safepath.Resolve(l.root, path)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	dir := filepath.Dir(abs)
+
+	// Decide the mtime to publish BEFORE anything is created: it depends on the
+	// destination as it stands right now, and a stat failure here must leave the
+	// filesystem exactly as it was. An absent destination has no prior mtime to
+	// collide with, so the requested mtime stands.
+	if fi, err := os.Stat(abs); err == nil {
+		publish = publishMtime(publish, fi.ModTime())
+	} else if !os.IsNotExist(err) {
+		return time.Time{}, fmt.Errorf("localfs: stat destination %q: %w", path, err)
+	}
 
 	// Create the destination's parent within root if missing. MkdirAll is a no-op
 	// when the dir already exists. Record which components are about to be
 	// created so each can be made durable below.
 	created, err := missingAncestors(l.root, dir)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("localfs: mkdir %q: %w", dir, err)
+		return time.Time{}, fmt.Errorf("localfs: mkdir %q: %w", dir, err)
 	}
 	// A new directory's NAME lives in its parent's entry list, so durably
 	// creating a/b/c means fsyncing a (entry "b") and b (entry "c"); we fsync
@@ -294,7 +338,7 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 	// directories are left behind, which is harmless.
 	for _, d := range created {
 		if err := syncDir(filepath.Dir(d)); err != nil {
-			return err
+			return time.Time{}, err
 		}
 	}
 
@@ -302,7 +346,7 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 	// atomic). CreateTemp picks a unique name so concurrent writers don't collide.
 	tmp, err := os.CreateTemp(dir, filepath.Base(abs)+tempSuffix+"-*")
 	if err != nil {
-		return fmt.Errorf("localfs: create temp in %q: %w", dir, err)
+		return time.Time{}, fmt.Errorf("localfs: create temp in %q: %w", dir, err)
 	}
 	tmpName := tmp.Name()
 
@@ -315,43 +359,67 @@ func (l *LocalFS) WriteAtomic(_ context.Context, path string, data []byte, mtime
 	if err := tmp.Chmod(saveFileMode); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return fmt.Errorf("localfs: chmod temp %q: %w", tmpName, err)
+		return time.Time{}, fmt.Errorf("localfs: chmod temp %q: %w", tmpName, err)
 	}
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return fmt.Errorf("localfs: write temp %q: %w", tmpName, err)
+		return time.Time{}, fmt.Errorf("localfs: write temp %q: %w", tmpName, err)
 	}
 	// fsync so the bytes are durable before the rename publishes the file.
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return fmt.Errorf("localfs: sync temp %q: %w", tmpName, err)
+		return time.Time{}, fmt.Errorf("localfs: sync temp %q: %w", tmpName, err)
 	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
-		return fmt.Errorf("localfs: close temp %q: %w", tmpName, err)
+		return time.Time{}, fmt.Errorf("localfs: close temp %q: %w", tmpName, err)
 	}
 
 	// Set mtime on the temp file BEFORE the rename so the published file already
-	// carries the source mtime; this avoids a brief window where the destination
-	// exists with a wrong mtime. (Chtimes after rename would also work; doing it
-	// first keeps the destination correct at the instant it appears.)
-	if err := os.Chtimes(tmpName, mtime, mtime); err != nil {
+	// carries the mtime decided above; this avoids a brief window where the
+	// destination exists with a wrong mtime. (Chtimes after rename would also
+	// work; doing it first keeps the destination correct at the instant it
+	// appears — and keeps the collision rule airtight, since the destination is
+	// never observable carrying the colliding mtime.)
+	if err := os.Chtimes(tmpName, publish, publish); err != nil {
 		cleanup()
-		return fmt.Errorf("localfs: chtimes temp %q: %w", tmpName, err)
+		return time.Time{}, fmt.Errorf("localfs: chtimes temp %q: %w", tmpName, err)
 	}
 
 	// Atomic publish. On failure the prior destination is untouched.
 	if err := os.Rename(tmpName, abs); err != nil {
 		cleanup()
-		return fmt.Errorf("localfs: rename %q -> %q: %w", tmpName, abs, err)
+		return time.Time{}, fmt.Errorf("localfs: rename %q -> %q: %w", tmpName, abs, err)
 	}
 	// Make the rename itself durable: os.Rename does not persist the parent
 	// directory's entry list, so fsync it. See the crash-durability note in the
 	// function comment. No cleanup here — the temp file no longer exists.
-	return syncDir(dir)
+	if err := syncDir(dir); err != nil {
+		return time.Time{}, err
+	}
+	return publish, nil
+}
+
+// publishMtime returns the mtime WriteAtomic stamps on a file it is publishing
+// over a destination that currently carries prev: the requested mtime when that
+// is newer, otherwise prev + mtimeBump. See mtimeBump and WriteAtomic for why a
+// non-newer mtime must never be published.
+//
+// "Newer" is judged at mtimeBump (microsecond) resolution rather than on the raw
+// instants, because that is the resolution every layer that consumes the mtime
+// works at: the engine truncates manifest mtimes to a microsecond and Postgres
+// timestamptz cannot store finer. A requested mtime that is newer than prev by
+// less than a microsecond would be indistinguishable from prev once stored — and
+// on a filesystem whose timestamp granularity is coarser than the gap it would
+// not even reach the disk — so it is treated as a collision and bumped.
+func publishMtime(requested, prev time.Time) time.Time {
+	if requested.Truncate(mtimeBump).After(prev.Truncate(mtimeBump)) {
+		return requested
+	}
+	return prev.Add(mtimeBump)
 }
 
 // missingAncestors returns the components of dir that do not yet exist,

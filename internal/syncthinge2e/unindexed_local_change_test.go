@@ -74,7 +74,7 @@ func TestUnindexedLocalChange_FanOutStillReachesDevice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("localfs.New: %v", err)
 	}
-	if err := fs.WriteAtomic(ctx, saveName, incoming, time.Now()); err != nil {
+	if _, err := fs.WriteAtomic(ctx, saveName, incoming, time.Now()); err != nil {
 		t.Fatalf("fan-out WriteAtomic: %v", err)
 	}
 	if err := m.Server.scan(folderA, ""); err != nil {
