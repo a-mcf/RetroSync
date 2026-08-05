@@ -103,18 +103,44 @@ func (s *Store) ListUsers(_ context.Context) ([]store.User, error) {
 	return out, nil
 }
 
-func (s *Store) UpdateUser(_ context.Context, u store.User) error {
+func (s *Store) UpdateUserProfile(_ context.Context, id string, display string, role store.Role) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Match Postgres: a no-match UPDATE reports ErrNotFound before the CHECK
 	// constraint can fire, so the existence check comes first.
-	if _, ok := s.users[u.ID]; !ok {
+	existing, ok := s.users[id]
+	if !ok {
 		return store.ErrNotFound
 	}
-	if !store.ValidRole(u.Role) {
+	if !store.ValidRole(role) {
 		return store.ErrInvalidValue
 	}
-	s.users[u.ID] = u
+	// Lockout guard: demoting the last admin is refused. The whole method runs
+	// under s.mu, which is this store's equivalent of the Postgres store's
+	// in-transaction row lock — the count and the write are atomic together.
+	if role != store.RoleAdmin && s.isLastAdmin(id) {
+		return store.ErrLastAdmin
+	}
+	// pw_hash is carried over from the stored row, never from the caller: this
+	// method does not accept one, so a profile edit cannot revert a password.
+	existing.Display = display
+	existing.Role = role
+	s.users[id] = existing
+	return nil
+}
+
+func (s *Store) UpdateUserPassword(_ context.Context, id string, pwHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.users[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	// No last-admin guard: role is not written here, so the admin count cannot
+	// move. Display and role are carried over from the stored row, so a password
+	// change cannot revert a concurrent demotion.
+	existing.PwHash = pwHash
+	s.users[id] = existing
 	return nil
 }
 
@@ -123,6 +149,12 @@ func (s *Store) DeleteUser(_ context.Context, id string) error {
 	defer s.mu.Unlock()
 	if _, ok := s.users[id]; !ok {
 		return store.ErrNotFound
+	}
+	// Lockout guard, same rule and same atomicity as UpdateUser: the only admin
+	// may not be deleted. Checked before the FK scan below so the two stores
+	// report the same error for a last admin who also owns nodes.
+	if s.isLastAdmin(id) {
+		return store.ErrLastAdmin
 	}
 	// Match Postgres: nodes.owner_user_id REFERENCES users (id) with no cascade,
 	// so deleting a user who still owns a node is a foreign-key violation
@@ -135,6 +167,22 @@ func (s *Store) DeleteUser(_ context.Context, id string) error {
 	}
 	delete(s.users, id)
 	return nil
+}
+
+// isLastAdmin reports whether id is currently an admin and the ONLY one, i.e.
+// whether removing or demoting it would leave zero admins. The caller must hold
+// s.mu (write lock) so the answer is still true at write time.
+func (s *Store) isLastAdmin(id string) bool {
+	u, ok := s.users[id]
+	if !ok || u.Role != store.RoleAdmin {
+		return false
+	}
+	for otherID, other := range s.users {
+		if otherID != id && other.Role == store.RoleAdmin {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- Nodes ----

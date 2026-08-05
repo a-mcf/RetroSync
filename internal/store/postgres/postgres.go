@@ -141,10 +141,38 @@ func (s *Store) ListUsers(ctx context.Context) ([]store.User, error) {
 	return out, mapErr(rows.Err())
 }
 
-func (s *Store) UpdateUser(ctx context.Context, u store.User) error {
+func (s *Store) UpdateUserProfile(ctx context.Context, id string, display string, role store.Role) error {
+	return s.withTx(ctx, func(q querier) error {
+		// Lockout guard (store.ErrLastAdmin): a write that would leave zero admins
+		// is refused. Only a role LEAVING "admin" can do that, so the guard — and
+		// the row lock it takes — is skipped when the new role is admin.
+		if role != store.RoleAdmin {
+			if err := guardLastAdmin(ctx, q, id); err != nil {
+				return err
+			}
+		}
+		// pw_hash is absent from the SET list, so a concurrent password change is
+		// preserved rather than overwritten with whatever this caller last read.
+		tag, err := q.Exec(ctx,
+			`UPDATE users SET display = $2, role = $3 WHERE id = $1`,
+			id, display, string(role))
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return store.ErrNotFound
+		}
+		return nil
+	})
+}
+
+// UpdateUserPassword needs no transaction: it is a single statement touching one
+// column, and no guard has to observe anything alongside it (a password cannot
+// change the admin count). display and role are absent from the SET list, so a
+// password write can never revert a concurrent demotion.
+func (s *Store) UpdateUserPassword(ctx context.Context, id string, pwHash string) error {
 	tag, err := s.db.Exec(ctx,
-		`UPDATE users SET display = $2, pw_hash = $3, role = $4 WHERE id = $1`,
-		u.ID, u.Display, u.PwHash, string(u.Role))
+		`UPDATE users SET pw_hash = $2 WHERE id = $1`, id, pwHash)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -155,12 +183,59 @@ func (s *Store) UpdateUser(ctx context.Context, u store.User) error {
 }
 
 func (s *Store) DeleteUser(ctx context.Context, id string) error {
-	tag, err := s.db.Exec(ctx, `DELETE FROM users WHERE id = $1`, id)
+	return s.withTx(ctx, func(q querier) error {
+		// Same lockout guard as UpdateUserProfile, in the same transaction as the delete.
+		// Checked before the DELETE so a last admin who also owns nodes reports
+		// ErrLastAdmin (not the FK's ErrInvalidReference) — matching the in-memory
+		// store's ordering.
+		if err := guardLastAdmin(ctx, q, id); err != nil {
+			return err
+		}
+		tag, err := q.Exec(ctx, `DELETE FROM users WHERE id = $1`, id)
+		if err != nil {
+			// nodes.owner_user_id REFERENCES users (id) with no ON DELETE action, so
+			// deleting a user who still owns nodes is 23503 -> ErrInvalidReference.
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return store.ErrNotFound
+		}
+		return nil
+	})
+}
+
+// guardLastAdmin returns store.ErrLastAdmin when id is the only admin, so the
+// caller's delete/demote must be refused. It MUST run inside the same
+// transaction as that write (callers go through withTx).
+//
+// It selects the admin ids FOR UPDATE, which is what makes the guard safe under
+// concurrency: the admin rows are locked for the rest of the transaction, so a
+// second transaction demoting/deleting a DIFFERENT admin blocks here, then
+// re-reads the (now smaller) admin set after the first commits and correctly
+// refuses. A plain count outside the write's transaction would let two concurrent
+// demotes each see "there is another admin" and strand the system with zero.
+// ORDER BY id makes the lock acquisition order deterministic (no deadlock between
+// two concurrent guards).
+func guardLastAdmin(ctx context.Context, q querier, id string) error {
+	rows, err := q.Query(ctx,
+		`SELECT id FROM users WHERE role = 'admin' ORDER BY id FOR UPDATE`)
 	if err != nil {
 		return mapErr(err)
 	}
-	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
+	defer rows.Close()
+	admins := make([]string, 0, 2)
+	for rows.Next() {
+		var adminID string
+		if err := rows.Scan(&adminID); err != nil {
+			return mapErr(err)
+		}
+		admins = append(admins, adminID)
+	}
+	if err := rows.Err(); err != nil {
+		return mapErr(err)
+	}
+	if len(admins) == 1 && admins[0] == id {
+		return store.ErrLastAdmin
 	}
 	return nil
 }

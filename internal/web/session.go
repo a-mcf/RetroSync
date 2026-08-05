@@ -119,6 +119,30 @@ func (m *sessionManager) destroy(tok string) {
 	delete(m.sessions, tok)
 }
 
+// destroyUser revokes EVERY session belonging to userID and reports how many it
+// removed. It is the revocation primitive behind the user-management guardrail
+// "invalidate sessions on password reset, role change, and delete": because
+// sessions are server-side (a token-keyed map), a reset/demote/delete can take
+// effect immediately instead of waiting out the 7-day cookie.
+//
+// Caveat, deliberately not solved this slice: the map is per-PROCESS. A restart
+// clears it (everyone is logged out — fine), but with more than one replica a
+// revocation only reaches sessions on the replica that served the request.
+// RetroSync runs single-replica today; a shared/persistent session store is the
+// follow-up if that ever changes.
+func (m *sessionManager) destroyUser(userID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for tok, s := range m.sessions {
+		if s.userID == userID {
+			delete(m.sessions, tok)
+			n++
+		}
+	}
+	return n
+}
+
 // setCookie writes the session cookie with the security flags required by
 // docs/auth.md: HttpOnly (no JS access), Secure (HTTPS only), SameSite=Lax
 // (sent on top-level navigations — needed so the post-login redirect carries

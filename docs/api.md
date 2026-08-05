@@ -18,7 +18,9 @@ authorization are enforced by middleware before any handler runs:
   compared in constant time). It travels in the `X-CSRF-Token` header (HTMX) or a
   `csrf_token` form field. A missing/invalid token (or no session) → `403`.
 - **Admin-gating** — all **registry** mutations (`/nodes`, `/syncs`, sync + member
-  edits, smoke-test) are admin-only; a non-admin → `403` ("admins only").
+  edits, smoke-test, `/users`) are admin-only; a non-admin → `403` ("admins only").
+  The one exception is `/account` + `POST /api/account/password`: any signed-in
+  user may change **their own** password.
 - **Member-owner/admin-gating** — `resolve-conflict` (the only play-side action
   under auto-mirror) requires the caller to **own at least one of the sync's
   member nodes** *or* be an admin; otherwise `403`. There is no primary anymore,
@@ -130,6 +132,71 @@ HTML result fragment with a **transient** result — "reachable" on success, or 
 error surfaced to the admin. Nothing is persisted; the fragment reflects only the
 live probe at click time. For an `ssh` node the adapter is not wired yet, so the
 fragment says "not supported yet (ssh adapter pending)". Unknown node → `404`.
+
+## Registry — People (admin-only)
+
+User management in the app (slice 36), so adding a person no longer means running
+`retrosync user set` in a one-off pod. Admin-only, wrapped exactly like `/nodes`.
+`pw_hash` is never rendered in any response. Passwords are hashed with the same
+`auth.Hash` (argon2id) the CLI uses and must satisfy the same
+`auth.ValidatePassword` rule (≥ 8 characters).
+
+### `GET /users`
+
+The people registry admin page: every user's id, display name, role, and how many
+devices they own (linked to `/nodes`).
+
+### `POST /api/users`
+
+Create. Form fields: `id` (slug), `display?` (defaults to the id, like `user set`),
+`role`, `password`. Errors: bad slug / bad role / short password → `400`; duplicate
+id → `409`.
+
+### `POST /api/users/{id}`
+
+Edit display name + role (the path id is authoritative; the password is untouched).
+Unknown user → `404`; demoting the **last admin** → `409`. A role change **revokes
+that user's sessions**.
+
+### `POST /api/users/{id}/password`
+
+Admin password **reset** for someone else — no current password required, that is
+the point of a reset. An admin resetting **their own** password → `409` pointing at
+`/account` (which does verify the current password). Short password → `400`;
+unknown user → `404`. Success **revokes every session** of the target user.
+
+### `POST /api/users/{id}/delete`
+
+Delete, with three humane refusals (all `409`, never a driver `500`):
+
+- **self-delete** — refused even for an admin who is not the last one;
+- **last admin** — refused by the store *inside the delete's transaction*
+  (`SELECT ... FOR UPDATE` over the admin rows), so two concurrent
+  demotes/deletes can't strand the system with zero admins;
+- **still owns devices** — `nodes.owner_user_id REFERENCES users (id)` has **no**
+  `ON DELETE` clause (deliberately: cascading or orphaning someone's devices is
+  worse), so the refusal names the device count and points at `/nodes` to
+  reassign.
+
+Unknown user → `404`. Success revokes the deleted user's sessions.
+
+## Account (any signed-in user)
+
+### `GET /account`
+
+The small self-service page: who you are signed in as, plus the change-password
+form. The one user-management surface a **non-admin** gets.
+
+### `POST /api/account/password`
+
+Change **your own** password. Form fields: `current_password`, `new_password`,
+`confirm_password`. The current password is **verified** (`403` if wrong — a
+borrowed unlocked session must not be enough to take an account over); mismatched
+confirmation or a short new password → `400`. On success every session of that
+user is revoked and a **fresh** session (new token + new CSRF) is minted for the
+caller, so other devices are signed out; the response redirects to
+`/account?changed=1` (`HX-Redirect` for an HTMX submit) rather than swapping a
+fragment, because the CSRF token rotated.
 
 ## Registry — Syncs (admin-only)
 

@@ -303,6 +303,27 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/syncs/{id}/members/{node_id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleSetSyncMember)))))
 	mux.Handle("POST /api/syncs/{id}/members/{node_id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteSyncMember)))))
 
+	// People registry (slice-36). Admin-only, wrapped exactly like /nodes: the
+	// page and every mutation behind requireAuth+requireAdmin, mutations also
+	// behind requireCSRF, so a non-admin never reaches the Store. This is what
+	// replaces "run `retrosync user set` in a one-off pod" for adding a person.
+	//
+	// The lockout guardrails (last admin, self-delete, a user who still owns
+	// devices) are enforced in the handlers and — for the last-admin rule — inside
+	// the store's write transaction. See users.go.
+	mux.Handle("GET /users", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleUsersPage))))
+	mux.Handle("POST /api/users", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateUser)))))
+	mux.Handle("POST /api/users/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditUser)))))
+	mux.Handle("POST /api/users/{id}/password", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleResetPassword)))))
+	mux.Handle("POST /api/users/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteUser)))))
+
+	// Self-service account (slice-36): the ONE user-management action a non-admin
+	// can take — change their own password, proving the current one. Behind
+	// requireAuth only (NOT requireAdmin); the POST is CSRF-protected like every
+	// other mutation.
+	mux.Handle("GET /account", s.requireAuth(http.HandlerFunc(s.handleAccountPage)))
+	mux.Handle("POST /api/account/password", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleChangeOwnPassword))))
+
 	// Discovery (slice-22): the on-ramp that replaces manual sync-building. The GET
 	// page scans every reachable node's save dir, infers a game name per save file,
 	// and offers candidates; the POST one-click-creates a sync from the selected
