@@ -164,16 +164,36 @@ current save everywhere" — a one-click undo for a bad propagation/resolve.
 - `manifest` is only updated *after* the rename. So a crash mid-copy leaves the
   manifest pointing at the previous good state, and the next poll re-detects
   divergence and retries.
-- **A published save's mtime is never a collision.** A fan-out asks the adapter to
-  stamp the SOURCE file's mtime (so the copy stays mtime-faithful and the
-  dashboard still shows when the save was made), but the adapter publishes
-  `previous mtime + 1µs` instead whenever that would not be strictly newer than
-  what the destination already carried. A same-size file republished under its own
-  indexed mtime is invisible to *every* mtime+size gate — syncthing's scanner and
-  the poll's tier 1 alike — so the bytes change while every layer above believes
-  nothing happened. `WriteAtomic` **returns** the mtime it published and the
-  manifest records that (never a follow-up stat, which could pick up an external
-  writer's mtime and file it under our hash).
+- **RetroSync alters a save's mtime only when a human made an explicit choice.**
+  A fan-out asks the adapter to stamp the SOURCE file's mtime, and the adapter
+  stamps *exactly* what it is handed — always. The one deviation is decided by the
+  **engine**, which alone knows why it is writing:
+  - **User-initiated writes** — a sync's **first** fan-out (`last_synced == nil`:
+    the person just set this sync up), a **conflict resolution** (they picked the
+    winner), and a **version restore** (they picked the version to bring back;
+    both the direct write to the restore target and the fan-out to the other
+    members) — publish `destination mtime + 1µs` when the source mtime is
+    *exactly* equal to what the destination already carries. A same-size file
+    republished under its own indexed mtime is invisible to *every* mtime+size
+    gate (syncthing's scanner and the poll's tier 1 alike), so without the nudge
+    the human's choice would change the bytes while every layer above believed
+    nothing happened. Resolution is the case that needs it most: winner and loser
+    can carry identical mtimes — that is how they became invisible to each other.
+    A restore is the same shape: it publishes the resolution time, and any member
+    whose file already carries it would silently ignore the restored bytes.
+  - **Routine auto-mirror** writes never touch file metadata. An exact collision
+    there is *logged as a WARNING* and written with the source mtime anyway: in
+    steady state it means the source's content moved while its mtime did not,
+    which is an anomaly worth a human seeing, not something to paper over.
+    Periodic verification is the backstop.
+  - Only **exact** equality qualifies. An mtime that merely moves *backwards* is
+    still a difference, and both gates test for difference, not ordering.
+  - **Every** deviation is logged with the sync, the node and both mtimes. Silent
+    metadata rewriting in a data path is unreviewable after the fact.
+
+  `WriteAtomic` **returns** the mtime it published and the manifest records that
+  (never a follow-up stat, which could pick up an external writer's mtime and file
+  it under our hash).
 - On resolve, `last_synced` is marked **before** `conflict_at` is cleared, so a
   crash between the two leaves the sync conflicted (re-resolvable) rather than
   un-paused-but-unsynced.

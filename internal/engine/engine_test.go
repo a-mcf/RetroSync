@@ -1,11 +1,14 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +54,27 @@ func steppingClock(start time.Time, step time.Duration) engine.Clock {
 	}
 }
 
+// logSink is a goroutine-safe io.Writer the harness points the engine's logger
+// at, so a test can assert what the engine LOGGED (the mtime-collision decisions
+// of slice 38 are required to be visible, not inferable) even when a test drives
+// concurrent operations.
+type logSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *logSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
 // harness wires a memory Store + a fakereach.Fake per node + an Engine.
 type harness struct {
 	t      *testing.T
@@ -58,6 +82,7 @@ type harness struct {
 	fakes  map[string]*fakereach.Fake
 	paths  map[string]string // nodeID -> member path
 	engine *engine.Engine
+	logs   *logSink
 	// overrides makes the engine resolve a node to an arbitrary Reach instead of
 	// its fake (typically a wrapper AROUND the fake, e.g. lyingHashReach). The
 	// fake stays registered as the backing store for direct test assertions.
@@ -75,6 +100,7 @@ func newHarness(t *testing.T, clock engine.Clock) *harness {
 		fakes:     map[string]*fakereach.Fake{},
 		paths:     map[string]string{},
 		overrides: map[string]reach.Reach{},
+		logs:      &logSink{},
 	}
 	resolve := func(n store.Node) (reach.Reach, error) {
 		if r, ok := h.overrides[n.ID]; ok {
@@ -86,7 +112,8 @@ func newHarness(t *testing.T, clock engine.Clock) *harness {
 		}
 		return f, nil
 	}
-	h.engine = engine.New(h.store, resolve, clock)
+	logger := slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h.engine = engine.New(h.store, resolve, clock, engine.WithLogger(logger))
 	if err := h.store.CreateSync(ctx(), store.Sync{ID: syncID, Game: gameLabel, Name: "Bob's stream"}); err != nil {
 		t.Fatal(err)
 	}
@@ -498,50 +525,142 @@ func TestPoll_VerificationSweep_IdenticalBytes_IsNotAChange(t *testing.T) {
 	}
 }
 
-// TestPoll_FanOut_NeverPublishesCollidingMtime is the WRITE-side half of issue
-// #33 seen from the engine: fanning a source out onto a destination whose file
-// is NEWER than the source must not leave the destination carrying an mtime that
-// is unchanged (or moved backwards) — that is what makes the new bytes invisible
-// to the next stat gate, here and in syncthing. The manifest must record what was
-// really published, not what was requested.
-func TestPoll_FanOut_NeverPublishesCollidingMtime(t *testing.T) {
-	h := newHarness(t, steppingClock(t0, time.Second))
-	base := t0.Add(-time.Hour)
-	// The peer's file is NEWER than the primary's, but only the primary's content
-	// changed (the peer still holds the agreed V1 bytes under a later mtime — e.g.
-	// a touch, or a copy delivered late).
-	peerMtime := base.Add(30 * time.Minute)
-	h.addNode("primary", "p.srm", []byte("V1"), base, true)
-	h.addNode("peer", "q.srm", []byte("V1"), peerMtime, true)
-	v1hash := h.hashOf("primary")
-	h.seedManifestHash("primary", base, int64(len("V1")), v1hash)
-	h.seedManifestHash("peer", peerMtime, int64(len("V1")), v1hash)
+// TestPoll_FanOut_MtimePolicy is the write-side of issue #33 as slice 38 settles
+// it: RetroSync may alter a published save's mtime ONLY where a human made an
+// explicit choice, and only when the source mtime EXACTLY collides with the
+// destination's.
+//
+// The collision matters because both syncthing's scanner and the engine's own
+// tier-1 stat gate decide "did this change?" from mtime+size, and saves are a
+// fixed size per game — so bytes republished under exactly the destination's
+// current mtime are invisible to both, permanently. But a routine auto-mirror
+// must NOT quietly paper over that: it warns and writes the source mtime, because
+// in steady state a collision means the source's content moved while its mtime
+// did not, which is an anomaly a human should see.
+//
+// Intent is discriminated by LastSynced: a sync that has never synced is being
+// INITIATED by the person who just set it up (the same discriminator as the
+// first-sync card, slice 31).
+//
+// Setup in every case: the peer is unchanged (manifest matches its file) and the
+// primary appeared/changed, so the primary is the lone source and fans out to the
+// peer.
+func TestPoll_FanOut_MtimePolicy(t *testing.T) {
+	base := t0.Add(-2 * time.Hour)
 
-	// The primary changes; its mtime moves but stays OLDER than the peer's file.
-	srcMtime := base.Add(time.Minute)
-	h.fake("primary").Mutate("p.srm", []byte("V2"), srcMtime)
+	tests := []struct {
+		name string
+		// synced marks the sync as having synced before (LastSynced != nil), i.e. a
+		// ROUTINE auto-mirror pass rather than the sync's initiation.
+		synced bool
+		// srcMtime is the mtime of the changed source file; the peer's file always
+		// sits at base.
+		srcMtime time.Time
+		// wantMtime is the mtime the peer's file (and its manifest) must end up with.
+		wantMtime time.Time
+		// wantLevel is the level of the log line the decision must emit ("" = the
+		// engine must say nothing, because it did nothing).
+		wantLevel string
+	}{
+		{
+			name:      "initiation, colliding mtime: bumped 1µs so the write is visible",
+			srcMtime:  base,
+			wantMtime: base.Add(time.Microsecond),
+			wantLevel: "INFO",
+		},
+		{
+			name:      "initiation, distinct mtime: source mtime published untouched",
+			srcMtime:  base.Add(time.Minute),
+			wantMtime: base.Add(time.Minute),
+		},
+		{
+			name: "initiation, OLDER mtime: still untouched (backwards is still a difference)",
+			// Slice 34 bumped anything "not strictly newer"; only exact equality can
+			// hide a write, and moving backwards is detected by both stat gates.
+			srcMtime:  base.Add(-time.Minute),
+			wantMtime: base.Add(-time.Minute),
+		},
+		{
+			name:      "routine mirror, colliding mtime: NOT bumped, warned about instead",
+			synced:    true,
+			srcMtime:  base,
+			wantMtime: base,
+			wantLevel: "WARN",
+		},
+		{
+			name:      "routine mirror, distinct mtime: source mtime published untouched",
+			synced:    true,
+			srcMtime:  base.Add(time.Minute),
+			wantMtime: base.Add(time.Minute),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, steppingClock(t0, time.Second))
+			h.addNode("primary", "p.srm", []byte("V2"), tc.srcMtime, true)
+			h.addNode("peer", "q.srm", []byte("V1"), base, true)
+			// The peer is fully described by its manifest => unchanged. The primary has
+			// no manifest row => it "appeared" and is the single changed member.
+			h.seedManifestHash("peer", base, int64(len("V1")), h.hashOf("peer"))
+			if tc.synced {
+				if err := h.store.MarkSyncSynced(ctx(), syncID, t0.Add(-time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := h.engine.Poll(ctx(), syncID); err != nil {
+				t.Fatalf("poll: %v", err)
+			}
+
+			// The bytes always land; only the mtime policy differs.
+			h.assertFile("peer", []byte("V2"), tc.wantMtime)
+			// The manifest records what was really published, so the peer's file and
+			// its manifest agree.
+			m := h.manifest("peer")
+			if m.Mtime == nil || !m.Mtime.Equal(tc.wantMtime.UTC().Truncate(time.Microsecond)) {
+				t.Fatalf("peer manifest mtime = %v, want the published %v", m.Mtime, tc.wantMtime)
+			}
+
+			// Every decision about an mtime must be VISIBLE in the log — silence is
+			// what made issue #33 unanswerable — and a no-decision must be silent.
+			logs := h.logs.String()
+			switch tc.wantLevel {
+			case "":
+				if strings.Contains(logs, "mtime") {
+					t.Fatalf("engine logged about mtimes when it took no mtime decision:\n%s", logs)
+				}
+			default:
+				if !strings.Contains(logs, `"level":"`+tc.wantLevel+`"`) {
+					t.Fatalf("want a %s log line about the mtime collision, got:\n%s", tc.wantLevel, logs)
+				}
+				for _, want := range []string{`"sync_id":"` + syncID + `"`, `"node_id":"peer"`, `"src_mtime"`, `"dst_mtime"`} {
+					if !strings.Contains(logs, want) {
+						t.Fatalf("mtime log line is missing %s:\n%s", want, logs)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestPoll_Initiation_CollisionBump_NextPollIsNoop pins the bookkeeping half of
+// the initiation bump: because the manifest records the mtime that was really
+// published (not the source's), the very next poll sees the peer as unchanged and
+// writes nothing. A manifest that recorded the requested mtime would re-detect
+// the peer every pass and re-arm exactly the divergence the bump prevents.
+func TestPoll_Initiation_CollisionBump_NextPollIsNoop(t *testing.T) {
+	h := newHarness(t, steppingClock(t0, time.Second))
+	base := t0.Add(-2 * time.Hour)
+	h.addNode("primary", "p.srm", []byte("V2"), base, true)
+	h.addNode("peer", "q.srm", []byte("V1"), base, true)
+	h.seedManifestHash("peer", base, int64(len("V1")), h.hashOf("peer"))
 
 	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
+	h.assertFile("peer", []byte("V2"), base.Add(time.Microsecond))
 
-	// The peer got the bytes, under an mtime strictly NEWER than what it had —
-	// never the source's older mtime, which would look unchanged to every gate.
-	fm, err := h.fake("peer").Stat(ctx(), "q.srm")
-	if err != nil {
-		t.Fatalf("stat peer: %v", err)
-	}
-	if !fm.Mtime.After(peerMtime) {
-		t.Fatalf("peer published mtime = %v, want strictly after its previous %v", fm.Mtime, peerMtime)
-	}
-	h.assertFileContent("peer", []byte("V2"))
-
-	// The manifest records the mtime actually published, so the peer's file and
-	// its manifest agree and the next poll is a clean noop for it.
-	m := h.manifest("peer")
-	if m.Mtime == nil || !m.Mtime.Equal(fm.Mtime.UTC().Truncate(time.Microsecond)) {
-		t.Fatalf("peer manifest mtime = %v, want the published %v", m.Mtime, fm.Mtime)
-	}
 	writesBefore := len(h.fake("peer").Writes())
 	if err := h.engine.Poll(ctx(), syncID); err != nil {
 		t.Fatalf("re-poll: %v", err)
@@ -1045,7 +1164,7 @@ func TestPoll_Propagate_CaptureFails_AbortsWrite_ManifestNotAdvanced(t *testing.
 // --- ResolveConflict -----------------------------------------------------
 
 func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
-	h, primaryMtime, peerMtime := seedConflicted(t)
+	h, primaryMtime, _ := seedConflicted(t)
 
 	// Capture the loser's pre-resolution content+hash so we can assert the
 	// server-side snapshot is its exact bytes.
@@ -1081,13 +1200,12 @@ func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
 		}
 	}
 
-	// Every other member now holds the WINNER's bytes. The loser's file was NEWER
-	// than the winner's (seedConflicted: the peer changed last), so publishing the
-	// winner's mtime verbatim would move the peer's mtime BACKWARDS onto a file of
-	// the same size — the invisible-write state of issue #33. The adapter instead
-	// publishes just past what the peer had; the peer's own manifest below must
-	// record that, not the winner's mtime.
-	wantPeerMtime := peerMtime.Add(time.Microsecond)
+	// Every other member now holds the WINNER's bytes AND the winner's mtime. The
+	// loser's file was newer (seedConflicted: the peer changed last), so this moves
+	// the peer's mtime BACKWARDS — which is fine and deliberate (slice 38): a
+	// backwards mtime is still a DIFFERENCE, so every stat gate still sees the
+	// write. Only an EXACT collision hides a write, and these two mtimes differ.
+	wantPeerMtime := primaryMtime
 	h.assertFile("peer", []byte("PRIMARY"), wantPeerMtime)
 
 	// Manifest updated for winner + every written node to the mtime each member's
@@ -1128,6 +1246,56 @@ func TestResolveConflict_WinnerWins_CapturesLoserAndFansOut(t *testing.T) {
 	}
 	if fanouts < 1 {
 		t.Fatalf("expected at least one fan-out ok row, got %d", fanouts)
+	}
+}
+
+// TestResolveConflict_CollidingMtimes_BumpsSoTheChoiceIsVisible is the case that
+// makes conflict resolution user-initiated (slice 38). Two members that diverged
+// while carrying the SAME mtime are exactly how they became invisible to each
+// other — same mtime, same size, so no stat gate on either side ever looked at
+// the bytes. If the resolve then published the winner's mtime verbatim, the
+// loser's file would change on disk under an unchanged mtime and NOTHING
+// downstream (syncthing's scanner, the next poll's tier 1) would notice: the
+// human would watch their choice evaporate.
+//
+// So a resolve — a human's explicit pick — publishes destination + 1µs, and says
+// so in the log.
+func TestResolveConflict_CollidingMtimes_BumpsSoTheChoiceIsVisible(t *testing.T) {
+	h, base := seedSynced(t)
+	// Both members diverge AT THE SAME MTIME (same size, too: the fixed-size save
+	// case). This is the state issue #33 is about.
+	collided := base.Add(time.Hour)
+	h.fake("primary").Mutate("p.srm", []byte("AAAA"), collided)
+	h.fake("peer").Mutate("q.srm", []byte("BBBB"), collided)
+	if err := h.engine.Poll(ctx(), syncID); err != nil {
+		t.Fatal(err)
+	}
+	if h.sync().ConflictAt == nil {
+		t.Fatal("setup: expected the sync to be conflicted")
+	}
+
+	if err := h.engine.ResolveConflict(ctx(), syncID, "primary"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// The loser holds the winner's bytes under an mtime one microsecond past its
+	// own — a difference, therefore detectable, therefore the choice took effect.
+	want := collided.Add(time.Microsecond)
+	h.assertFile("peer", []byte("AAAA"), want)
+	m := h.manifest("peer")
+	if m.Mtime == nil || !m.Mtime.Equal(want) {
+		t.Fatalf("peer manifest mtime = %v, want the published %v", m.Mtime, want)
+	}
+	// The winner keeps its own mtime: only the destination that would have been
+	// invisible is nudged.
+	h.assertFile("primary", []byte("AAAA"), collided)
+
+	logs := h.logs.String()
+	if !strings.Contains(logs, `"level":"INFO"`) || !strings.Contains(logs, `"node_id":"peer"`) {
+		t.Fatalf("the mtime bump must be logged with the node it applied to, got:\n%s", logs)
+	}
+	if strings.Contains(logs, `"level":"WARN"`) {
+		t.Fatalf("a user-initiated bump must not warn:\n%s", logs)
 	}
 }
 
@@ -1394,6 +1562,110 @@ func TestRestoreVersion_WritesBackAndPropagates(t *testing.T) {
 		t.Fatalf("target captured pre-restore bytes = %q, want V1", got)
 	}
 	_ = srcMtime
+}
+
+// TestRestoreVersion_MtimePolicy is the restore half of slice 38's rule: picking
+// a version to bring back is an explicit human choice, so a restore may nudge a
+// colliding mtime — on the TARGET member (written directly, outside the fan-out)
+// and on every other member (written by the fan-out) alike.
+//
+// It matters for the same reason it matters on a conflict resolve: a restore
+// publishes the resolution time, and any member whose file already carries
+// exactly that mtime would receive the restored bytes under an unchanged
+// mtime+size — invisible to syncthing's scanner and to the next poll's tier 1, so
+// the user's choice would silently do nothing on that member.
+//
+// The engine's clock is frozen at t0 here, so "the restore time" is t0 and a
+// member seeded at t0 is precisely the colliding case.
+func TestRestoreVersion_MtimePolicy(t *testing.T) {
+	old := []byte("OLD-SAVE")
+	oldHash := sha256Hex(old)
+	base := t0.Add(-time.Hour) // safely distinct from the restore time
+
+	tests := []struct {
+		name string
+		// seeded file mtimes; t0 == the restore time == a collision.
+		primaryMtime, peerMtime time.Time
+		// mtimes each member's file must end up carrying.
+		wantPrimary, wantPeer time.Time
+		// wantLogNode is the node the bump must be logged against ("" = no bump, so
+		// the engine must say nothing).
+		wantLogNode string
+	}{
+		{
+			// The RESTORE TARGET itself already carries the restore time: the direct
+			// write (which bypasses fanOut) must still be nudged.
+			name:         "target mtime collides with the restore time",
+			primaryMtime: t0,
+			peerMtime:    base,
+			wantPrimary:  t0.Add(time.Microsecond),
+			// The fan-out then propagates what the target actually published.
+			wantPeer:    t0.Add(time.Microsecond),
+			wantLogNode: "primary",
+		},
+		{
+			// A NON-target member carries the restore time: the fan-out copy to it
+			// must be nudged.
+			name:         "another member's mtime collides with the restore time",
+			primaryMtime: base,
+			peerMtime:    t0,
+			wantPrimary:  t0,
+			wantPeer:     t0.Add(time.Microsecond),
+			wantLogNode:  "peer",
+		},
+		{
+			name:         "nothing collides: the restore time is published verbatim",
+			primaryMtime: base,
+			peerMtime:    base,
+			wantPrimary:  t0,
+			wantPeer:     t0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// A FROZEN clock: every engine timestamp in this restore is exactly t0.
+			h := newHarness(t, steppingClock(t0, 0))
+			h.addNode("primary", "p.srm", []byte("V1"), tc.primaryMtime, true)
+			h.addNode("peer", "q.srm", []byte("V1"), tc.peerMtime, true)
+			if err := h.store.PutSaveVersion(ctx(), syncID, "primary", oldHash, old, "propagate"); err != nil {
+				t.Fatalf("seed version: %v", err)
+			}
+			seq := h.versions("primary")[0].Seq
+
+			if err := h.engine.RestoreVersion(ctx(), syncID, seq); err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+
+			// The restored bytes land everywhere; only the mtime policy differs.
+			h.assertFile("primary", old, tc.wantPrimary)
+			h.assertFile("peer", old, tc.wantPeer)
+			// Every manifest describes the file that is really on disk.
+			for id, want := range map[string]time.Time{"primary": tc.wantPrimary, "peer": tc.wantPeer} {
+				m := h.manifest(id)
+				if m.Mtime == nil || !m.Mtime.Equal(want.UTC().Truncate(time.Microsecond)) {
+					t.Fatalf("%s manifest mtime = %v, want the published %v", id, m.Mtime, want)
+				}
+				if m.SHA256 == nil || *m.SHA256 != oldHash {
+					t.Fatalf("%s manifest hash = %v, want the restored %q", id, m.SHA256, oldHash)
+				}
+			}
+
+			logs := h.logs.String()
+			if tc.wantLogNode == "" {
+				if strings.Contains(logs, "mtime") {
+					t.Fatalf("engine logged about mtimes when it took no mtime decision:\n%s", logs)
+				}
+				return
+			}
+			if !strings.Contains(logs, `"level":"INFO"`) || !strings.Contains(logs, `"node_id":"`+tc.wantLogNode+`"`) {
+				t.Fatalf("want an INFO bump logged against %q, got:\n%s", tc.wantLogNode, logs)
+			}
+			if strings.Contains(logs, `"level":"WARN"`) {
+				t.Fatalf("a user-initiated bump must not warn:\n%s", logs)
+			}
+		})
+	}
 }
 
 // TestRestoreVersion_PrunedSeq_NotFound asserts restoring a seq that no longer

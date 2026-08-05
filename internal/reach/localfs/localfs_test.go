@@ -62,22 +62,21 @@ func TestWriteReadStat_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestWriteAtomic_PublishedMtimeNeverCollides is the write-side fix for issue
-// #33. Both syncthing's scanner and the engine's tier-1 stat gate decide "did
-// this change?" from mtime+size, and saves are a fixed size per game — so a
-// published file whose mtime is not strictly newer than the destination's
-// previous mtime is permanently invisible to both: the bytes change while every
-// layer above believes nothing happened.
+// TestWriteAtomic_PublishesExactlyTheRequestedMtime pins that the adapter is
+// DUMB about mtimes (slice 38): it stamps precisely what it is handed, whatever
+// the destination already carries — equal, newer, older, or absent.
 //
-// The rule: publish the source mtime when it is strictly newer (the common case,
-// which preserves "when was this save actually made" for the dashboard),
-// otherwise publish just past what the destination had. A fresh create has no
-// prior mtime to collide with, so it keeps the source mtime verbatim.
+// Slice 34 put an mtime-collision rule in here, where it silently applied to
+// every write forever; an adapter cannot tell a one-time human-initiated write
+// from the ten-thousandth routine mirror. That policy now lives in the engine's
+// fan-out, gated on user intent (engine.publishMtime), so this layer must be
+// verifiably free of it — including for the case slice 34 bumped (an equal
+// mtime), which is why that case is here asserting NO adjustment.
 //
 // Every case asserts the RETURNED mtime is exactly what ended up on disk: the
 // engine records the return value in the manifest, so a return that did not
-// match the file would re-arm the same invisible divergence.
-func TestWriteAtomic_PublishedMtimeNeverCollides(t *testing.T) {
+// match the file would make the manifest describe a file that does not exist.
+func TestWriteAtomic_PublishesExactlyTheRequestedMtime(t *testing.T) {
 	base := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 
 	tests := []struct {
@@ -86,40 +85,30 @@ func TestWriteAtomic_PublishedMtimeNeverCollides(t *testing.T) {
 		// destination, create fresh".
 		seedMtime time.Time
 		srcMtime  time.Time
-		// want is the mtime the write must publish.
-		want time.Time
 	}{
 		{
-			name:     "fresh create keeps the source mtime",
+			name:     "fresh create",
 			srcMtime: base,
-			want:     base,
 		},
 		{
-			name:      "source strictly newer keeps the source mtime",
+			name:      "destination exists with an older mtime",
 			seedMtime: base,
 			srcMtime:  base.Add(time.Hour),
-			want:      base.Add(time.Hour),
 		},
 		{
-			name:      "colliding source mtime is bumped past the destination's",
+			name:      "destination exists with the SAME mtime (no bump here anymore)",
 			seedMtime: base,
 			srcMtime:  base,
-			want:      base.Add(mtimeBump),
 		},
 		{
-			name:      "older source mtime is bumped past the destination's",
+			name:      "destination exists with a newer mtime (moving backwards is allowed)",
 			seedMtime: base,
 			srcMtime:  base.Add(-time.Hour),
-			want:      base.Add(mtimeBump),
 		},
 		{
-			// Newer, but by less than the resolution the manifest (and Postgres) can
-			// store, so it would be indistinguishable from prev to every consumer:
-			// treated as a collision.
-			name:      "sub-microsecond-newer source mtime is bumped",
+			name:      "sub-microsecond difference is published verbatim",
 			seedMtime: base,
 			srcMtime:  base.Add(time.Nanosecond),
-			want:      base.Add(mtimeBump),
 		},
 	}
 	for _, tc := range tests {
@@ -133,8 +122,6 @@ func TestWriteAtomic_PublishedMtimeNeverCollides(t *testing.T) {
 				if _, err := l.WriteAtomic(ctx, rel, []byte("OLD"), tc.seedMtime); err != nil {
 					t.Fatalf("seed write: %v", err)
 				}
-				// The seed itself is a fresh create, so it must carry its mtime exactly
-				// — otherwise the case below is not testing what it claims to.
 				fi, err := os.Stat(abs)
 				if err != nil {
 					t.Fatalf("stat seed: %v", err)
@@ -148,8 +135,8 @@ func TestWriteAtomic_PublishedMtimeNeverCollides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("WriteAtomic: %v", err)
 			}
-			if !got.Equal(tc.want) {
-				t.Errorf("returned mtime = %v, want %v", got, tc.want)
+			if !got.Equal(tc.srcMtime) {
+				t.Errorf("returned mtime = %v, want the requested %v (the adapter must not adjust it)", got, tc.srcMtime)
 			}
 			// The returned mtime must be what is actually ON DISK — the engine files
 			// its content hash under it.
@@ -157,13 +144,8 @@ func TestWriteAtomic_PublishedMtimeNeverCollides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("stat published: %v", err)
 			}
-			if !fi.ModTime().Equal(got) {
-				t.Errorf("on-disk mtime = %v, but WriteAtomic returned %v", fi.ModTime(), got)
-			}
-			// And whatever the requested mtime was, the destination's mtime moved
-			// strictly forward, so no stat gate can mistake the new bytes for the old.
-			if !tc.seedMtime.IsZero() && !fi.ModTime().After(tc.seedMtime) {
-				t.Errorf("published mtime %v is not strictly newer than the destination's previous %v", fi.ModTime(), tc.seedMtime)
+			if !fi.ModTime().Equal(tc.srcMtime) {
+				t.Errorf("on-disk mtime = %v, want the requested %v", fi.ModTime(), tc.srcMtime)
 			}
 			data, err := os.ReadFile(abs)
 			if err != nil {

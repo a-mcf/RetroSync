@@ -29,6 +29,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -70,6 +71,12 @@ type Engine struct {
 	// very path being configured). Set via WithShareRoot.
 	shareRoot string
 
+	// logger records the engine's few operator-visible decisions — today the
+	// mtime-collision handling in fanOut, which MUST be visible in the log rather
+	// than inferred from a file's timestamps (slice 38). Never nil: New defaults it
+	// to slog.Default(); WithLogger overrides it.
+	logger *slog.Logger
+
 	// mu guards syncMu. syncMu holds one mutex per sync id, lazily created and
 	// never removed — fine for a household-scale registry (a handful of syncs,
 	// each entry a few dozen bytes).
@@ -88,12 +95,23 @@ func WithShareRoot(root string) Option {
 	return func(e *Engine) { e.shareRoot = root }
 }
 
+// WithLogger sets the logger the engine writes its operator-visible decisions to
+// (the mtime-collision handling in fanOut). A nil logger is ignored, leaving the
+// default (slog.Default()).
+func WithLogger(l *slog.Logger) Option {
+	return func(e *Engine) {
+		if l != nil {
+			e.logger = l
+		}
+	}
+}
+
 // New builds an Engine. clock may be nil, in which case time.Now (UTC) is used.
 func New(s store.Store, resolve ResolveReach, clock Clock, opts ...Option) *Engine {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	e := &Engine{store: s, resolve: resolve, clock: clock, syncMu: make(map[string]*sync.Mutex)}
+	e := &Engine{store: s, resolve: resolve, clock: clock, logger: slog.Default(), syncMu: make(map[string]*sync.Mutex)}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -212,11 +230,11 @@ type changedMember struct {
 // save is a fixed size for a given game — so a member whose BYTES changed while
 // its mtime stayed put is invisible to the gate, permanently rather than until
 // the next poll, and the manifest keeps a hash that no longer describes the file.
-// RetroSync's own writes can no longer do that (the reach adapters never publish
-// a colliding mtime), but RetroSync is not the only writer: Syncthing PRESERVES
-// mtimes when it delivers a file, so it can restore an older save carrying
-// exactly the mtime already in the manifest. Pure mtime+size cannot be made safe
-// for fixed-size files written by other processes. So a member whose manifest
+// RetroSync is not the only writer: Syncthing PRESERVES mtimes when it delivers a
+// file, so it can restore an older save carrying exactly the mtime already in the
+// manifest — and a routine auto-mirror deliberately does NOT alter mtimes to
+// dodge this (it warns instead; see publishMtime). Pure mtime+size cannot be made
+// safe for fixed-size files written by other processes. So a member whose manifest
 // LastChecked is older than verifyInterval is hashed REGARDLESS of the stat gate.
 // LastChecked advances only when the manifest is written — i.e. it means "the
 // last time we actually looked at the bytes" — so this costs one hash per member
@@ -370,7 +388,17 @@ func (e *Engine) Poll(ctx context.Context, syncID string) error {
 	// fanOut hashes the source bytes it ACTUALLY reads and returns that hash, so
 	// every written member's manifest describes the propagated bytes even if the
 	// source file moved between the tier-2 Hash above and the fan-out Read.
-	actualHash, err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], alreadyHave, reasonPropagate, now)
+	//
+	// INTENT: a sync that has never synced (LastSynced == nil) is being INITIATED —
+	// the human just set it up and is watching for it to take effect — which is the
+	// same discriminator the first-sync card uses (slice 31). That first fan-out may
+	// nudge a colliding mtime (publishMtime); every subsequent pass is the routine
+	// auto-mirror, which never touches file metadata.
+	intent := routineMirror
+	if sy.LastSynced == nil {
+		intent = userChose
+	}
+	actualHash, err := e.fanOut(ctx, syncID, src.sn, scoped, metas[src.sn.node.ID], alreadyHave, reasonPropagate, now, intent)
 	if err != nil {
 		return err
 	}
@@ -675,7 +703,13 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 	// hard gate: a capture or write failure returns the error and (because we have
 	// NOT cleared conflict_at) leaves the sync conflicted for re-resolution. No
 	// skip set here: a resolve deliberately overwrites every loser with the winner.
-	winnerHash, err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, nil, reasonConflictResolve, now)
+	//
+	// INTENT: userChose — the human picked this winner. It matters here more than
+	// anywhere: winner and loser can carry IDENTICAL mtimes (that is how they became
+	// invisible to each other in the first place), so without the collision nudge the
+	// resolve would write bytes no stat gate can see and the user would watch their
+	// choice evaporate.
+	winnerHash, err := e.fanOut(ctx, syncID, winner, scoped, winnerMeta, nil, reasonConflictResolve, now, userChose)
 	if err != nil {
 		return err
 	}
@@ -716,10 +750,11 @@ func (e *Engine) ResolveConflict(ctx context.Context, syncID, winnerNodeID strin
 // the write); a partial restore leaves the manifest trailing the actual writes
 // and is retried/re-driven safely. The restored bytes are published with the
 // resolution time (the injected clock), so every member normally converges to one
-// mtime and the next poll is a clean noop; a member whose file already carried a
-// mtime at or past the resolution time gets a slightly newer one instead (the
-// issue #33 collision rule) and its manifest records what was really published,
-// so that member is still a noop next poll.
+// mtime and the next poll is a clean noop; a member whose file ALREADY carries
+// exactly that mtime gets one microsecond later instead (publishMtime: a restore
+// is an explicit human choice, and a colliding write would be invisible to every
+// mtime+size gate). Each manifest records the mtime really published, so every
+// member is still a noop next poll.
 //
 // AUTHORIZATION: seq is loaded BOUND to syncID (the caller's authorized sync) via
 // GetSaveVersionData(ctx, syncID, seq). A seq belonging to a DIFFERENT sync is
@@ -758,18 +793,31 @@ func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) e
 	// Step 1: overwrite the TARGET member with the restored bytes, capturing its
 	// current bytes first (it's an overwrite of recoverable content). The restored
 	// content gets the resolution mtime so all members converge.
+	//
+	// The target's mtime BEFORE the overwrite, for the same user-initiated
+	// collision rule the fan-out below applies (publishMtime): picking a version to
+	// restore is an explicit human choice, and if the restored bytes landed carrying
+	// exactly the mtime the target already has, the restore would be undetectable to
+	// every mtime+size gate — the user would watch their choice evaporate. nil when
+	// the target has no file (nothing to collide with) or could not be stat'd.
+	var targetMtimeBefore *time.Time
+	if fm, present, err := e.statOpt(ctx, target); err == nil && present {
+		mt := fm.Mtime
+		targetMtimeBefore = &mt
+	}
 	if err := e.captureBeforeOverwrite(ctx, syncID, target, reasonRestore); err != nil {
 		return err
 	}
-	publishedMtime, err := target.r.WriteAtomic(ctx, target.path, data, now)
+	publish := e.publishMtime(ctx, syncID, target.node.ID, now, targetMtimeBefore, userChose)
+	publishedMtime, err := target.r.WriteAtomic(ctx, target.path, data, publish)
 	if err != nil {
 		return fmt.Errorf("engine: restore write target %s: %w", target.node.ID, err)
 	}
-	// The manifest records the mtime the adapter reports it PUBLISHED — normally
-	// the resolution time, but bumped past the target's previous mtime if that was
-	// somehow not older (a device clock ahead of the server's, say). Recording the
-	// requested time instead would leave the manifest describing a file that
-	// carries a different mtime (issue #33).
+	// The manifest records the mtime the adapter reports it PUBLISHED (what
+	// publishMtime asked for — the resolution time, or one microsecond past the
+	// target's own mtime on a collision; adapters stamp exactly what they are
+	// handed) rather than the requested value, so the manifest can never describe a
+	// file that carries a different mtime.
 	restoredMeta := reach.FileMeta{Mtime: publishedMtime, Size: int64(len(data))}
 	if err := e.setManifest(ctx, syncID, target.node.ID, restoredMeta, restoredHash, now); err != nil {
 		return err
@@ -794,7 +842,13 @@ func (e *Engine) RestoreVersion(ctx context.Context, syncID string, seq int64) e
 	// bytes it actually reads for the written members' manifests (equal to
 	// restoredHash unless an external writer mutated the target mid-restore, in
 	// which case the manifests still describe the bytes really propagated).
-	if _, err := e.fanOut(ctx, syncID, target, scoped, restoredMeta, nil, reasonRestore, now); err != nil {
+	//
+	// INTENT: userChose — the human picked this version. Restore is the third
+	// explicit human choice, alongside a sync's initiation and a conflict
+	// resolution; only the routine auto-mirror stays hands-off. A member whose file
+	// already carries the restored mtime would otherwise receive bytes no stat gate
+	// can see, and the restore would silently do nothing on that member.
+	if _, err := e.fanOut(ctx, syncID, target, scoped, restoredMeta, nil, reasonRestore, now, userChose); err != nil {
 		return err
 	}
 
@@ -861,12 +915,15 @@ func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst 
 // Hash and this Read; the manifest must describe the bytes really propagated).
 // It returns that hash so the caller can record it for the source member's own
 // manifest too, and appends a sync_log "ok" row per copy. The destination is
-// asked to publish the SOURCE's mtime so the next poll sees source == peer; the
-// adapter may publish a slightly newer one instead when the source mtime would
-// not be strictly newer than what that destination already had (the issue #33
-// collision rule), and each written member's manifest records the mtime the
-// adapter reports it actually published — so members can legitimately end a
-// fan-out on slightly different mtimes, each matching its own file.
+// normally asked to publish the SOURCE's mtime so the next poll sees source ==
+// peer; the ONE exception is the user-initiated collision rule (see intent and
+// publishMtime). Each written member's manifest records the mtime the adapter
+// reports it actually published — so members can legitimately end a fan-out on
+// slightly different mtimes, each matching its own file.
+//
+// intent says whether a HUMAN chose this write (userChose) or it is the routine
+// auto-mirror (routineMirror). It is passed explicitly, never inferred here,
+// because it is the gate on the only thing that may alter a save's mtime.
 //
 // skip names members that must NOT be overwritten because they already hold the
 // agreed content (the byte-identical co-changers in the one-distinct-hash case).
@@ -882,7 +939,7 @@ func (e *Engine) captureBeforeOverwrite(ctx context.Context, syncID string, dst 
 // error surfaced (the manifest is not advanced, the next poll retries), so no
 // recoverable bytes are ever destroyed without a snapshot. A destination with no
 // current file has nothing to capture (skip).
-func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, skip map[string]bool, reason string, now time.Time) (string, error) {
+func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scoped []scopedNode, srcMeta reach.FileMeta, skip map[string]bool, reason string, now time.Time, intent writeIntent) (string, error) {
 	data, err := src.r.Read(ctx, src.path)
 	if err != nil {
 		return "", fmt.Errorf("engine: read source %s: %w", src.node.ID, err)
@@ -897,11 +954,13 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		if skip[dst.node.ID] {
 			continue
 		}
-		// dst mtime *before* overwrite, for the log (nil if dst absent or
-		// unreadable; this is a best-effort diagnostic, not load-bearing).
+		// dst mtime *before* overwrite: the log's diagnostic, and the input to the
+		// collision rule below. nil when dst is absent (nothing to collide with) or
+		// its stat failed (we cannot tell, so we do not adjust anything).
 		var dstMtimeBefore *time.Time
 		if fm, present, err := e.statOpt(ctx, dst); err == nil && present {
-			dstMtimeBefore = &fm.Mtime
+			m := fm.Mtime
+			dstMtimeBefore = &m
 		}
 
 		// Capture-before-overwrite: snapshot the destination's current bytes into
@@ -912,7 +971,11 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 			return "", err
 		}
 
-		publishedMtime, err := dst.r.WriteAtomic(ctx, dst.path, data, srcMeta.Mtime)
+		// The mtime to ask for: the source's, except where a human-initiated write
+		// would otherwise be invisible (see publishMtime).
+		publish := e.publishMtime(ctx, syncID, dst.node.ID, srcMeta.Mtime, dstMtimeBefore, intent)
+
+		publishedMtime, err := dst.r.WriteAtomic(ctx, dst.path, data, publish)
 		if err != nil {
 			// Crash-safety: the write failed, so we do NOT advance dst's manifest.
 			// Log the error and abort the pass; the next poll re-detects and
@@ -934,14 +997,13 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		// destination now holds exactly `data`, so its manifest records data's
 		// length and in-process hash (not the possibly-stale srcMeta.Size / a
 		// caller-computed hash). The mtime is the one WriteAtomic REPORTS having
-		// published, which is the source mtime only when that was strictly newer
-		// than what the destination already had — the adapter bumps it otherwise so
-		// the write cannot be invisible to a stat gate (issue #33). Recording the
-		// requested mtime instead would leave the manifest describing a file that
-		// carries a different mtime, re-arming the false "unchanged" the bump
-		// exists to prevent; and re-stating the file here (rather than trusting the
-		// adapter's report) could pick up an external writer's mtime and file it
-		// under OUR hash.
+		// published — which is what publishMtime asked for (adapters stamp exactly
+		// what they are handed), i.e. the source's mtime except on a user-initiated
+		// collision bump. Recording srcMeta.Mtime instead would leave the manifest
+		// describing a file that carries a different mtime, re-arming the false
+		// "unchanged" the bump exists to prevent; and re-stating the file here
+		// (rather than trusting the adapter's report) could pick up an external
+		// writer's mtime and file it under OUR hash.
 		written := reach.FileMeta{Mtime: publishedMtime, Size: int64(len(data))}
 		if err := e.setManifest(ctx, syncID, dst.node.ID, written, srcHash, now); err != nil {
 			return "", err
@@ -961,6 +1023,94 @@ func (e *Engine) fanOut(ctx context.Context, syncID string, src scopedNode, scop
 		}
 	}
 	return srcHash, nil
+}
+
+// writeIntent says WHY a write is happening: because a human made an explicit
+// choice (userChose), or because the auto-mirror is doing its routine job
+// (routineMirror). It exists for exactly one decision — whether RetroSync may
+// alter the mtime it publishes (publishMtime) — and is always passed explicitly
+// by the caller that knows, never inferred by the writer.
+type writeIntent bool
+
+const (
+	// userChose marks a write a human asked for. There are exactly three:
+	//  1. INITIATION — a sync's first fan-out (LastSynced == nil): the user just
+	//     set this sync up and is watching for it to take effect.
+	//  2. CONFLICT RESOLUTION — they picked the winner.
+	//  3. RESTORE — they picked a version to bring back.
+	userChose writeIntent = true
+	// routineMirror marks the ordinary auto-mirror fan-out — no human in the loop,
+	// so nothing about the file's metadata may be "fixed up".
+	routineMirror writeIntent = false
+)
+
+// publishMtime returns the mtime a write asks the destination adapter to stamp:
+// srcMtime, except on a USER-INITIATED write whose source mtime EXACTLY equals
+// what the destination already carries, where it returns the destination's mtime
+// + one microsecond instead. Every write to a member goes through it — the
+// fan-out's copies and RestoreVersion's direct write to its target alike.
+//
+// Why the exception exists (issue #33): both syncthing's scanner and this
+// engine's own tier-1 stat gate decide "did this change?" from mtime+size alone,
+// and a save is a fixed size for a given game — so a file republished under
+// exactly the mtime the destination already had is PERMANENTLY invisible to
+// both. Never hashed, never propagated, manifest hash no longer describing the
+// bytes on disk. That is precisely how two copies become invisible to each other,
+// which is why a conflict resolution is the case that needs this most: winner and
+// loser can carry identical mtimes, and without the nudge the human's choice
+// writes bytes nobody downstream will ever notice.
+//
+// Why it is gated on a human (slice 38): altering a save's mtime is a lie about
+// when the save was made, and a lie told automatically ten thousand times is
+// unreviewable. RetroSync tells it only where a person made an explicit choice —
+// initiating a sync, resolving a conflict, or restoring a version — and LOGS
+// every instance.
+//
+// Why ONLY exact equality: invisibility needs mtime AND size to be identical. An
+// mtime that merely moves BACKWARDS is still a difference, and both gates test
+// for difference, not ordering — so bumping "anything not strictly newer" (slice
+// 34) bought nothing and fired routinely wherever two devices' clocks disagree.
+//
+// Equality is judged at mtimeResolution (microsecond), the resolution every
+// consumer works at — the manifest truncates to it and Postgres timestamptz
+// cannot store finer — so a difference smaller than that, which would vanish on
+// the way to the manifest, still counts as a collision. One microsecond is
+// likewise the smallest nudge that survives that round trip.
+//
+// dstMtime is nil when the destination has no file (nothing to collide with) or
+// could not be stat'd (we cannot tell, so we change nothing).
+func (e *Engine) publishMtime(ctx context.Context, syncID, dstNodeID string, srcMtime time.Time, dstMtime *time.Time, intent writeIntent) time.Time {
+	if dstMtime == nil || !mtimeEqual(srcMtime, *dstMtime) {
+		return srcMtime
+	}
+	if intent != userChose {
+		// Part 3: surface, don't silently fix. In steady state a collision means the
+		// source's content changed while its mtime did not — anomalous, and worth a
+		// human seeing rather than a machine papering over. The write proceeds with
+		// the source mtime; the periodic verification sweep is the backstop.
+		e.logger.WarnContext(ctx, "fan-out mtime collides with the destination's; writing anyway (routine mirror never alters mtimes) — this write may not be detected downstream",
+			slog.String("sync_id", syncID),
+			slog.String("node_id", dstNodeID),
+			mtimeAttr("src_mtime", srcMtime),
+			mtimeAttr("dst_mtime", *dstMtime))
+		return srcMtime
+	}
+	published := dstMtime.UTC().Truncate(mtimeResolution).Add(mtimeResolution)
+	e.logger.InfoContext(ctx, "user-initiated write collides with the destination's mtime; publishing one microsecond later so the write is visible",
+		slog.String("sync_id", syncID),
+		slog.String("node_id", dstNodeID),
+		mtimeAttr("src_mtime", srcMtime),
+		mtimeAttr("dst_mtime", *dstMtime),
+		mtimeAttr("published_mtime", published))
+	return published
+}
+
+// mtimeAttr logs an mtime as an RFC3339 string with FULL sub-second precision.
+// slog's built-in time formatting truncates attribute times to milliseconds,
+// which would render a one-MICROSECOND bump as three identical timestamps — the
+// exact detail these log lines exist to make legible.
+func mtimeAttr(key string, t time.Time) slog.Attr {
+	return slog.String(key, t.UTC().Format(time.RFC3339Nano))
 }
 
 // flagConflict sets conflict_at on the sync and appends a single conflict log
