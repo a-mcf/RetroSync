@@ -221,6 +221,8 @@ Design and reference docs live in [`docs/`](docs/):
 - [`docs/state-machine.md`](docs/state-machine.md) — auto-mirror loop, hash detection, conflicts, restore
 - [`docs/api.md`](docs/api.md) — the HTTP surface (HTMX/POST + read-only JSON)
 - [`docs/ui.md`](docs/ui.md) — screens and flows
+- [`docs/save-files.md`](docs/save-files.md) — **which save files sync reliably**, why whole-card
+  images do not, and how to recognise the failure (reads as "the game didn't save")
 - [`docs/auth.md`](docs/auth.md) — identity, sessions, CSRF, role gating
 - [`docs/open-questions.md`](docs/open-questions.md) — design decisions (resolved + still-open)
 
