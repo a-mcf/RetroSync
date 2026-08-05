@@ -103,9 +103,8 @@ type Reach interface {
 	List(ctx context.Context, relPath string) ([]DirEntry, error)
 
 	// WriteAtomic writes data to path crash-safely, stamps the published file
-	// with an mtime derived from the requested mtime, and RETURNS the mtime it
-	// actually published. The contract (from docs/state-machine.md "Crash
-	// safety"):
+	// with EXACTLY the requested mtime, and RETURNS the mtime it published. The
+	// contract (from docs/state-machine.md "Crash safety"):
 	//
 	//   1. Write the bytes to a temporary sibling (e.g. <path>.retrosync-tmp).
 	//   2. Atomically rename the temp file over path.
@@ -120,15 +119,17 @@ type Reach interface {
 	// a spurious "peer changed", and the dashboard keeps showing when the save was
 	// really made.
 	//
-	// MTIME COLLISIONS (issue #33). Adapters MUST NOT publish an mtime that is
-	// not strictly newer than the mtime the destination already had. Both
-	// Syncthing's scanner and the engine's own tier-1 stat gate decide "did this
-	// change?" from mtime+size alone, and saves are a fixed size per game — so a
-	// published file whose mtime equals the destination's previous mtime is
+	// MTIME COLLISIONS (issue #33) ARE THE ENGINE'S BUSINESS, NOT AN ADAPTER'S.
+	// Both Syncthing's scanner and the engine's own tier-1 stat gate decide "did
+	// this change?" from mtime+size alone, and saves are a fixed size per game —
+	// so a published file whose mtime equals the destination's previous mtime is
 	// PERMANENTLY invisible to both: never hashed, never propagated, with a
-	// manifest hash that no longer describes the bytes on disk. When the requested
-	// mtime is not strictly newer than the destination's current mtime, the
-	// adapter must publish a slightly newer one instead (see localfs.mtimeBump).
+	// manifest hash that no longer describes the bytes on disk. But an adapter
+	// cannot tell a one-time human-initiated write from the ten-thousandth routine
+	// auto-mirror, so it must NOT decide when to deviate from the requested mtime:
+	// implementations stamp exactly what they are handed, and the engine decides
+	// what to hand them (engine.publishMtime, slice 38). RetroSync alters a file's
+	// mtime only where a human made an explicit choice.
 	//
 	// The published mtime is RETURNED rather than left for the caller to stat back
 	// off the file: an external writer (Syncthing, an emulator) can change the

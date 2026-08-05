@@ -139,7 +139,8 @@ func run(logger *slog.Logger) error {
 	cancelStart()
 
 	st := postgres.New(pool)
-	eng := engine.New(st, resolve.ResolveReach, time.Now, engine.WithShareRoot(cfg.ShareRoot))
+	eng := engine.New(st, resolve.ResolveReach, time.Now,
+		engine.WithShareRoot(cfg.ShareRoot), engine.WithLogger(logger))
 	d := daemon.New(st, eng, cfg.PollInterval, cfg.PollTimeout, logger)
 
 	srv, err := web.New(st, web.Options{Logger: logger, Actioner: eng, ShareRoot: cfg.ShareRoot})

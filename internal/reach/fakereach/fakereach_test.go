@@ -64,24 +64,23 @@ func TestWriteAtomicStoresMtimeFaithfully(t *testing.T) {
 	}
 }
 
-// TestWriteAtomic_MtimeCollisionRule pins that the fake models the production
-// adapter's issue-#33 rule: a published mtime is never allowed to collide with
-// (or predate) the destination's current mtime, because engine tests rely on the
-// fake to behave like localfs here. The returned mtime is what was published.
-func TestWriteAtomic_MtimeCollisionRule(t *testing.T) {
+// TestWriteAtomic_StampsExactlyTheRequestedMtime pins that the fake is as DUMB
+// about mtimes as the production adapter (slice 38): it stamps precisely what it
+// is handed, whatever the destination carries. Engine tests depend on this — the
+// mtime policy lives in engine.publishMtime now, and a fake that quietly applied
+// its own rule would hide the engine's from every test that uses it.
+func TestWriteAtomic_StampsExactlyTheRequestedMtime(t *testing.T) {
 	base := time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name string
 		// seed is the destination's existing mtime; zero means no destination.
-		seed     time.Time
-		request  time.Time
-		want     time.Time
-		wantSame bool // want == request (no bump)
+		seed    time.Time
+		request time.Time
 	}{
-		{name: "fresh create keeps the requested mtime", request: base, want: base, wantSame: true},
-		{name: "newer request is kept", seed: base, request: base.Add(time.Hour), want: base.Add(time.Hour), wantSame: true},
-		{name: "colliding request is bumped", seed: base, request: base, want: base.Add(time.Microsecond)},
-		{name: "older request is bumped", seed: base, request: base.Add(-time.Hour), want: base.Add(time.Microsecond)},
+		{name: "fresh create", request: base},
+		{name: "newer request", seed: base, request: base.Add(time.Hour)},
+		{name: "colliding request is NOT bumped", seed: base, request: base},
+		{name: "older request is NOT bumped", seed: base, request: base.Add(-time.Hour)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,23 +92,20 @@ func TestWriteAtomic_MtimeCollisionRule(t *testing.T) {
 			if err != nil {
 				t.Fatalf("WriteAtomic: %v", err)
 			}
-			if !got.Equal(tc.want) {
-				t.Errorf("returned mtime = %v, want %v", got, tc.want)
+			if !got.Equal(tc.request) {
+				t.Errorf("returned mtime = %v, want the requested %v", got, tc.request)
 			}
 			// The stored file, and the recorded write, both carry the PUBLISHED mtime.
 			fm, err := f.Stat(ctx(), "g.srm")
 			if err != nil {
 				t.Fatalf("Stat: %v", err)
 			}
-			if !fm.Mtime.Equal(got) {
-				t.Errorf("stored mtime = %v, but WriteAtomic returned %v", fm.Mtime, got)
+			if !fm.Mtime.Equal(tc.request) {
+				t.Errorf("stored mtime = %v, want the requested %v", fm.Mtime, tc.request)
 			}
 			writes := f.Writes()
-			if len(writes) != 1 || !writes[0].Mtime.Equal(got) {
-				t.Errorf("write record = %+v, want one record at %v", writes, got)
-			}
-			if !tc.wantSame && !fm.Mtime.After(tc.seed) {
-				t.Errorf("published mtime %v is not strictly newer than the destination's previous %v", fm.Mtime, tc.seed)
+			if len(writes) != 1 || !writes[0].Mtime.Equal(tc.request) {
+				t.Errorf("write record = %+v, want one record at %v", writes, tc.request)
 			}
 		})
 	}

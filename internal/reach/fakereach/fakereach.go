@@ -1,9 +1,8 @@
 // Package fakereach is an in-memory implementation of reach.Reach for unit
 // tests. It backs each node's filesystem with a map keyed by path, honors
-// reach.ErrNotExist, and — like the real localfs adapter — publishes the mtime
-// handed to WriteAtomic unless that would collide with (or predate) the
-// destination's current mtime, so tests can assert both mtime-faithful fan-out
-// copies and the collision rule that issue #33 turned on.
+// reach.ErrNotExist, and — like the real localfs adapter — publishes EXACTLY the
+// mtime handed to WriteAtomic, so an engine test observes the engine's own mtime
+// policy (engine.publishMtime) rather than an adapter's.
 //
 // A Fake models ONE node's save filesystem (the engine resolves one reach.Reach
 // per node). Tests typically hold a Fake per node and let the engine's resolver
@@ -24,13 +23,6 @@ import (
 	"github.com/a-mcf/retrosync/internal/reach"
 )
 
-// mtimeBump mirrors localfs.mtimeBump: how far past the destination's PREVIOUS
-// mtime WriteAtomic publishes when the requested mtime would not be strictly
-// newer. The fake models the rule so engine tests exercise the same behavior the
-// production adapter has (issue #33) — without it, the engine's manifest
-// bookkeeping around a colliding fan-out would be untested.
-const mtimeBump = time.Microsecond
-
 // File is one stored file's state.
 type File struct {
 	Data  []byte
@@ -41,8 +33,8 @@ type File struct {
 type WriteRecord struct {
 	Path string
 	Data []byte
-	// Mtime is the mtime actually PUBLISHED (what WriteAtomic returned), which is
-	// the requested mtime except when the collision rule bumped it.
+	// Mtime is the mtime actually PUBLISHED (what WriteAtomic returned) — always
+	// exactly the requested mtime; the adapter never adjusts it.
 	Mtime time.Time
 }
 
@@ -307,20 +299,16 @@ func (f *Fake) List(_ context.Context, relPath string) ([]reach.DirEntry, error)
 // (modeling the temp+rename crash-safety guarantee). On success it stores the
 // data with the PUBLISHED mtime, records the call, and returns that mtime.
 //
-// The published mtime follows the same rule as localfs: the requested mtime when
-// the destination is absent or has a strictly older mtime, otherwise the
-// destination's previous mtime + mtimeBump. Publishing a colliding mtime is what
-// made a fan-out invisible to every mtime+size gate in issue #33, so the fake
-// must not be able to do it either.
+// Like localfs, the fake stamps EXACTLY the requested mtime — even when that
+// collides with what the destination already carries. Deciding when a colliding
+// mtime may be nudged is the engine's policy (engine.publishMtime, slice 38); a
+// fake that quietly applied its own rule would hide the engine's from every test
+// that uses it.
 func (f *Fake) WriteAtomic(_ context.Context, path string, data []byte, publish time.Time) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.injected(f.failWrite, path); err != nil {
 		return time.Time{}, err
-	}
-	if prev, ok := f.files[path]; ok && !publish.Truncate(mtimeBump).After(prev.Mtime.Truncate(mtimeBump)) {
-		// Not newer at the resolution the manifest stores (see localfs.publishMtime).
-		publish = prev.Mtime.Add(mtimeBump)
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
