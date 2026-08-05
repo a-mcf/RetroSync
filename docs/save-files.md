@@ -13,17 +13,18 @@ rewritten while you play do not.**
 | shape | example | verdict |
 |---|---|---|
 | per-game save | `Game (USA).srm`, `.sav`, `.mcr` | good — a few KB, written when you save |
-| per-game folder | PCSX2 **folder** memory card | good — one small directory per game |
-| whole-console image | PCSX2 `Mcd001.ps2` (8 MB) and similar | **avoid** |
-| save states | `.state*`, `.p2s` | excluded from RetroSync by design |
+| per-game folder | a memory card stored as a **directory** | good — one small directory per game |
+| whole-card image | a single multi-megabyte card image | **avoid** |
+| save states | `.state*` and similar | excluded from RetroSync by design |
 
-A whole memory card is one large file holding *every* game's saves, and the
-emulator rewrites the entire image as you play, not only when you choose "save".
-A file that is constantly changing is a moving target for any sync tool, and a
-copy that never lands cleanly can leave you back at an older save. Two things
-about this are counter-intuitive and worth knowing: saving repeatedly "to be
-safe" makes it worse, and the blast radius is every game on the card, not just
-the one you were playing.
+Consoles that saved to a memory card are the ones to watch. A card image is a
+single large file holding *every* game's saves, and the emulator rewrites the
+whole image as you play, not only when you choose "save". A file that is
+constantly changing is a moving target for any sync tool, and a copy that never
+lands cleanly can leave you back at an older save. Two things about this are
+counter-intuitive and worth knowing: saving repeatedly "to be safe" makes it
+worse, and the blast radius is every game on the card, not just the one you were
+playing.
 
 If a save goes missing, suspect this first — it presents as *"the game didn't
 save"*, which sends you looking in entirely the wrong place.
@@ -32,16 +33,17 @@ save"*, which sends you looking in entirely the wrong place.
 
 Use a save format that writes one small file, or one small directory, per game.
 
-For PS2, PCSX2 supports **folder memory cards**: the card becomes a directory
-with one subfolder per game, and only real save data is stored. The game still
-sees a standard 8 MB card, so capacity behaves normally, and one folder card
-holds many games comfortably.
+Where the console used memory cards, check whether your emulator can store a
+card as a **directory** rather than a single image. Several can. The card becomes
+a folder with one subfolder per game, holding only real save data; the game still
+sees a normal card, so capacity behaves as it always did, and one card holds many
+games comfortably.
 
-To convert: pause syncing for that folder, copy the existing `.ps2` somewhere
-outside the synced directory, fully close the emulator, then use its
-convert-memory-card action. Check the game loads from the new card before you
-remove the old image, and move that image out of the synced folder so it is not
-still being transferred.
+To convert: pause syncing for that folder, copy the existing card image somewhere
+outside the synced directory, fully close the emulator, then use whatever
+convert or migrate option it offers. Check the game loads from the new card
+before you remove the old image, and move that image out of the synced folder so
+it is not still being transferred.
 
 ## Turn on file versioning
 
