@@ -22,6 +22,7 @@ import (
 var templateFuncs = template.FuncMap{
 	"nodeRowCtx":  nodeRowCtx,
 	"groupRowCtx": groupRowCtx,
+	"userRowCtx":  userRowCtx,
 }
 
 // nodeRowContext is the per-row template context: one node plus the shared

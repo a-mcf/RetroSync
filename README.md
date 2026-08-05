@@ -167,7 +167,18 @@ podman run --rm --network host \
 ```
 
 `user set <id> [--display NAME] [--role user|admin]` upserts a web user; run it
-once with `--role admin` to bootstrap. `--role` defaults to `user`.
+once with `--role admin` to bootstrap. On a **new** user `--role` defaults to
+`user`; on an **existing** one, a flag you don't pass leaves that field alone, so
+`user set alice` resets alice's password without touching her role — which is
+what makes it a usable recovery path for the only admin. The password must be at
+least 8 characters (the same rule the web forms apply).
+
+After that first admin exists, **everyone else is added in the app** — the
+admin-only **People** page (`/users`) adds people, edits display name and role,
+resets a password, and removes an account; every signed-in user can change their
+own password from **Account** (`/account`), which asks for the current one. The
+CLI stays as the bootstrap/recovery path — no more one-off pods just to add
+someone.
 
 ### Environment variables
 

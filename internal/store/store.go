@@ -27,6 +27,12 @@ var (
 	// ErrInvalidValue is returned when a field fails a domain/enum constraint:
 	// e.g. a bad role, kind, or reach (a CHECK violation).
 	ErrInvalidValue = errors.New("store: invalid value")
+	// ErrLastAdmin is returned when a write would leave the system with zero
+	// admins: deleting the only admin, or demoting them to `user`. It is a
+	// lockout guard, enforced INSIDE the write's transaction (see
+	// UpdateUserProfile / DeleteUser) so two concurrent demotes can't both observe
+	// "there is another admin" and strand the registry with none.
+	ErrLastAdmin = errors.New("store: last admin")
 )
 
 // Role is a user's authorization level. See docs/auth.md.
@@ -250,7 +256,36 @@ type Store interface {
 	CreateUser(ctx context.Context, u User) error
 	GetUser(ctx context.Context, id string) (User, error)
 	ListUsers(ctx context.Context) ([]User, error)
-	UpdateUser(ctx context.Context, u User) error
+	// The user updates are deliberately FIELD-SCOPED rather than one whole-row
+	// setter. A whole-row Update forces every caller into a read-modify-write, and
+	// those callers touch disjoint fields: the admin edit form writes display+role,
+	// the password paths write pw_hash. With a whole-row write, a password change
+	// that read the row before a concurrent demotion committed would write the old
+	// role back and silently un-demote the user — a privilege the operator
+	// explicitly revoked, restored by an unrelated write. Scoping the statement to
+	// the columns the caller actually means removes the interleaving entirely,
+	// rather than narrowing its window.
+
+	// UpdateUserProfile rewrites a user's display and role, LEAVING pw_hash
+	// untouched. Missing -> ErrNotFound; a bad role -> ErrInvalidValue. Demoting
+	// the ONLY admin (role leaving "admin" when no other admin exists) ->
+	// ErrLastAdmin: the write is refused so the system can never be left with
+	// nobody who can administer it. The check runs inside the same transaction as
+	// the update (and takes a lock over the admin rows), so concurrent demotes
+	// serialize instead of racing to zero admins.
+	UpdateUserProfile(ctx context.Context, id string, display string, role Role) error
+
+	// UpdateUserPassword replaces a user's pw_hash, LEAVING display and role
+	// untouched. Missing -> ErrNotFound. There is no last-admin guard because a
+	// password change cannot alter the admin count — which is the point: resetting
+	// the sole admin's password must never be entangled with the lockout guard.
+	UpdateUserPassword(ctx context.Context, id string, pwHash string) error
+	// DeleteUser removes a user. Missing -> ErrNotFound. Deleting the ONLY admin
+	// -> ErrLastAdmin (same in-transaction guard as UpdateUserProfile). A user who still
+	// owns nodes -> ErrInvalidReference: nodes.owner_user_id REFERENCES users (id)
+	// with NO on-delete action, deliberately — orphaning or cascading away a
+	// person's devices would be worse than refusing. Reassign or delete the nodes
+	// first.
 	DeleteUser(ctx context.Context, id string) error
 
 	// Nodes.

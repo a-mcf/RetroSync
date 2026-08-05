@@ -35,6 +35,29 @@ const (
 	saltLen      = 16        // per-hash random salt length (bytes)
 )
 
+// MinPasswordLen is the shortest password RetroSync accepts anywhere a password
+// is SET: the `user set` CLI bootstrap, the admin /users create + reset forms,
+// and the self-service change. Length is the only rule — no composition
+// requirements, which push people toward "P@ssw0rd!" — and 8 is the NIST 800-63B
+// floor. Login does NOT apply it: an existing shorter password must still be
+// able to sign in (and be changed).
+const MinPasswordLen = 8
+
+// ErrPasswordTooShort is returned by ValidatePassword for a password below
+// MinPasswordLen (including an empty one). Its message is safe to show a human.
+var ErrPasswordTooShort = fmt.Errorf("password must be at least %d characters", MinPasswordLen)
+
+// ValidatePassword reports whether a proposed password is acceptable to set. It
+// is the single rule shared by every path that sets a password, so the CLI and
+// the web UI can never drift apart. Length is measured in runes, so a short
+// non-ASCII passphrase isn't over-credited by its byte count.
+func ValidatePassword(password string) error {
+	if len([]rune(password)) < MinPasswordLen {
+		return ErrPasswordTooShort
+	}
+	return nil
+}
+
 // ErrInvalidHash is returned by Verify when the stored encoded hash is
 // malformed (wrong format, bad version, unparseable params, or corrupt
 // base64). It is distinct from "password did not match" so callers can tell a

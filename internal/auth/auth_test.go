@@ -106,3 +106,35 @@ func TestHashSaltedDiffers(t *testing.T) {
 		}
 	}
 }
+
+// TestValidatePassword pins the one shared set-a-password rule (used by the
+// `user set` CLI and every web password form): at least MinPasswordLen RUNES,
+// no composition requirements.
+func TestValidatePassword(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		wantErr  bool
+	}{
+		{"empty", "", true},
+		{"one-short", strings.Repeat("a", MinPasswordLen-1), true},
+		{"exactly-min", strings.Repeat("a", MinPasswordLen), false},
+		{"long-passphrase", "correct horse battery staple", false},
+		{"multibyte-counts-runes-not-bytes", strings.Repeat("é", MinPasswordLen-1), true},
+		{"multibyte-long-enough", strings.Repeat("é", MinPasswordLen), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePassword(tc.password)
+			if tc.wantErr {
+				if !errors.Is(err, ErrPasswordTooShort) {
+					t.Fatalf("ValidatePassword(%q) = %v, want ErrPasswordTooShort", tc.password, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidatePassword(%q) = %v, want nil", tc.password, err)
+			}
+		})
+	}
+}

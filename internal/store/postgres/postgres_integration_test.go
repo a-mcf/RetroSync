@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 
@@ -127,6 +128,66 @@ func TestPostgresMigrationRoundTrip(t *testing.T) {
 // Enum-rejection (bad role/kind/reach) and FK-rejection (missing owner/game/
 // node) are now exercised by the shared conformance suite (InvalidValue /
 // InvalidReference subtests), which runs against this Postgres store too.
+
+// TestPostgresConcurrentDemoteKeepsAnAdmin is the reason the last-admin guard
+// runs INSIDE the write's transaction (SELECT ... FOR UPDATE over the admin rows)
+// rather than as a read-then-write check in the handler: two admins demoting each
+// other at the same moment would otherwise BOTH observe "there is another admin"
+// and strand the system with zero.
+//
+// Two goroutines demote the two admins concurrently. Exactly one must win; the
+// loser must get store.ErrLastAdmin, and an admin must remain either way.
+func TestPostgresConcurrentDemoteKeepsAnAdmin(t *testing.T) {
+	pool := freshPool(t)
+	s := postgres.New(pool)
+	ctx := context.Background()
+
+	for round := 0; round < 5; round++ {
+		a := store.User{ID: "admin-a", Display: "A", PwHash: "h", Role: store.RoleAdmin}
+		b := store.User{ID: "admin-b", Display: "B", PwHash: "h", Role: store.RoleAdmin}
+		for _, u := range []store.User{a, b} {
+			// Re-promote (or create) so each round starts with exactly two admins.
+			if err := s.CreateUser(ctx, u); err != nil && !errors.Is(err, store.ErrConflict) {
+				t.Fatalf("seed %s: %v", u.ID, err)
+			}
+			if err := s.UpdateUserProfile(ctx, u.ID, u.Display, store.RoleAdmin); err != nil {
+				t.Fatalf("re-promote %s: %v", u.ID, err)
+			}
+		}
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		for _, u := range []store.User{a, b} {
+			go func(u store.User) {
+				<-start
+				errs <- s.UpdateUserProfile(ctx, u.ID, u.Display, store.RoleUser)
+			}(u)
+		}
+		close(start)
+		var wins, refusals int
+		for i := 0; i < 2; i++ {
+			switch err := <-errs; {
+			case err == nil:
+				wins++
+			case errors.Is(err, store.ErrLastAdmin):
+				refusals++
+			default:
+				t.Fatalf("unexpected demote error: %v", err)
+			}
+		}
+		if wins != 1 || refusals != 1 {
+			t.Fatalf("round %d: wins=%d refusals=%d, want exactly one of each", round, wins, refusals)
+		}
+
+		var admins int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'admin'`).Scan(&admins); err != nil {
+			t.Fatalf("count admins: %v", err)
+		}
+		if admins != 1 {
+			t.Fatalf("round %d: %d admins left, want exactly 1 (never zero)", round, admins)
+		}
+	}
+}
 
 // TestPostgresReachConfigNoSecret asserts the persisted reach_config JSON never
 // contains a cleartext secret field — only the secret_ref pointer.

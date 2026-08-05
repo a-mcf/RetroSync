@@ -1,0 +1,210 @@
+{{define "users"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — People</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // Let HTMX swap the 400/409/422 bodies so the refusal text (last admin,
+    // still owns devices, password too short) shows in place instead of
+    // vanishing into the console.
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      var s = e.detail.xhr.status;
+      if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync — People</h1>
+      <span class="who">
+        <a href="/">&larr; Dashboard</a> &nbsp;
+        <a href="/account">Account</a> &nbsp;
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <section>
+      <h2>People</h2>
+      <p class="sub">Admin-only. Everyone who can sign in to RetroSync. An
+         <strong>admin</strong> manages devices, syncs, and people; a
+         <strong>user</strong> sees their own syncs and resolves conflicts on
+         devices they own.</p>
+      {{template "users-list" .}}
+    </section>
+
+    <section>
+      <h2>Add a person</h2>
+      <form class="user-form card" hx-post="/api/users"
+            hx-target="#users-list" hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label>username <input type="text" name="id" required placeholder="alice"></label>
+        <label>display name <input type="text" name="display" placeholder="Alice (defaults to the username)"></label>
+        <label>role
+          <select name="role">
+            {{range .Roles}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </label>
+        <label>password
+          <input type="password" name="password" required autocomplete="new-password"
+                 minlength="{{.MinPasswordLen}}">
+        </label>
+        <p class="sub">At least {{.MinPasswordLen}} characters. They can change it
+           themselves from Account once they sign in.</p>
+        <p><button class="btn" type="submit">Save person</button></p>
+        <div class="form-error"></div>
+      </form>
+    </section>
+  </div>
+</body>
+</html>{{end}}
+
+{{define "users-list"}}
+<div id="users-list">
+  <p class="sub">{{len .Users}} {{if eq (len .Users) 1}}person{{else}}people{{end}}
+     &middot; {{.AdminCount}} admin{{if ne .AdminCount 1}}s{{end}}</p>
+  {{$root := .}}
+  {{range .Users}}
+    {{template "user-row" (userRowCtx $root .)}}
+  {{end}}
+</div>
+{{end}}
+
+{{define "user-row"}}
+{{$csrf := .CSRF}}{{$roles := .Roles}}{{$min := .MinPasswordLen}}{{with .User}}
+<div class="card user-card" id="user-{{.ID}}">
+  <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
+  <div class="sub">
+    role: {{.Role}}
+    &nbsp;|&nbsp; devices:
+    {{if .Devices}}<a href="/nodes">{{.Devices}}</a>{{else}}0{{end}}
+    {{if .IsSelf}}&nbsp;|&nbsp; <span class="badge ok">you</span>{{end}}
+    {{if .IsLastAdmin}}&nbsp;|&nbsp; <span class="badge warn">only admin</span>{{end}}
+  </div>
+
+  {{if .IsLastAdmin}}
+    <p class="sub">RetroSync will refuse to delete or demote the only admin —
+       make someone else an admin first.</p>
+  {{end}}
+
+  <div class="user-actions">
+    {{if .IsSelf}}
+      <span class="sub">This is you — change your own password on
+        <a href="/account">Account</a>.</span>
+    {{else}}
+      <form hx-post="/api/users/{{.ID}}/delete"
+            hx-target="#users-list" hx-swap="outerHTML"
+            hx-confirm="Remove {{.ID}}? Their devices stay registered.">
+        <input type="hidden" name="csrf_token" value="{{$csrf}}">
+        <button class="btn danger" type="submit">Delete</button>
+      </form>
+    {{end}}
+  </div>
+
+  <details>
+    <summary>Edit</summary>
+    <form class="user-form" hx-post="/api/users/{{.ID}}"
+          hx-target="#users-list" hx-swap="outerHTML">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <label>display name <input type="text" name="display" value="{{.Display}}"></label>
+      <label>role
+        <select name="role">
+          {{$role := .Role}}
+          {{range $roles}}<option value="{{.}}" {{if eq . $role}}selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      <p><button class="btn" type="submit">Save changes</button></p>
+    </form>
+  </details>
+
+  {{if not .IsSelf}}
+  <details>
+    <summary>Reset password</summary>
+    <form class="user-form" hx-post="/api/users/{{.ID}}/password"
+          hx-target="#users-list" hx-swap="outerHTML">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <label>new password
+        <input type="password" name="password" required autocomplete="new-password"
+               minlength="{{$min}}">
+      </label>
+      <p class="sub">At least {{$min}} characters. Signs {{.ID}} out everywhere.</p>
+      <p><button class="btn" type="submit">Save password</button></p>
+    </form>
+  </details>
+  {{end}}
+</div>
+{{end}}{{end}}
+
+{{define "account"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RetroSync — Account</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script>
+    // Show the 400/403 refusal text (wrong current password, mismatch, too
+    // short) in place rather than swallowing it.
+    document.addEventListener('htmx:beforeOnLoad', function (e) {
+      var s = e.detail.xhr.status;
+      if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
+    });
+  </script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  <div class="wrap">
+    <header class="top">
+      <h1>RetroSync — Account</h1>
+      <span class="who">
+        <a href="/">&larr; Dashboard</a> &nbsp;
+        {{.User.Display}} ({{.User.Role}})
+        &nbsp;
+        <form class="logout" method="post" action="/logout">
+          <button class="linkbtn" type="submit">Sign out</button>
+        </form>
+      </span>
+    </header>
+
+    <section>
+      <h2>Your account</h2>
+      <div class="card">
+        <h3>{{.User.Display}} <span class="sub">{{.User.ID}}</span></h3>
+        <div class="sub">role: {{.User.Role}}</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Change your password</h2>
+      {{if .Changed}}<p class="notice">Password changed. Any other device you
+         were signed in on has been signed out.</p>{{end}}
+      <form class="user-form card" hx-post="/api/account/password"
+            hx-target="#account-msg" hx-swap="innerHTML">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label>current password
+          <input type="password" name="current_password" required autocomplete="current-password">
+        </label>
+        <label>new password
+          <input type="password" name="new_password" required autocomplete="new-password"
+                 minlength="{{.MinPasswordLen}}">
+        </label>
+        <label>new password again
+          <input type="password" name="confirm_password" required autocomplete="new-password"
+                 minlength="{{.MinPasswordLen}}">
+        </label>
+        <p class="sub">At least {{.MinPasswordLen}} characters. Changing it signs
+           you out on every other device.</p>
+        <p><button class="btn" type="submit">Save new password</button></p>
+        <div class="form-error" id="account-msg"></div>
+      </form>
+    </section>
+  </div>
+</body>
+</html>{{end}}

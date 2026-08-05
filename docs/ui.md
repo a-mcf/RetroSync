@@ -185,6 +185,40 @@ sync", the remove confirm "Stop syncing this save file on `<device>`?", and
 only — the data model, form field names (`node_id`, `path`), API routes, and
 `docs/data-model.md` keep the precise terms (node, member).
 
+### `/users` — people
+
+Admin-only. Everyone who can sign in: display name, username, role, and how many
+**devices** they own (the count links to `/nodes`, because owning devices is
+exactly what blocks a delete). Per person: **Edit** (display name + role),
+**Reset password**, **Delete**. "Add a person" at the bottom takes a username,
+optional display name, role, and password, and commits with **Save person**.
+
+The refusals are the feature, and each says why in a sentence rather than
+throwing a 500:
+
+- The **only admin** cannot be deleted or demoted ("make someone else an admin
+  first, or nobody can manage RetroSync"). Their row is badged **only admin** so
+  it is visible before you click. Enforced in the store, inside the write's
+  transaction — two admins demoting each other at once cannot both win.
+- **You cannot delete yourself** — ask another admin.
+- A person who **still owns devices** cannot be deleted; the message names the
+  count and points at `/nodes` to reassign them. Devices are never
+  cascade-deleted or silently orphaned to make a user delete succeed.
+- An admin **resetting their own** password is sent to `/account` instead: a
+  reset skips proving you are still at the keyboard, which is fine for someone
+  else's forgotten password and not fine for your own.
+
+A password reset, a role change, and a delete all **sign that person out
+everywhere** (sessions are server-side, so they can be revoked).
+
+### `/account` — your account
+
+Every signed-in user, admin or not. Shows who you are signed in as and lets you
+**change your own password**, which requires your **current** password (a
+borrowed unlocked session is not enough). Changing it signs you out on every
+other device and rotates your session here. Linked from the header on the
+dashboard.
+
 ### `/nodes` — devices
 
 Per-node configuration UI (admin-only). Each node lists its

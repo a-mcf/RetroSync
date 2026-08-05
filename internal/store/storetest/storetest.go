@@ -31,6 +31,7 @@ func Run(t *testing.T, newStore Factory) {
 	}{
 		{"Users", testUsers},
 		{"DeleteUserOwningNode", testDeleteUserOwningNode},
+		{"LastAdminGuard", testLastAdminGuard},
 		{"Nodes", testNodes},
 		{"InvalidReference", testInvalidReference},
 		{"InvalidValue", testInvalidValue},
@@ -100,23 +101,41 @@ func testUsers(t *testing.T, s store.Store) {
 		t.Fatalf("GetUser(missing): want ErrNotFound, got %v", err)
 	}
 
-	// Update.
-	u.Display = "Bobby"
-	u.Role = store.RoleAdmin
-	if err := s.UpdateUser(c, u); err != nil {
-		t.Fatalf("UpdateUser: %v", err)
+	// Update the profile. pw_hash must survive untouched — the method does not
+	// take one, and a profile edit that reverted a password would be the same
+	// clobber in the other direction.
+	if err := s.UpdateUserProfile(c, "bob", "Bobby", store.RoleAdmin); err != nil {
+		t.Fatalf("UpdateUserProfile: %v", err)
 	}
 	got, _ = s.GetUser(c, "bob")
 	if got.Display != "Bobby" || got.Role != store.RoleAdmin {
-		t.Fatalf("UpdateUser not applied: %+v", got)
+		t.Fatalf("UpdateUserProfile not applied: %+v", got)
 	}
-	// Update missing -> not found.
-	if err := s.UpdateUser(c, store.User{ID: "ghost"}); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("UpdateUser(missing): want ErrNotFound, got %v", err)
+	if got.PwHash != u.PwHash {
+		t.Fatalf("UpdateUserProfile changed pw_hash: got %q, want %q", got.PwHash, u.PwHash)
+	}
+	// Update the password. display and role must survive untouched.
+	if err := s.UpdateUserPassword(c, "bob", "hash2"); err != nil {
+		t.Fatalf("UpdateUserPassword: %v", err)
+	}
+	got, _ = s.GetUser(c, "bob")
+	if got.PwHash != "hash2" {
+		t.Fatalf("UpdateUserPassword not applied: %+v", got)
+	}
+	if got.Display != "Bobby" || got.Role != store.RoleAdmin {
+		t.Fatalf("UpdateUserPassword changed the profile: %+v", got)
+	}
+	// Both missing -> not found.
+	if err := s.UpdateUserProfile(c, "ghost", "Ghost", store.RoleUser); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("UpdateUserProfile(missing): want ErrNotFound, got %v", err)
+	}
+	if err := s.UpdateUserPassword(c, "ghost", "h"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("UpdateUserPassword(missing): want ErrNotFound, got %v", err)
 	}
 
-	// List.
-	if err := s.CreateUser(c, store.User{ID: "alice", Display: "Alice", PwHash: "h", Role: store.RoleUser}); err != nil {
+	// List. Alice is an admin: bob was just promoted above, and the last-admin
+	// guard (see testLastAdminGuard) would otherwise refuse the delete below.
+	if err := s.CreateUser(c, store.User{ID: "alice", Display: "Alice", PwHash: "h", Role: store.RoleAdmin}); err != nil {
 		t.Fatalf("CreateUser alice: %v", err)
 	}
 	list, err := s.ListUsers(c)
@@ -175,6 +194,65 @@ func testDeleteUserOwningNode(t *testing.T, s store.Store) {
 	must(t, s.DeleteNode(c, "bob-deck"))
 	if err := s.DeleteUser(c, "carol"); err != nil {
 		t.Fatalf("DeleteUser after deleting node: %v", err)
+	}
+}
+
+// testLastAdminGuard asserts the lockout guard: the ONLY admin can be neither
+// deleted nor demoted (-> store.ErrLastAdmin, with the row left untouched), while
+// a second admin makes both operations legal again. This is the invariant that
+// keeps a household from locking itself out of its own registry.
+func testLastAdminGuard(t *testing.T, s store.Store) {
+	c := ctx()
+	admin := store.User{ID: "root", Display: "Root", PwHash: "h", Role: store.RoleAdmin}
+	must(t, s.CreateUser(c, admin))
+	mustUser(t, s, "plain") // a non-admin does not count toward the admin quorum
+
+	// Delete the sole admin -> refused, user survives.
+	if err := s.DeleteUser(c, "root"); !errors.Is(err, store.ErrLastAdmin) {
+		t.Fatalf("DeleteUser(last admin): want ErrLastAdmin, got %v", err)
+	}
+	if _, err := s.GetUser(c, "root"); err != nil {
+		t.Fatalf("refused DeleteUser must not remove the last admin: %v", err)
+	}
+
+	// Demote the sole admin -> refused, role unchanged.
+	if err := s.UpdateUserProfile(c, "root", admin.Display, store.RoleUser); !errors.Is(err, store.ErrLastAdmin) {
+		t.Fatalf("UpdateUserProfile(demote last admin): want ErrLastAdmin, got %v", err)
+	}
+	got, err := s.GetUser(c, "root")
+	if err != nil {
+		t.Fatalf("GetUser(root): %v", err)
+	}
+	if got.Role != store.RoleAdmin {
+		t.Fatalf("refused demote changed the role: %+v", got)
+	}
+
+	// A non-admin is freely deletable/updatable — the guard only counts admins.
+	must(t, s.UpdateUserProfile(c, "plain", "Plain", store.RoleUser))
+
+	// Resetting the SOLE admin's password is always allowed. This is the
+	// recovery path (`retrosync user set <id>` with no --role, and the /account
+	// form): it must never collide with the lockout guard, which is exactly what
+	// a whole-row update did — it carried role=user along and got refused.
+	must(t, s.UpdateUserPassword(c, "root", "h2"))
+	got, _ = s.GetUser(c, "root")
+	if got.Role != store.RoleAdmin || got.PwHash != "h2" {
+		t.Fatalf("password reset on the sole admin: %+v", got)
+	}
+	// A display-only edit on the sole admin is likewise allowed (role unchanged).
+	must(t, s.UpdateUserProfile(c, "root", "Root II", store.RoleAdmin))
+
+	// With a second admin, demote and delete both succeed.
+	must(t, s.CreateUser(c, store.User{ID: "second", Display: "Second", PwHash: "h", Role: store.RoleAdmin}))
+	must(t, s.UpdateUserProfile(c, "root", "Root II", store.RoleUser)) // second is still admin
+	if err := s.DeleteUser(c, "second"); !errors.Is(err, store.ErrLastAdmin) {
+		t.Fatalf("DeleteUser(now-last admin): want ErrLastAdmin, got %v", err)
+	}
+	// Promote root back so there are two admins, then the delete goes through.
+	must(t, s.UpdateUserProfile(c, "root", "Root II", store.RoleAdmin))
+	must(t, s.DeleteUser(c, "second"))
+	if _, err := s.GetUser(c, "second"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("after delete: want ErrNotFound, got %v", err)
 	}
 }
 

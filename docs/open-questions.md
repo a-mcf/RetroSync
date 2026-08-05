@@ -145,3 +145,17 @@ The `ssh` reach strategy has no adapter yet: `ssh` nodes resolve to
 locked-down devices (see "Writeback for syncthing-share nodes" above) is blocked on
 it. Building it means an ssh/sftp adapter with secret-store credential resolution
 (`reach_config.host/user/secret_ref`).
+
+## Sessions are per-process, so revocation is per-replica — OPEN
+
+Sessions live in an in-memory, token-keyed map inside the web server
+(`internal/web/session.go`). That makes them revocable — user management (slice
+36) destroys a user's sessions on password reset, role change, and delete, and
+rotates the caller's session on a self-service password change — but the map is
+**per process**: a restart logs everyone out (acceptable for a household tool),
+and with more than one replica a revocation reaches only the replica that served
+the request. RetroSync runs single-replica today. If it ever scales out (or if
+"stay logged in across a deploy" becomes wanted), the fix is a shared session
+store — a `sessions` table or Redis — behind the same `sessionManager` methods
+(`create` / `lookup` / `destroy` / `destroyUser`); nothing above that interface
+would change.
