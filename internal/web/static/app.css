@@ -10,9 +10,17 @@
    yourself adding a rule here, check whether Pico already styles the semantic
    element first — that is the whole point of adopting it. */
 
+/* The one value Pico has no token for: an amber that means "expected, but needs
+   you" — distinct from its del/ins red and green, which mean wrong and right. */
+:root { --rs-warn: #d9a441; }
+
 /* Muted secondary text. Pico's <small> handles size; this handles colour, for
    the places where the text is not small, only quieter. */
 .sub { color: var(--pico-muted-color); }
+
+/* The /syncs "Discover is the easy way" card is the one article on that page
+   that is advice rather than data, so it carries an accent rail. */
+.callout { border-left: 3px solid var(--pico-primary); }
 
 /* "Nothing here yet" states. Italic so they read as narration, not data. */
 .empty { color: var(--pico-muted-color); font-style: italic; }
@@ -35,7 +43,7 @@
 }
 .badge.ok   { color: var(--pico-ins-color); }
 .badge.bad  { color: var(--pico-del-color); }
-.badge.warn { color: #d9a441; }
+.badge.warn { color: var(--rs-warn); }
 
 /* A paused sync. The first-sync variant is deliberately amber, not red: a
    never-synced sync's first conflict is the last step of setup ("pick your
@@ -48,8 +56,8 @@
   margin-top: var(--pico-spacing);
 }
 .conflict.first-sync {
-  border-color: #d9a441;
-  background: color-mix(in srgb, #d9a441 8%, transparent);
+  border-color: var(--rs-warn);
+  background: color-mix(in srgb, var(--rs-warn) 8%, transparent);
 }
 .conflict button { margin: 0.75rem 0 0; }
 
@@ -111,8 +119,9 @@ td button, td a[role="button"] {
 .source-id { flex: 1; }
 .source-opt form { margin: 0; }
 
-/* Dialogs open by toggling the open attribute (see the openDialog helpers), so
-   they must not inherit a form's block margins. */
+/* Dialogs arrive from the server already carrying the open attribute (they are
+   HTMX fragments swapped into #modal), so they must not inherit a form's block
+   margins on the way in. */
 dialog article { margin: 0; }
 dialog article > footer { display: flex; gap: 0.5rem; justify-content: flex-end; }
 dialog article > footer button { margin: 0; width: auto; }
