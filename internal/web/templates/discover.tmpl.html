@@ -1,9 +1,10 @@
 {{define "discover"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — Discover</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -15,74 +16,83 @@
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <div class="wrap">
-    <header class="top">
-      <h1>RetroSync — Discover</h1>
-      <span class="who">
-        <a href="/">&larr; Dashboard</a> &nbsp;
-        <a href="/syncs">Syncs</a> &nbsp;
-        {{.User.Display}} ({{.User.Role}})
-        &nbsp;
-        <form class="logout" method="post" action="/logout">
-          <button class="linkbtn" type="submit">Sign out</button>
-        </form>
-      </span>
-    </header>
+  <main class="container">
+    <nav>
+      <ul><li><strong>RetroSync — Discover</strong></li></ul>
+      <ul>
+        <li><a href="/">&larr; Dashboard</a></li>
+        <li><a href="/syncs">Syncs</a></li>
+        <li class="whoami">
+          <small>{{.User.Display}} ({{.User.Role}})</small>
+          <form method="post" action="/logout">
+            <button class="linkbtn" type="submit">Sign out</button>
+          </form>
+        </li>
+      </ul>
+    </nav>
 
     <section>
-      <h2>Save files found across your devices</h2>
-      <p class="sub">Admin-only. RetroSync scanned every reachable device's save
-         directory and grouped the save files it found by an inferred game name.
-         Pick the copies you want to keep together (uncheck any that are really a
-         different person's save) and one-click create a sync. This scan is
-         read-only — nothing changes until you create a sync.</p>
+      <hgroup>
+        <h2>Save files found across your devices</h2>
+        <p>Admin-only. RetroSync scanned every reachable device's save directory
+           and grouped the save files it found by an inferred game name. Pick the
+           copies you want to keep together (uncheck any that are really a
+           different person's save) and one-click create a sync. This scan is
+           read-only — nothing changes until you create a sync.</p>
+      </hgroup>
       {{if not .Games}}
         <p class="empty">No un-synced save files were found. (Files already in a
            sync are not shown; ssh nodes aren't scanned yet.)</p>
       {{else}}
-        <p class="sub">When two devices each have their own save, RetroSync will
-           ask which one to start from before it mirrors anything.</p>
+        <p><small class="sub">When two devices each have their own save, RetroSync will
+           ask which one to start from before it mirrors anything.</small></p>
         {{$csrf := .CSRF}}
         {{range .Games}}
-          <div class="card game-card">
-            <h3>{{.Name}}</h3>
+          <article class="game-card">
+            <header><strong>{{.Name}}</strong></header>
             <form class="discover-create" hx-post="/api/discover/create-sync"
                   hx-swap="none">
               <input type="hidden" name="csrf_token" value="{{$csrf}}">
               <input type="hidden" name="game" value="{{.Name}}">
 
-              <ul class="discover-candidates">
-                {{range .Candidates}}
-                  <li>
-                    <label>
-                      <input type="checkbox" name="candidate" value="{{.Value}}" checked>
-                      <span class="member-node">{{.NodeID}}</span>
+              <table>
+                <thead>
+                  <tr><th scope="col">Keep</th><th scope="col">Device</th><th scope="col">Save file</th></tr>
+                </thead>
+                <tbody>
+                  {{range .Candidates}}
+                  <tr>
+                    <td><input type="checkbox" name="candidate" value="{{.Value}}" checked
+                               aria-label="include {{.NodeID}}"></td>
+                    <td>{{.NodeID}}</td>
+                    <td class="path-cell">
                       <code>{{.Path}}</code>
-                      <span class="sub">({{.Size}} B, {{.Mtime}})</span>
-                    </label>
-                  </li>
-                {{end}}
-              </ul>
+                      <br><small class="sub">{{.Size}} B, {{.Mtime}}</small>
+                    </td>
+                  </tr>
+                  {{end}}
+                </tbody>
+              </table>
 
-              <div class="discover-meta">
-                <label>sync name
-                  <input type="text" name="name" value="Main" placeholder="Main"></label>
-              </div>
-              <details class="advanced">
+              <label>Sync name
+                <input type="text" name="name" value="Main" placeholder="Main">
+              </label>
+              <details>
                 <summary>Advanced</summary>
-                <label>id
+                <label>Id
                   <input type="text" name="id" value="{{.DefaultSyncID}}"
-                         placeholder="{{.DefaultSyncID}}"></label>
-                <p class="sub">Id is optional — leave blank to auto-generate a slug
-                   from the game + sync name.</p>
+                         placeholder="{{.DefaultSyncID}}">
+                </label>
+                <small class="sub">Id is optional — leave blank to auto-generate a slug
+                   from the game + sync name.</small>
               </details>
-              <p><button class="btn" type="submit">Create sync</button></p>
+              <button type="submit">Create sync</button>
               <div class="form-error"></div>
             </form>
-          </div>
+          </article>
         {{end}}
       {{end}}
     </section>
-  </div>
+  </main>
 </body>
 </html>{{end}}

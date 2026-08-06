@@ -1,52 +1,59 @@
 {{define "conflict-modal"}}
-<div class="modal-backdrop" id="modal-backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-label="{{if .FirstSync}}Choose your starting save for{{else}}Resolve conflict for{{end}} {{if .Game}}{{.Game}}{{else}}sync{{end}}">
-    <div class="modal-head">
-      <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}} — {{if .FirstSync}}choose your starting save{{else}}sync paused{{end}}</h3>
-      <button class="modal-close" type="button"
-              aria-label="Close"
-              onclick="document.getElementById('modal').innerHTML='';">&times;</button>
-    </div>
+<!-- Native <dialog>, styled by Pico. Rendered with the open attribute because
+     the fragment is swapped in already-visible; closing empties the mount, so
+     there is no stale dialog left in the DOM. -->
+<dialog open id="conflict-dialog"
+        aria-label="{{if .FirstSync}}Choose your starting save for{{else}}Resolve conflict for{{end}} {{if .Game}}{{.Game}}{{else}}sync{{end}}">
+  <article>
+    <header>
+      <button aria-label="Close" rel="prev" type="button"
+              onclick="document.getElementById('modal').innerHTML='';"></button>
+      <p>
+        <strong>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</strong><br>
+        <small>{{if .FirstSync}}choose your starting save{{else}}sync paused{{end}}</small>
+      </p>
+    </header>
+
     {{if .FirstSync}}
     <p>Your devices hold different saves for this game. That's expected — playing
        it once on each device is how the save files got here. Pick the one to
        continue from:</p>
-    <p class="sub">That save becomes the starting point on every device. Each
+    <p><small class="sub">That save becomes the starting point on every device. Each
        other device's current save is snapshotted to RetroSync's save history
        first, so you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if
-       you picked wrong.</p>
+       you picked wrong.</small></p>
     {{else}}
     <p>More than one device changed since the last sync.
        <strong>retrosync won't choose for you.</strong> Pick a winner:</p>
-    <p class="sub">The winner's save is copied to every other device. Each other
+    <p><small class="sub">The winner's save is copied to every other device. Each other
        device's current save is snapshotted to RetroSync's save history first, so
-       you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if needed.</p>
+       you can <a href="/syncs/{{.SyncID}}/history">restore it</a> if needed.</small></p>
     {{end}}
+
     <ul class="source-list">
       {{range .Nodes}}
-      <li>
-        <div class="source-opt">
-          <span class="source-id">{{.NodeID}}</span>
-          <span class="source-mtime">
-            {{if .Present}}{{.Mtime}}, {{.Size}}{{else}}no save{{end}}
-          </span>
-          {{if .Present}}
-          <form hx-post="/api/syncs/{{$.SyncID}}/resolve-conflict"
-                hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
-                hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
-            <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-            <input type="hidden" name="winner_node_id" value="{{.NodeID}}">
-            <button class="btn" type="submit">Use {{.NodeID}}</button>
-          </form>
-          {{end}}
-        </div>
+      <li class="source-opt">
+        <span class="source-id">{{.NodeID}}</span>
+        <small class="sub">
+          {{if .Present}}{{.Mtime}}, {{.Size}}{{else}}no save{{end}}
+        </small>
+        {{if .Present}}
+        <form hx-post="/api/syncs/{{$.SyncID}}/resolve-conflict"
+              hx-target="#dashboard" hx-swap="outerHTML" hx-select="#dashboard"
+              hx-on::after-request="if(event.detail.successful) document.getElementById('modal').innerHTML='';">
+          <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+          <input type="hidden" name="winner_node_id" value="{{.NodeID}}">
+          <button type="submit">Use {{.NodeID}}</button>
+        </form>
+        {{end}}
       </li>
       {{end}}
     </ul>
-    <div class="modal-actions">
-      <button class="linkbtn" type="button"
+
+    <footer>
+      <button class="secondary" type="button"
               onclick="document.getElementById('modal').innerHTML='';">Cancel</button>
-    </div>
-  </div>
-</div>
+    </footer>
+  </article>
+</dialog>
 {{end}}

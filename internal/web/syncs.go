@@ -523,3 +523,104 @@ func (s *Server) refreshSyncsList(w http.ResponseWriter, r *http.Request, u stor
 		s.logger.ErrorContext(r.Context(), "refresh syncs render failed", "err", err.Error())
 	}
 }
+
+// --- GET /syncs/{id}/member-editor (the member <dialog>) -----------------
+
+// memberEditorData drives the member editor dialog.
+type memberEditorData struct {
+	SyncID   string
+	Game     string
+	SyncName string
+	// NodeID is the member being edited. EMPTY means "add a device", and the
+	// difference between the two modes is only whether the device is fixed or
+	// chosen — the fields, the picker and the submit target are otherwise the
+	// same, which is why one template serves both.
+	NodeID string
+	Path   string
+	// Nodes offers the device choice in add mode: every registered node that is
+	// not already a member of this sync (a repeat would silently upsert the
+	// existing member's path rather than add anything).
+	Nodes []string
+	CSRF  string
+}
+
+// handleMemberEditor serves the member editor as a <dialog> fragment, swapped
+// into the syncs page's #modal mount — the same shape as the conflict modal.
+//
+// Why a dialog rather than editing in place: setting a member's path offers the
+// Browse picker, which is a scrolling file tree. That does not fit in a table
+// row, and putting it there is what made the old member rows sprawl. Keeping the
+// row read-only until an explicit Edit also means the page can show a sync's
+// configuration without simultaneously offering to change it — the path is no
+// longer a live <input> that can be nudged by accident.
+//
+// Read-only GET, admin-gated by the route wrapper like the rest of the registry.
+// It writes nothing, so there is no CSRF token to check on the way in; the forms
+// it renders carry one for their own POSTs.
+func (s *Server) handleMemberEditor(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sy, err := s.store.GetSync(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "no such sync", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "member editor: load sync failed", "sync", id, "err", err.Error())
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	members, err := s.store.ListSyncMembers(r.Context(), id)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "member editor: list members failed", "sync", id, "err", err.Error())
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	data := memberEditorData{
+		SyncID:   id,
+		Game:     sy.Game,
+		SyncName: sy.Name,
+		NodeID:   strings.TrimSpace(r.URL.Query().Get("node")),
+		CSRF:     s.csrfFor(r),
+	}
+
+	if data.NodeID != "" {
+		// Edit mode: the member must exist, so a stale row's Edit link 404s
+		// rather than silently turning into an add.
+		found := false
+		for _, m := range members {
+			if m.NodeID == data.NodeID {
+				data.Path, found = m.Path, true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "no such member", http.StatusNotFound)
+			return
+		}
+	} else {
+		// Add mode: offer only nodes that are not already members.
+		taken := make(map[string]bool, len(members))
+		for _, m := range members {
+			taken[m.NodeID] = true
+		}
+		nodes, err := s.store.ListNodes(r.Context())
+		if err != nil {
+			s.logger.ErrorContext(r.Context(), "member editor: list nodes failed", "err", err.Error())
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for _, n := range nodes {
+			if !taken[n.ID] {
+				data.Nodes = append(data.Nodes, n.ID)
+			}
+		}
+		sort.Strings(data.Nodes)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.templates.ExecuteTemplate(w, "member-editor", data); err != nil {
+		s.logger.ErrorContext(r.Context(), "member editor render failed", "err", err.Error())
+	}
+}

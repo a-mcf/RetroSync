@@ -1,9 +1,10 @@
 {{define "history"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — Save history</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -18,46 +19,57 @@
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <div class="wrap" id="history">
-    <header class="top">
-      <h1>Save history</h1>
-      <span class="who"><a href="/">&larr; Dashboard</a></span>
-    </header>
+  <main class="container" id="history">
+    <nav>
+      <ul><li><strong>Save history</strong></li></ul>
+      <ul><li><a href="/">&larr; Dashboard</a></li></ul>
+    </nav>
 
     <section>
-      <h2>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</h2>
-      <p class="sub">Every time RetroSync is about to overwrite a save (a normal
-         propagation or a conflict resolution), it snapshots the about-to-be-
-         overwritten bytes here first. Restore makes a snapshot the current save
-         everywhere — a one-click undo for a bad sync.</p>
+      <hgroup>
+        <h2>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</h2>
+        <p>Every time RetroSync is about to overwrite a save (a normal
+           propagation or a conflict resolution), it snapshots the about-to-be-
+           overwritten bytes here first. Restore makes a snapshot the current save
+           everywhere — a one-click undo for a bad sync.</p>
+      </hgroup>
 
       {{if not .Members}}
         <p class="empty">This sync has no members.</p>
       {{else}}
         {{range .Members}}
-        <div class="card">
-          <h3>{{.NodeID}}</h3>
+        <article>
+          <header><strong>{{.NodeID}}</strong></header>
           {{if not .Versions}}
             <p class="empty">No saved versions yet.</p>
           {{else}}
-          <ul class="version-list">
-            {{range .Versions}}
-            <li class="version-row">
-              <span class="version-meta">{{.When}} &middot; {{.Reason}} &middot; {{.Size}}</span>
-              <form class="restore-form"
-                    hx-post="/api/syncs/{{$.SyncID}}/versions/{{.Seq}}/restore"
-                    hx-swap="none">
-                <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-                <button class="btn" type="submit">Restore</button>
-              </form>
-            </li>
-            {{end}}
-          </ul>
+          <table>
+            <thead>
+              <tr><th scope="col">When</th><th scope="col">Why</th><th scope="col">Size</th><th></th></tr>
+            </thead>
+            <tbody>
+              {{range .Versions}}
+              <tr>
+                <td>{{.When}}</td>
+                <td><small class="sub">{{.Reason}}</small></td>
+                <td><small>{{.Size}}</small></td>
+                <td>
+                  <form class="restore-form"
+                        hx-post="/api/syncs/{{$.SyncID}}/versions/{{.Seq}}/restore"
+                        hx-swap="none">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+                    <button type="submit">Restore</button>
+                  </form>
+                </td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
           {{end}}
-        </div>
+        </article>
         {{end}}
       {{end}}
     </section>
-  </div>
+  </main>
 </body>
 </html>{{end}}

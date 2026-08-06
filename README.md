@@ -89,9 +89,11 @@ RetroSync is a single **Go 1.23** service backed by **Postgres**.
   the changed members: 0 → noop, exactly 1 distinct hash → propagate to the
   others, 2+ distinct hashes → conflict + pause.
 - **Web UI.** stdlib `net/http` + `html/template` + **HTMX** — server-rendered
-  fragments, no SPA, no build step. The dashboard is a **status view** (it shows
-  what each device holds and whether a sync is paused); the only state-changing
-  controls are **Resolve conflict** and **Restore**.
+  fragments, no SPA, no build step. Styled with **Pico CSS** (vendored, semantic
+  markup rather than utility classes) plus a thin RetroSync layer. The dashboard
+  is a **status view** (it shows what each device holds and whether a sync is
+  paused); the only state-changing controls are **Resolve conflict** and
+  **Restore**.
 - **Auth.** Username + password with **argon2id** (OWASP-baseline params,
   constant-time verify), server-side sessions (`HttpOnly`/`Secure`/`SameSite=Lax`
   cookie), and a per-session **CSRF** token on every state-changing POST.

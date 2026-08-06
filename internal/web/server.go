@@ -292,6 +292,11 @@ func (s *Server) Handler() http.Handler {
 	// its MEMBERS (node + path), all managed via POST (not PUT/DELETE) to stay
 	// consistent with the existing form/HTMX style.
 	mux.Handle("GET /syncs", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleSyncsPage))))
+	// The member editor <dialog> fragment: ?node=<id> edits that member, no node
+	// adds one. Read-only GET (it renders a form, it does not act on one), so it
+	// is admin-gated like the rest of the registry but carries no CSRF check —
+	// the forms inside it do.
+	mux.Handle("GET /syncs/{id}/member-editor", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleMemberEditor))))
 
 	// Sync registry mutations. Same admin + CSRF wrapping. Note these are distinct
 	// from the engine-side /api/syncs/{id}/resolve-conflict route above: that

@@ -1,6 +1,9 @@
 # UI
 
-HTMX + server-rendered HTML. No build step. One CSS file. Optimized for "I'm sitting on the couch with a Deck and want it to just work."
+HTMX + server-rendered HTML, no build step. **RetroSync is an admin console**,
+operated from a desktop browser: register devices, wire up syncs, resolve the
+occasional conflict, browse save history. It is not operated from the couch —
+devices are hands-off by design, which is the entire point of auto-mirror.
 
 > **Auto-mirror (slice 18).** There are **no Play / Done / Take-over buttons** and
 > **no activation modal**. Every sync mirrors automatically; the dashboard is a
@@ -178,9 +181,27 @@ sync, manage save files (a device + the path on it), and **rename/relabel** or
 **delete** the sync (delete is refused on a conflicted sync). No game CRUD — there
 is no games table. Most users live on `/`.
 
+**A sync's members are a read-only table until you ask to change them.** Each row
+is device + save file as text, with an **Edit** button; **Add a device** sits
+below. Both open the same `<dialog>`, served by
+`GET /syncs/{id}/member-editor` (`?node=` edits that member, no node adds one),
+swapped into the page's `#modal` mount exactly like the conflict modal. The two
+modes differ only in whether the device is fixed or chosen from a `<select>`, so
+they are one template and one endpoint. **Stop syncing this device** lives in the
+dialog's footer, quiet and behind a confirm.
+
+Why a dialog rather than editing in the row: setting a path offers the **Browse**
+picker, which is a scrolling file tree that does not fit in a table row. Trying to
+put it there is what made the old member rows sprawl. The read state matters
+independently — previously every path was a live `<input>` with a Save button
+always present, so the page could not show a sync's configuration without
+simultaneously offering to mutate it, and a path could be nudged by accident.
+(The disclosure on each sync is now **"Rename or delete this sync"** — it used to
+say "Edit / delete sync" while the actual editing sat outside it.)
+
 **Display language.** The visible UI says **device** (not "node") and **save file**
-(not "member"): the member-add label is "save file", the button "Add device to
-sync", the remove confirm "Stop syncing this save file on `<device>`?", and
+(not "member"): the member editor's field is "Save file", its commit is "Save
+device", the remove confirm is "Stop syncing this save file on `<device>`?", and
 `/nodes` reads "Registered devices" / "Add a device". These are display strings
 only — the data model, form field names (`node_id`, `path`), API routes, and
 `docs/data-model.md` keep the precise terms (node, member).
@@ -239,13 +260,38 @@ share root surfaces as a friendly in-place message, not an error. This mirrors t
 `/syncs` member **Browse** picker (which selects a save *file* on a specific node);
 the two share one fragment, parameterized folder-select vs file-select.
 
-## Couch ergonomics
+## Design language
 
-- Big tap targets. The dashboard's primary action — **Resolve conflict** when a
-  sync is paused — should be the largest, most obvious thing on a conflicted card.
-- Touch-friendly modal close (×) corners.
-- Dark mode by default.
-- Keyboard nav nice-to-have, not required.
+**RetroSync uses [Pico CSS](https://picocss.com) v2, vendored** as
+`internal/web/static/pico.min.css` and loaded before `app.css`. Pico is a plain
+stylesheet — no build step, no framework — and it is semantic-first, so the
+markup carries the meaning and Pico supplies the look. That matters here because
+HTMX swaps fragments of this markup by hand.
+
+The rules that follow from adopting it:
+
+- **Write semantic HTML and let Pico style it.** `<article>` is a card, `<nav>`
+  is the header, `<details>` is a disclosure, `<dialog>` is a modal, `<table>` is
+  a table. Reach for a class only when Pico has no opinion.
+- **`app.css` is RetroSync's layer only** — status badges, the two conflict
+  banners, the save-file picker, the compact size for table row actions. If you
+  are adding a rule, first check whether Pico already styles the element. The
+  file is ~120 lines including comments and should stay near that.
+- **Express values in Pico's custom properties** (`--pico-spacing`,
+  `--pico-muted-color`, `--pico-border-radius`, …) rather than hard numbers, so
+  the two layers cannot drift.
+- **Desktop density.** There is no touch sizing. An earlier version of this doc
+  assumed syncing would be operated by hand on the device, and sized every
+  control for a thumb (`min-height: 48px` on everything); the assumption was
+  wrong and the result read as blown-up on the screen actually used. If a screen
+  ever genuinely needs coarse-pointer sizing, scope it to
+  `@media (pointer: coarse)` rather than applying it to everything.
+- **Dark by default** — `<html data-theme="dark">` on every page.
+- **Destructive actions are the quietest control on the screen**, never a filled
+  red button. Delete/remove is `class="secondary outline"`, lives inside the
+  disclosure or dialog that owns the thing, and keeps its `hx-confirm`.
+- Keyboard nav is a nice-to-have, not a requirement — but native `<dialog>`
+  brings Esc and focus trapping for free, so don't hand-roll a modal and lose it.
 
 ## States the UI must surface clearly
 

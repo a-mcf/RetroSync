@@ -1,9 +1,10 @@
 {{define "nodes"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — Devices</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -27,6 +28,16 @@
       var s = e.detail.xhr.status;
       if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
     });
+    // A swapped-in nodes list carries fresh edit forms, so re-apply the
+    // reach-field reveal to them (DOMContentLoaded has long since fired).
+    document.addEventListener('htmx:afterSwap', function (e) {
+      if (!e.target || !e.target.querySelectorAll) return;
+      e.target.querySelectorAll('form.node-form').forEach(function (f) {
+        syncReachFields(f);
+        var sel = f.querySelector('[name=reach]');
+        if (sel) sel.addEventListener('change', function () { syncReachFields(f); });
+      });
+    });
     // Server folder picker (slice-29): clicking "Use this folder" fills the sibling
     // syncthing-share path input with the current folder's ABSOLUTE path (rendered
     // server-side into data-abs, since the client can't know the share root) and
@@ -49,73 +60,78 @@
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <div class="wrap">
-    <header class="top">
-      <h1>RetroSync — Devices</h1>
-      <span class="who">
-        <a href="/">&larr; Dashboard</a> &nbsp;
-        {{.User.Display}} ({{.User.Role}})
-        &nbsp;
-        <form class="logout" method="post" action="/logout">
-          <button class="linkbtn" type="submit">Sign out</button>
-        </form>
-      </span>
-    </header>
+  <main class="container">
+    <nav>
+      <ul><li><strong>RetroSync — Devices</strong></li></ul>
+      <ul>
+        <li><a href="/">&larr; Dashboard</a></li>
+        <li class="whoami">
+          <small>{{.User.Display}} ({{.User.Role}})</small>
+          <form method="post" action="/logout">
+            <button class="linkbtn" type="submit">Sign out</button>
+          </form>
+        </li>
+      </ul>
+    </nav>
 
     <section>
-      <h2>Registered devices</h2>
-      <p class="sub">Admin-only. Add a device, edit its reach config, run a
-         reachability smoke-test, or remove it.</p>
+      <hgroup>
+        <h2>Registered devices</h2>
+        <p>Admin-only. Add a device, edit its reach config, run a reachability
+           smoke-test, or remove it.</p>
+      </hgroup>
       {{template "nodes-list" .}}
     </section>
 
     <section>
       <h2>Add a device</h2>
-      <form class="node-form card" hx-post="/api/nodes"
-            hx-target="#nodes-list" hx-swap="outerHTML">
-        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-        <label>id <input type="text" name="id" required placeholder="bob-deck"></label>
-        <label>display <input type="text" name="display" required placeholder="Bob's Deck"></label>
-        <label>owner
-          <select name="owner_user_id">
-            <option value="">(shared / none)</option>
-            {{range .Owners}}<option value="{{.}}">{{.}}</option>{{end}}
-          </select>
-        </label>
-        <label>kind
-          <select name="kind">
-            {{range .Kinds}}<option value="{{.}}">{{.}}</option>{{end}}
-          </select>
-        </label>
-        <label>reach
-          <select name="reach">
-            {{range .Reaches}}<option value="{{.}}">{{.}}</option>{{end}}
-          </select>
-        </label>
-        <div data-reach="syncthing-share">
-          <label>path <input type="text" name="path" placeholder="/shares/bob-deck-saves"></label>
-          <!-- Server folder picker (slice-29): browse the server's share mount and
-               click "Use this folder" to fill the absolute path above, instead of
-               typing it. The panel is the next sibling. The manual field stays as a
-               fallback. -->
-          <button class="btn node-browse" type="button"
-                  hx-get="/api/server/browse?path="
-                  hx-target="next .browse-panel" hx-swap="innerHTML">Browse…</button>
-          <div class="browse-panel"></div>
-        </div>
-        <div data-reach="ssh">
-          <label>host <input type="text" name="host" placeholder="172.16.7.12"></label>
-          <label>user <input type="text" name="user" placeholder="root"></label>
-          <!-- secret_ref is a NAME into the host secret store, never a password. -->
-          <label>secret_ref <input type="text" name="secret_ref" placeholder="mister-1"></label>
-          <p class="sub">secret_ref names a credential in the host secret store.
-             Never paste a password or key here.</p>
-        </div>
-        <p><button class="btn" type="submit">Add device</button></p>
-        <div class="form-error"></div>
-      </form>
+      <article>
+        <form class="node-form" hx-post="/api/nodes"
+              hx-target="#nodes-list" hx-swap="outerHTML">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <label>Id <input type="text" name="id" required placeholder="bob-deck"></label>
+          <label>Display <input type="text" name="display" required placeholder="Bob's Deck"></label>
+          <label>Owner
+            <select name="owner_user_id">
+              <option value="">(shared / none)</option>
+              {{range .Owners}}<option value="{{.}}">{{.}}</option>{{end}}
+            </select>
+          </label>
+          <label>Kind
+            <select name="kind">
+              {{range .Kinds}}<option value="{{.}}">{{.}}</option>{{end}}
+            </select>
+          </label>
+          <label>Reach
+            <select name="reach">
+              {{range .Reaches}}<option value="{{.}}">{{.}}</option>{{end}}
+            </select>
+          </label>
+          <div data-reach="syncthing-share">
+            <label>Path <input type="text" name="path" placeholder="/shares/bob-deck-saves"></label>
+            <!-- Server folder picker (slice-29): browse the server's share mount and
+                 click "Use this folder" to fill the absolute path above, instead of
+                 typing it. The panel is the next sibling. The manual field stays as a
+                 fallback. -->
+            <button class="secondary outline node-browse" type="button"
+                    hx-get="/api/server/browse?path="
+                    hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+            <div class="browse-panel"></div>
+          </div>
+          <div data-reach="ssh">
+            <label>Host <input type="text" name="host" placeholder="172.16.7.12"></label>
+            <label>User <input type="text" name="user" placeholder="root"></label>
+            <!-- secret_ref is a NAME into the host secret store, never a password. -->
+            <label>Secret ref <input type="text" name="secret_ref" placeholder="mister-1"></label>
+            <small class="sub">secret_ref names a credential in the host secret store.
+               Never paste a password or key here.</small>
+          </div>
+          <button type="submit">Add device</button>
+          <div class="form-error"></div>
+        </form>
+      </article>
     </section>
-  </div>
+  </main>
 </body>
 </html>{{end}}
 
@@ -134,68 +150,72 @@
 
 {{define "node-row"}}
 {{$csrf := .CSRF}}{{$owners := .Owners}}{{$kinds := .Kinds}}{{$reaches := .Reaches}}{{with .Node}}
-<div class="card node-card" id="node-{{.ID}}">
-  <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
-  <div class="sub">
+<article class="node-card" id="node-{{.ID}}">
+  <header>
+    <strong>{{.Display}}</strong> <small class="sub">{{.ID}}</small>
+  </header>
+  <p><small class="sub">
     kind: {{.Kind}} &nbsp;|&nbsp; reach: {{.Reach}}
     &nbsp;|&nbsp; owner: {{if .OwnerUserID}}{{.OwnerUserID}}{{else}}(shared){{end}}
-  </div>
+  </small></p>
 
-  <div class="node-actions">
-    <button class="btn" type="button"
+  <p>
+    <button class="secondary outline" type="button"
             hx-post="/api/nodes/{{.ID}}/smoke-test"
             hx-target="#smoke-{{.ID}}" hx-swap="innerHTML">Test</button>
     <span id="smoke-{{.ID}}" class="smoke-result"></span>
-    <form hx-post="/api/nodes/{{.ID}}/delete"
-          hx-target="#nodes-list" hx-swap="outerHTML"
-          hx-confirm="Delete device {{.ID}}?">
-      <input type="hidden" name="csrf_token" value="{{$csrf}}">
-      <button class="btn danger" type="submit">Delete</button>
-    </form>
-  </div>
+  </p>
 
   <details>
-    <summary>Edit</summary>
+    <summary>Edit or remove</summary>
     <form class="node-form" hx-post="/api/nodes/{{.ID}}"
           hx-target="#nodes-list" hx-swap="outerHTML">
       <input type="hidden" name="csrf_token" value="{{$csrf}}">
-      <label>display <input type="text" name="display" value="{{.Display}}" required></label>
-      <label>owner
+      <label>Display <input type="text" name="display" value="{{.Display}}" required></label>
+      <label>Owner
         <select name="owner_user_id">
           <option value="" {{if not .OwnerUserID}}selected{{end}}>(shared / none)</option>
           {{$owner := .OwnerUserID}}
           {{range $owners}}<option value="{{.}}" {{if eq . $owner}}selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
-      <label>kind
+      <label>Kind
         <select name="kind">
           {{$kind := .Kind}}
           {{range $kinds}}<option value="{{.}}" {{if eq . $kind}}selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
-      <label>reach
+      <label>Reach
         <select name="reach">
           {{$reach := .Reach}}
           {{range $reaches}}<option value="{{.}}" {{if eq . $reach}}selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
       <div data-reach="syncthing-share">
-        <label>path <input type="text" name="path" value="{{.Path}}"></label>
+        <label>Path <input type="text" name="path" value="{{.Path}}"></label>
         <!-- Server folder picker (slice-29): same as the add form above. -->
-        <button class="btn node-browse" type="button"
+        <button class="secondary outline node-browse" type="button"
                 hx-get="/api/server/browse?path="
-                hx-target="next .browse-panel" hx-swap="innerHTML">Browse…</button>
+                hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
         <div class="browse-panel"></div>
       </div>
       <div data-reach="ssh">
-        <label>host <input type="text" name="host" value="{{.Host}}"></label>
-        <label>user <input type="text" name="user" value="{{.SSHUser}}"></label>
-        <label>secret_ref <input type="text" name="secret_ref" value="{{.SecretRef}}"></label>
+        <label>Host <input type="text" name="host" value="{{.Host}}"></label>
+        <label>User <input type="text" name="user" value="{{.SSHUser}}"></label>
+        <label>Secret ref <input type="text" name="secret_ref" value="{{.SecretRef}}"></label>
       </div>
-      <p><button class="btn" type="submit">Save changes</button></p>
+      <button type="submit">Save changes</button>
+    </form>
+    <!-- Destructive, so it is the quietest control on the card and lives behind
+         the same disclosure as the editing rather than shouting from the row. -->
+    <form hx-post="/api/nodes/{{.ID}}/delete"
+          hx-target="#nodes-list" hx-swap="outerHTML"
+          hx-confirm="Delete device {{.ID}}?">
+      <input type="hidden" name="csrf_token" value="{{$csrf}}">
+      <button class="secondary outline" type="submit">Delete this device</button>
     </form>
   </details>
-</div>
+</article>
 {{end}}{{end}}
 
 {{define "smoke-result"}}
@@ -203,20 +223,21 @@
 {{end}}
 
 {{define "forbidden"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — Forbidden</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <div class="wrap">
-    <header class="top"><h1>Admins only</h1></header>
-    <section>
-      <p class="empty">This page is restricted to administrators.</p>
-      <p><a href="/">&larr; Back to the dashboard</a></p>
-    </section>
-  </div>
+  <main class="container">
+    <hgroup>
+      <h1>Admins only</h1>
+      <p>This page is restricted to administrators.</p>
+    </hgroup>
+    <p><a href="/">&larr; Back to the dashboard</a></p>
+  </main>
 </body>
 </html>{{end}}

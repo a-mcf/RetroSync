@@ -1,9 +1,10 @@
 {{define "syncs"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — Syncs</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -12,7 +13,7 @@
       var s = e.detail.xhr.status;
       if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
     });
-    // The "add a member" form targets POST /api/syncs/{id}/members/{node_id},
+    // The member editor's "add" mode targets POST /api/syncs/{id}/members/{node_id},
     // but node_id is chosen from a <select> at submit time. Rewrite the request
     // path to include the selected node id just before HTMX fires the request.
     document.addEventListener('htmx:configRequest', function (e) {
@@ -27,24 +28,21 @@
         delete e.detail.parameters['node_id'];
       }
       // The "Browse…" button's hx-get path has a placeholder node id ("_"); splice
-      // in the node currently chosen in the sibling member-add <select> so the
-      // picker browses THAT node's save directory. Preserve any ?path= the button
-      // already carries (folder re-browse links set it on the panel buttons, not
-      // here — this only fires for the top-level Browse button).
+      // in the node this editor is for — either the fixed one it was opened with
+      // (edit mode) or whatever the device <select> currently holds (add mode) —
+      // so the picker browses THAT node's save directory.
       var bbase = el.getAttribute && el.getAttribute('data-browse-base');
       if (bbase) {
-        // The node <select> lives in the per-sync "add" form (.member-add) OR, on
-        // the one-shot manual create form, in the enclosing member row
-        // (.member-row-new) — closest() picks whichever is nearer so each row
-        // browses its OWN selected device.
-        var form = el.closest('.member-add, .member-row-new');
+        var form = el.closest('.member-editor-form, .member-row-new');
+        var fixed = form && form.getAttribute('data-node-id');
         var sel = form && form.querySelector('[name=node_id]');
-        if (sel && sel.value) {
-          e.detail.path = bbase + '/' + encodeURIComponent(sel.value) + '/browse';
+        var node = fixed || (sel && sel.value);
+        if (node) {
+          e.detail.path = bbase + '/' + encodeURIComponent(node) + '/browse';
         }
       }
     });
-    // Clicking a FILE row in the picker fills the member-add path input with that
+    // Clicking a FILE row in the picker fills the nearest path input with that
     // file's node-relative path and collapses the picker (the manual field stays
     // as a fallback). Folder rows are htmx re-browse requests handled server-side.
     document.addEventListener('click', function (e) {
@@ -52,7 +50,7 @@
       if (!t) return;
       e.preventDefault();
       var rel = t.getAttribute('data-rel') || '';
-      var form = t.closest('.member-add, .member-row-new');
+      var form = t.closest('.member-editor-form, .member-row-new');
       var panel = t.closest('.browse-panel');
       if (form) {
         var pathInput = form.querySelector('[name=path]');
@@ -60,7 +58,7 @@
       }
       if (panel) panel.innerHTML = '';
     });
-    // Progressive enhancement for the one-shot manual create form: "+ add another
+    // Progressive enhancement for the one-shot manual create form: "+ another
     // device" clones the last member row (device <select> + path input + Browse
     // picker), clears the clone's path + any open picker, and appends it. htmx.process
     // rebinds the cloned Browse button's hx-get. With no JS the single server-rendered
@@ -78,41 +76,57 @@
       rows.appendChild(clone);
       if (window.htmx) htmx.process(clone);
     });
+    // Closing the member editor empties its mount, so no stale dialog is left in
+    // the DOM to be re-opened with out-of-date values.
+    function rsCloseModal() { document.getElementById('modal').innerHTML = ''; }
+    // htmx events BUBBLE, so a form's hx-on::after-request also fires for requests
+    // made by controls INSIDE it — notably the Browse picker's hx-get, which would
+    // otherwise slam the dialog shut the moment you tried to pick a file. Close
+    // only when the form itself was the thing that made the request.
+    function rsCloseIfDone(evt, el) {
+      if (evt.detail.successful && evt.detail.elt === el) rsCloseModal();
+    }
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <div class="wrap">
-    <header class="top">
-      <h1>RetroSync — Syncs</h1>
-      <span class="who">
-        <a href="/">&larr; Dashboard</a> &nbsp;
-        <a href="/discover">Discover</a> &nbsp;
-        {{.User.Display}} ({{.User.Role}})
-        &nbsp;
-        <form class="logout" method="post" action="/logout">
-          <button class="linkbtn" type="submit">Sign out</button>
-        </form>
-      </span>
-    </header>
+  <!-- Modal mount: the member editor <dialog> swaps in here. -->
+  <div id="modal"></div>
+  <main class="container">
+    <nav>
+      <ul><li><strong>RetroSync — Syncs</strong></li></ul>
+      <ul>
+        <li><a href="/">&larr; Dashboard</a></li>
+        <li><a href="/discover">Discover</a></li>
+        <li class="whoami">
+          <small>{{.User.Display}} ({{.User.Role}})</small>
+          <form method="post" action="/logout">
+            <button class="linkbtn" type="submit">Sign out</button>
+          </form>
+        </li>
+      </ul>
+    </nav>
 
     <section>
-      <div class="card callout">
-        <h2>Discover is the easy way</h2>
+      <article class="callout">
+        <header><strong>Discover is the easy way</strong></header>
         <p>Play the game once on each device, then Discover finds the save files
            and links them for you — no ids or paths to type.</p>
-        <p><a class="btn" href="/discover">Find your saves &rarr;</a></p>
-      </div>
+        <a href="/discover" role="button">Find your saves &rarr;</a>
+      </article>
     </section>
 
     <section>
-      <h2>Sync registry</h2>
-      <p class="sub">Admin-only. A <em>sync</em> keeps one save file per device in
-         step. "Game" is just a free-text label used to group syncs for display.</p>
+      <hgroup>
+        <h2>Sync registry</h2>
+        <p>Admin-only. A <em>sync</em> keeps one save file per device in step.
+           "Game" is just a free-text label used to group syncs for display.</p>
+      </hgroup>
 
       <form class="search-form" hx-get="/syncs" hx-target="#syncs-list"
             hx-swap="outerHTML" hx-trigger="submit, input delay:300ms from:[name=q]">
-        <label>search <input type="search" name="q" value="{{.Q}}" placeholder="game label, sync name, or id"></label>
-        <button class="btn" type="submit">Search</button>
+        <label>Search
+          <input type="search" name="q" value="{{.Q}}" placeholder="game label, sync name, or id">
+        </label>
       </form>
 
       {{template "syncs-list" .}}
@@ -121,56 +135,58 @@
     <section>
       <details class="manual-create">
         <summary>Create a sync manually (advanced)</summary>
-        <form class="sync-form sync-create card" hx-post="/api/syncs"
-              hx-target="#syncs-list" hx-swap="outerHTML">
-          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-          <label>game label <input type="text" name="game" required placeholder="Super Metroid"></label>
-          <label>sync name <input type="text" name="name" required placeholder="Bob's stream"></label>
+        <article>
+          <form class="sync-form sync-create" hx-post="/api/syncs"
+                hx-target="#syncs-list" hx-swap="outerHTML">
+            <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+            <label>Game label <input type="text" name="game" required placeholder="Super Metroid"></label>
+            <label>Sync name <input type="text" name="name" required placeholder="Bob's stream"></label>
 
-          <!-- One or more member rows submitted together: each is a device +
-               save-file path (with the slice-17 Browse picker). "+ add another
-               device" clones a row (progressive enhancement); the server accepts
-               repeated node_id/path fields, so the single row works with no JS. A
-               row left blank simply adds no save file. -->
-          <div class="member-rows">
-            {{$nodes := .Nodes}}
-            <div class="member-row-new">
-              <label>device
-                <select name="node_id">
-                  {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
-                </select>
-              </label>
-              <label>save file <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm"></label>
-              <button class="btn member-browse" type="button"
-                      hx-get="/api/nodes/_/browse"
-                      data-browse-base="/api/nodes"
-                      hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
-              <div class="browse-panel"></div>
+            <!-- One or more member rows submitted together: each is a device +
+                 save-file path (with the slice-17 Browse picker). "+ another
+                 device" clones a row (progressive enhancement); the server accepts
+                 repeated node_id/path fields, so the single row works with no JS. A
+                 row left blank simply adds no save file. -->
+            <div class="member-rows">
+              {{$nodes := .Nodes}}
+              <fieldset class="member-row-new">
+                <label>Device
+                  <select name="node_id">
+                    {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
+                  </select>
+                </label>
+                <label>Save file <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm"></label>
+                <button class="secondary outline member-browse" type="button"
+                        hx-get="/api/nodes/_/browse"
+                        data-browse-base="/api/nodes"
+                        hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+                <div class="browse-panel"></div>
+              </fieldset>
             </div>
-          </div>
-          <!-- Row cloner, NOT a save. Deliberately link-styled and worded
-               without a verb, so it cannot be mistaken for the submit below or
-               for the "Add device to sync" button on an existing sync (which
-               does commit immediately). Only committing actions get a filled
-               button here. -->
-          <p><button class="linkbtn add-member-row" type="button">+ another device</button></p>
+            <!-- Row cloner, NOT a save. Deliberately link-styled and worded
+                 without a verb, so it cannot be mistaken for the submit below or
+                 for the "Save device" button in the member editor (which does
+                 commit immediately). Only committing actions get a filled
+                 button here. -->
+            <p><button class="linkbtn add-member-row" type="button">+ another device</button></p>
 
-          <details class="advanced">
-            <summary>Advanced</summary>
-            <label>id <input type="text" name="id" placeholder="super-metroid-bob"></label>
-            <p class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</p>
-          </details>
+            <details class="advanced">
+              <summary>Advanced</summary>
+              <label>Id <input type="text" name="id" placeholder="super-metroid-bob"></label>
+              <small class="sub">Id is optional — leave blank to auto-generate a slug from the game label + sync name.</small>
+            </details>
 
-          <!-- "Save", not "Create sync": inside a form you are filling in, the
-               commit button should say it commits what is in front of you.
-               Anything phrased as creating/adding reads like it starts ANOTHER
-               one, which is the confusion this whole section is fixing. -->
-          <p><button class="btn" type="submit">Save</button></p>
-          <div class="form-error"></div>
-        </form>
+            <!-- "Save", not "Create sync": inside a form you are filling in, the
+                 commit button should say it commits what is in front of you.
+                 Anything phrased as creating/adding reads like it starts ANOTHER
+                 one, which is the confusion this whole section is fixing. -->
+            <button type="submit">Save</button>
+            <div class="form-error"></div>
+          </form>
+        </article>
       </details>
     </section>
-  </div>
+  </main>
 </body>
 </html>{{end}}
 
@@ -191,7 +207,7 @@
       <!-- Folder picker: select the CURRENT directory by its absolute path. data-abs
            is HTML-attribute-escaped by html/template; the browser decodes it before
            JS reads getAttribute, so a path with & # % fills in intact. -->
-      <button type="button" class="btn browse-usedir" data-abs="{{.AbsDir}}"
+      <button type="button" class="secondary outline browse-usedir" data-abs="{{.AbsDir}}"
               title="use this folder as the node path">Use this folder</button>
     {{end}}
     {{if .HasParent}}
@@ -215,12 +231,12 @@
             {{else if $.FolderSelect}}
               <!-- Folder-picker mode: files are shown for confirmation but inert. -->
               <span class="browse-file-inert">📄 {{.Name}}
-                <span class="sub">({{.Size}} B, {{.Mtime.Format "2006-01-02 15:04"}})</span>
+                <small>({{.Size}} B, {{.Mtime.Format "2006-01-02 15:04"}})</small>
               </span>
             {{else}}
               <button type="button" class="linkbtn browse-file" data-rel="{{.Rel}}"
                       title="select this file">📄 {{.Name}}
-                <span class="sub">({{.Size}} B, {{.Mtime.Format "2006-01-02 15:04"}})</span>
+                <small class="sub">({{.Size}} B, {{.Mtime.Format "2006-01-02 15:04"}})</small>
               </button>
             {{end}}
           </li>
@@ -251,98 +267,155 @@
 {{end}}
 
 {{define "sync-group"}}
-{{$csrf := .CSRF}}{{$nodes := .Nodes}}{{with .Group}}
-<div class="card game-card">
-  <h3>{{if .Label}}{{.Label}}{{else}}(no label){{end}}</h3>
+{{$csrf := .CSRF}}{{with .Group}}
+<article class="game-card">
+  <header><strong>{{if .Label}}{{.Label}}{{else}}(no label){{end}}</strong></header>
 
-  <div class="syncs">
-    {{range .Syncs}}
-      <div class="sync-block" id="sync-{{.ID}}">
-        <div class="sync-head">
-          <strong>{{.Name}}</strong> <span class="sub">{{.ID}}</span>
-          {{if .Conflict}} <span class="badge bad">conflict</span>{{end}}
-        </div>
+  {{range .Syncs}}
+    <div class="sync-block" id="sync-{{.ID}}">
+      <p>
+        <strong>{{.Name}}</strong> <small class="sub">{{.ID}}</small>
+        {{if .Conflict}} <span class="badge bad">conflict</span>{{end}}
+      </p>
 
-        <div class="members">
-          {{$syncID := .ID}}
-          {{if not .Members}}
-            <p class="empty">No save files yet.</p>
-          {{else}}
+      {{$syncID := .ID}}
+      {{if not .Members}}
+        <p class="empty">No save files yet.</p>
+      {{else}}
+        <!-- Read state. The path is text until you ask to change it, so the card
+             can show a sync's configuration without also offering to mutate it. -->
+        <table>
+          <thead>
+            <tr><th scope="col">Device</th><th scope="col">Save file</th><th></th></tr>
+          </thead>
+          <tbody>
             {{range .Members}}
-              <div class="member-row">
-                <span class="member-node">{{.NodeID}}</span>
-                <form class="member-set" hx-post="/api/syncs/{{$syncID}}/members/{{.NodeID}}"
-                      hx-target="#syncs-list" hx-swap="outerHTML">
-                  <input type="hidden" name="csrf_token" value="{{$csrf}}">
-                  <input type="text" name="path" value="{{.Path}}" required>
-                  <button class="btn" type="submit">Save</button>
-                </form>
-                <form class="member-del" hx-post="/api/syncs/{{$syncID}}/members/{{.NodeID}}/delete"
-                      hx-target="#syncs-list" hx-swap="outerHTML"
-                      hx-confirm="Stop syncing this save file on {{.NodeID}}?">
-                  <input type="hidden" name="csrf_token" value="{{$csrf}}">
-                  <button class="btn danger" type="submit">Remove</button>
-                </form>
-              </div>
+            <tr>
+              <td>{{.NodeID}}</td>
+              <td class="path-cell"><small>{{.Path}}</small></td>
+              <td>
+                <button class="secondary outline" type="button"
+                        hx-get="/syncs/{{$syncID}}/member-editor?node={{.NodeID}}"
+                        hx-target="#modal" hx-swap="innerHTML">Edit</button>
+              </td>
+            </tr>
             {{end}}
-          {{end}}
+          </tbody>
+        </table>
+      {{end}}
 
-          <!-- Progressive enhancement: the htmx:configRequest handler above
-               rewrites this request path to splice in the selected node_id at
-               submit time. The authoritative server route is
-               POST /api/syncs/{id}/members/{node_id} (handleSetSyncMember),
-               exercised directly by the handler tests. The path can be typed
-               OR filled by the slice-17 "Browse…" picker below. -->
-          <form class="member-add" hx-post="/api/syncs/{{$syncID}}/members/"
-                data-member-base="/api/syncs/{{$syncID}}/members"
-                hx-target="#syncs-list" hx-swap="outerHTML">
-            <input type="hidden" name="csrf_token" value="{{$csrf}}">
-            <label>device
-              <select name="node_id">
-                {{range $nodes}}<option value="{{.}}">{{.}}</option>{{end}}
-              </select>
-            </label>
-            <label>save file <input type="text" name="path" placeholder="retroarch/saves/Super Metroid.srm" required></label>
-            <!-- Save-file picker (slice-17): Browse the SELECTED node's mounted
-                 save directory and click the real file to fill the path input,
-                 instead of typing it by hand. The hx-get's node id is spliced in
-                 at submit time by the htmx:configRequest handler above (it reads
-                 the sibling node <select>). Folder/file clicks inside the panel
-                 re-request or fill the path; the manual field above stays as a
-                 fallback. -->
-            <button class="btn member-browse" type="button"
-                    hx-get="/api/nodes/_/browse"
-                    data-browse-base="/api/nodes"
-                    hx-target="next .browse-panel" hx-swap="innerHTML">Browse…</button>
-            <div class="browse-panel"></div>
-            <!-- Commits immediately, so it says "Save" like every other
-                 committing button. "Save device" rather than bare "Save"
-                 because this form sits alongside the sync's own Save changes;
-                 the noun says WHICH thing is being saved, without reverting to
-                 the add/create phrasing that reads as "start another one". -->
-            <button class="btn" type="submit">Save device</button>
-          </form>
-        </div>
+      <!-- Same dialog as Edit, minus a fixed device. -->
+      <button class="secondary outline" type="button"
+              hx-get="/syncs/{{$syncID}}/member-editor"
+              hx-target="#modal" hx-swap="innerHTML">Add a device</button>
 
-        <details class="sync-rename">
-          <summary>Edit / delete sync</summary>
-          <form class="sync-form" hx-post="/api/syncs/{{.ID}}"
-                hx-target="#syncs-list" hx-swap="outerHTML">
-            <input type="hidden" name="csrf_token" value="{{$csrf}}">
-            <label>game label <input type="text" name="game" value="{{.Game}}" required></label>
-            <label>name <input type="text" name="name" value="{{.Name}}" required></label>
-            <button class="btn" type="submit">Save changes</button>
-          </form>
-          <form class="sync-del" hx-post="/api/syncs/{{.ID}}/delete"
-                hx-target="#syncs-list" hx-swap="outerHTML"
-                hx-confirm="Delete sync {{.ID}}?">
-            <input type="hidden" name="csrf_token" value="{{$csrf}}">
-            <button class="btn danger" type="submit">Delete sync</button>
-          </form>
-        </details>
-      </div>
-    {{end}}
-  </div>
+      <details class="sync-rename">
+        <summary>Rename or delete this sync</summary>
+        <form class="sync-form" hx-post="/api/syncs/{{.ID}}"
+              hx-target="#syncs-list" hx-swap="outerHTML">
+          <input type="hidden" name="csrf_token" value="{{$csrf}}">
+          <label>Game label <input type="text" name="game" value="{{.Game}}" required></label>
+          <label>Name <input type="text" name="name" value="{{.Name}}" required></label>
+          <button type="submit">Save changes</button>
+        </form>
+        <form class="sync-del" hx-post="/api/syncs/{{.ID}}/delete"
+              hx-target="#syncs-list" hx-swap="outerHTML"
+              hx-confirm="Delete sync {{.ID}}?">
+          <input type="hidden" name="csrf_token" value="{{$csrf}}">
+          <button class="secondary outline" type="submit">Delete this sync</button>
+        </form>
+      </details>
+    </div>
+  {{end}}
   <div class="form-error"></div>
-</div>
+</article>
 {{end}}{{end}}
+
+{{/* The member editor. One dialog serves both modes: with a NodeID it edits that
+     member (device fixed, Remove offered); without one it adds a device (device
+     chosen from a <select>, no Remove). The fields, the Browse picker and the
+     submit target are identical either way — which is why the two are not two
+     templates. */}}
+{{define "member-editor"}}
+<dialog open id="member-dialog"
+        aria-label="{{if .NodeID}}Save file on {{.NodeID}}{{else}}Add a device{{end}}">
+  <article>
+    <header>
+      <button aria-label="Close" rel="prev" type="button" onclick="rsCloseModal();"></button>
+      <p>
+        <strong>{{if .NodeID}}Save file on {{.NodeID}}{{else}}Add a device{{end}}</strong><br>
+        <small class="sub">{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</small>
+      </p>
+    </header>
+
+    {{if .NodeID}}
+      <form class="member-editor-form" data-node-id="{{.NodeID}}"
+            hx-post="/api/syncs/{{.SyncID}}/members/{{.NodeID}}"
+            hx-target="#syncs-list" hx-swap="outerHTML"
+            hx-on::after-request="rsCloseIfDone(event, this)">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label>Save file
+          <input type="text" name="path" value="{{.Path}}" required
+                 placeholder="retroarch/saves/Super Metroid.srm">
+        </label>
+        <button class="secondary outline member-browse" type="button"
+                hx-get="/api/nodes/_/browse"
+                data-browse-base="/api/nodes"
+                hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+        <div class="browse-panel"></div>
+        <button type="submit">Save</button>
+      </form>
+      <footer>
+        <!-- Removing a device stops mirroring its save; the file itself is left
+             alone. Quietest control in the dialog, and behind a confirm. -->
+        <form class="member-del"
+              hx-post="/api/syncs/{{.SyncID}}/members/{{.NodeID}}/delete"
+              hx-target="#syncs-list" hx-swap="outerHTML"
+              hx-confirm="Stop syncing this save file on {{.NodeID}}?"
+              hx-on::after-request="rsCloseIfDone(event, this)">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <button class="secondary outline" type="submit">Stop syncing this device</button>
+        </form>
+        <button class="secondary" type="button" onclick="rsCloseModal();">Cancel</button>
+      </footer>
+    {{else}}
+      {{if not .Nodes}}
+        <p class="empty">Every registered device is already in this sync.</p>
+        <footer>
+          <button class="secondary" type="button" onclick="rsCloseModal();">Close</button>
+        </footer>
+      {{else}}
+        <!-- The htmx:configRequest handler splices the selected node id into the
+             path at submit time; the authoritative route is
+             POST /api/syncs/{id}/members/{node_id}. -->
+        <form class="member-editor-form"
+              hx-post="/api/syncs/{{.SyncID}}/members/"
+              data-member-base="/api/syncs/{{.SyncID}}/members"
+              hx-target="#syncs-list" hx-swap="outerHTML"
+              hx-on::after-request="rsCloseIfDone(event, this)">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <label>Device
+            <select name="node_id">
+              {{range .Nodes}}<option value="{{.}}">{{.}}</option>{{end}}
+            </select>
+          </label>
+          <label>Save file
+            <input type="text" name="path" required
+                   placeholder="retroarch/saves/Super Metroid.srm">
+          </label>
+          <button class="secondary outline member-browse" type="button"
+                  hx-get="/api/nodes/_/browse"
+                  data-browse-base="/api/nodes"
+                  hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+          <div class="browse-panel"></div>
+          <button type="submit">Save device</button>
+        </form>
+        <footer>
+          <button class="secondary" type="button" onclick="rsCloseModal();">Cancel</button>
+        </footer>
+      {{end}}
+    {{end}}
+    <div class="form-error"></div>
+  </article>
+</dialog>
+{{end}}

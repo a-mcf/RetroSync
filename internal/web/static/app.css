@@ -1,138 +1,129 @@
-/* RetroSync dashboard — dark mode by default, big tap targets for couch use.
-   One file, no preprocessor (docs/ui.md). */
+/* RetroSync's own layer, on top of vendored Pico CSS v2 (docs/ui.md).
+   No preprocessor, no build step — Pico is a plain stylesheet loaded before
+   this one, and everything here is expressed in its custom properties so the
+   two cannot drift apart.
 
-:root {
-  --bg: #14161a;
-  --panel: #1d2026;
-  --panel-2: #262a32;
-  --text: #e6e8eb;
-  --muted: #9aa3ad;
-  --accent: #4fa3ff;
-  --accent-press: #2f7fd6;
-  --ok: #58c97a;
-  --warn: #e0b341;
-  --bad: #e0584b;
-  --border: #30353e;
-  --radius: 10px;
-}
+   Pico supplies typography, spacing, forms, buttons, tables, <article> cards,
+   <details> accordions and <dialog> modals. What remains below is only what
+   Pico has no opinion about: status badges, the conflict banners, the save-file
+   picker, and a compact control size for table row actions. If you find
+   yourself adding a rule here, check whether Pico already styles the semantic
+   element first — that is the whole point of adopting it. */
 
-* { box-sizing: border-box; }
+/* Muted secondary text. Pico's <small> handles size; this handles colour, for
+   the places where the text is not small, only quieter. */
+.sub { color: var(--pico-muted-color); }
 
-html, body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-}
+/* "Nothing here yet" states. Italic so they read as narration, not data. */
+.empty { color: var(--pico-muted-color); font-style: italic; }
 
-a { color: var(--accent); }
+/* Inline error text swapped in from a 4xx body (see the htmx:beforeOnLoad
+   handlers in the page templates) and the success counterpart. */
+.form-error:not(:empty) { color: var(--pico-del-color); margin-top: var(--pico-spacing); }
+.notice { color: var(--pico-ins-color); }
 
-.wrap {
-  max-width: 880px;
-  margin: 0 auto;
-  padding: 1rem 1rem 4rem;
-}
-
-header.top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 1rem 0;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 1rem;
-}
-
-header.top h1 { font-size: 1.4rem; margin: 0; }
-
-.who { color: var(--muted); font-size: 0.95rem; }
-
-section { margin: 1.5rem 0; }
-
-section > h2 {
-  font-size: 1.1rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin: 0 0 0.75rem;
-}
-
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem;
-  margin-bottom: 0.75rem;
-}
-
-.card h3 { margin: 0 0 0.25rem; font-size: 1.15rem; }
-.card .sub { color: var(--muted); font-size: 0.95rem; }
-
-/* The /syncs "Discover is the easy way" pointer card. */
-.callout { border-left: 3px solid var(--accent); }
-
-.peers, .node-lines { list-style: none; margin: 0.5rem 0 0; padding: 0; }
-.peers li, .node-lines li { padding: 0.15rem 0; color: var(--muted); }
-
+/* Status pills: device reachability, role markers, sync state. Colour is
+   carried by the border and text, never a fill, so a row of them does not
+   compete with the page's real actions. */
 .badge {
   display: inline-block;
-  font-size: 0.8rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  padding: 0.1rem 0.55rem;
+  border: 1px solid currentColor;
+  border-radius: 1rem;
+  white-space: nowrap;
 }
-.badge.ok  { color: var(--ok);  border-color: var(--ok); }
-.badge.bad { color: var(--bad); border-color: var(--bad); }
-.badge.warn{ color: var(--warn);border-color: var(--warn); }
+.badge.ok   { color: var(--pico-ins-color); }
+.badge.bad  { color: var(--pico-del-color); }
+.badge.warn { color: #d9a441; }
 
+/* A paused sync. The first-sync variant is deliberately amber, not red: a
+   never-synced sync's first conflict is the last step of setup ("pick your
+   starting save"), not a fault. Same endpoint, different register. */
 .conflict {
-  border: 1px solid var(--bad);
-  color: var(--bad);
-  background: rgba(224, 88, 75, 0.08);
-  border-radius: var(--radius);
-  padding: 0.5rem 0.75rem;
-  margin-top: 0.5rem;
+  border: 1px solid var(--pico-del-color);
+  border-radius: var(--pico-border-radius);
+  background: color-mix(in srgb, var(--pico-del-color) 8%, transparent);
+  padding: var(--pico-spacing);
+  margin-top: var(--pico-spacing);
 }
-/* A never-synced sync's first conflict is the expected last setup step ("pick
-   your starting save"), not breakage — amber/informational, not red. */
 .conflict.first-sync {
-  border-color: var(--warn);
-  color: var(--warn);
-  background: rgba(224, 179, 65, 0.08);
+  border-color: #d9a441;
+  background: color-mix(in srgb, #d9a441 8%, transparent);
 }
+.conflict button { margin: 0.75rem 0 0; }
 
-/* The "Resolve conflict" button inside the red banner. */
-.conflict-btn {
-  display: block;
-  margin-top: 0.6rem;
-  border-color: var(--bad);
-  background: var(--bad);
-  color: #0b0d10;
+/* Save-file / folder picker (the Browse… panels). A scrolling file tree, which
+   is exactly why editing a member happens in a <dialog> and not inside a table
+   row — this does not fit in a row. */
+.browse-panel:not(:empty) {
+  border: 1px solid var(--pico-form-element-border-color);
+  border-radius: var(--pico-border-radius);
+  max-height: 15rem;
+  overflow-y: auto;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: var(--pico-spacing);
 }
-.conflict.first-sync .conflict-btn {
-  border-color: var(--warn);
-  background: var(--warn);
-}
+.browse-entries { list-style: none; margin: 0.25rem 0 0; padding: 0; }
+.browse-entries li { padding: 0.1rem 0; }
+.browse-crumb { font-size: 0.8rem; }
+/* In folder-select mode the file rows are shown for orientation but are not
+   selectable, so they must not look clickable. */
+.browse-file-inert { color: var(--pico-muted-color); }
 
-/* Big tap targets. The "Play on <node>" action is meant to be the largest
-   thing on the page once slice-actions wires it up. */
-.btn {
-  display: inline-block;
-  font-size: 1.05rem;
-  padding: 0.8rem 1.2rem;
-  border-radius: var(--radius);
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: #0b0d10;
+/* Buttons that are really links: picker rows, row cloners, sign-out. Pico has
+   no such variant — its .secondary is still a filled button. */
+.linkbtn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  width: auto;
+  color: var(--pico-primary);
+  font: inherit;
+  text-align: left;
   cursor: pointer;
-  min-height: 48px;
-  min-width: 48px;
 }
-.btn:active { background: var(--accent-press); }
-.btn[disabled] {
-  opacity: 0.4;
-  cursor: not-allowed;
+.linkbtn:hover { color: var(--pico-primary-hover); background: none; }
+
+/* Row actions inside a table need to be smaller than a form's submit button;
+   Pico has no size modifier. */
+td button, td a[role="button"] {
+  padding: 0.25rem 0.7rem;
+  font-size: 0.8rem;
+  margin: 0;
+  width: auto;
 }
-.btn.big { font-size: 1.25rem; padding: 1rem 1.6rem; width: 100%; }
+/* Paths are the widest thing in these tables and the least useful to read in
+   full, so let them shrink first. */
+.path-cell { word-break: break-all; }
+
+/* The conflict dialog's source list: one row per device, each a click target. */
+.source-list { list-style: none; margin: 0; padding: 0; }
+.source-opt {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem;
+  border-radius: var(--pico-border-radius);
+}
+.source-opt:hover { background: var(--pico-form-element-background-color); }
+.source-id { flex: 1; }
+.source-opt form { margin: 0; }
+
+/* Dialogs open by toggling the open attribute (see the openDialog helpers), so
+   they must not inherit a form's block margins. */
+dialog article { margin: 0; }
+dialog article > footer { display: flex; gap: 0.5rem; justify-content: flex-end; }
+dialog article > footer button { margin: 0; width: auto; }
+
+/* The nav's identity block: pushed right, quieter than the links. */
+.whoami { color: var(--pico-muted-color); }
+.whoami form { display: inline; margin: 0; }
+
+/* The sign-in page is the one screen with a single job, so it gets a narrower
+   measure than Pico's container and sits above the fold's centre. */
+.signin { max-width: 24rem; margin-top: 10vh; }
 
 /* The manual create form's submit reads as inert until its required fields
    (game label, sync name) are filled. Pure CSS, keyed on the form's own
@@ -141,191 +132,4 @@ section > h2 {
    It stays CLICKABLE on purpose: clicking a greyed-out button surfaces the
    browser's own "please fill in this field" hint pointing at the offending
    input, which is more helpful than a dead control that explains nothing. */
-.sync-create:has(:invalid) button[type="submit"] {
-  opacity: 0.45;
-}
-
-.search {
-  width: 100%;
-  padding: 0.8rem 1rem;
-  font-size: 1.05rem;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--text);
-  margin-bottom: 0.75rem;
-}
-
-.empty { color: var(--muted); font-style: italic; }
-
-/* Login */
-.login {
-  max-width: 360px;
-  margin: 12vh auto 0;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.5rem;
-}
-.login h1 { margin: 0 0 1rem; font-size: 1.4rem; }
-.login label { display: block; margin: 0.75rem 0 0.25rem; color: var(--muted); }
-.login input {
-  width: 100%;
-  padding: 0.8rem 1rem;
-  font-size: 1.05rem;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  color: var(--text);
-  min-height: 48px;
-}
-.login .btn { width: 100%; margin-top: 1.25rem; }
-.login .error { color: var(--bad); margin-top: 0.75rem; }
-
-form.logout { display: inline; }
-.linkbtn {
-  background: none;
-  border: none;
-  color: var(--accent);
-  cursor: pointer;
-  font: inherit;
-  padding: 0;
-}
-
-/* Conflict-resolution modal — dark, consistent with the cards. */
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1rem;
-  z-index: 100;
-}
-.modal {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.25rem;
-  width: 100%;
-  max-width: 440px;
-}
-.modal-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-}
-.modal-head h3 { margin: 0; font-size: 1.2rem; }
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--muted);
-  font-size: 1.8rem;
-  line-height: 1;
-  cursor: pointer;
-  /* Touch-friendly close corner (docs/ui.md). */
-  min-width: 44px;
-  min-height: 44px;
-}
-.source-list { list-style: none; margin: 0.75rem 0; padding: 0; }
-.source-opt {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  padding: 0.7rem 0.5rem;
-  border-radius: var(--radius);
-  cursor: pointer;
-  min-height: 48px;
-}
-.source-opt:hover { background: var(--panel-2); }
-.source-opt input[type="radio"] { width: 1.2rem; height: 1.2rem; }
-.source-id { flex: 1; }
-.source-id .you { color: var(--accent); font-size: 0.85rem; }
-.source-mtime { color: var(--muted); font-size: 0.9rem; }
-
-/* Save-history page: per-member version list + the dashboard "History" link. */
-.history-link { margin-left: 0.6rem; font-size: 0.9rem; }
-.version-list { list-style: none; margin: 0.5rem 0 0; padding: 0; }
-.version-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  padding: 0.5rem 0.4rem;
-  border-radius: var(--radius);
-  min-height: 44px;
-}
-.version-row:hover { background: var(--panel-2); }
-.version-meta { color: var(--muted); font-size: 0.95rem; }
-
-.modal-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 1rem;
-  margin-top: 0.5rem;
-}
-
-/* /nodes registry admin UI. */
-.node-form label {
-  display: block;
-  margin: 0.5rem 0;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-.node-form input[type="text"],
-.node-form select {
-  display: block;
-  width: 100%;
-  margin-top: 0.25rem;
-  padding: 0.5rem;
-  background: var(--panel-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font: inherit;
-}
-.node-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  margin: 0.75rem 0;
-}
-.smoke-result { font-size: 0.9rem; }
-.btn.danger { background: var(--bad); }
-.node-card details summary { cursor: pointer; color: var(--accent); margin-top: 0.5rem; }
-.form-error { color: var(--bad); font-size: 0.9rem; margin-top: 0.5rem; }
-
-/* /users people registry + /account self-service (slice 36). Same shape as the
-   /nodes forms, plus password inputs. */
-.user-form label {
-  display: block;
-  margin: 0.5rem 0;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-.user-form input[type="text"],
-.user-form input[type="password"],
-.user-form select {
-  display: block;
-  width: 100%;
-  margin-top: 0.25rem;
-  padding: 0.5rem;
-  background: var(--panel-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font: inherit;
-}
-.user-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  margin: 0.75rem 0;
-}
-.user-card details summary { cursor: pointer; color: var(--accent); margin-top: 0.5rem; }
-.notice { color: var(--ok); }
+.sync-create:has(:invalid) button[type="submit"] { opacity: 0.45; }
