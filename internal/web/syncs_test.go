@@ -383,14 +383,13 @@ func TestSyncsPage_DiscoverCalloutAndManualForm(t *testing.T) {
 		// `.sync-create:has(:invalid)`, so it only works while the form carries
 		// that class AND its two required fields are marked required. Pin both;
 		// dropping either silently disables the affordance.
-		`class="sync-form sync-create card"`,
+		`class="sync-form sync-create"`,
 		`name="game" required`,
 		`name="name" required`,
 		// Committing buttons say "Save"; only the row cloner is phrased as
-		// adding. Pin both sides of that split — it is the whole point of the
-		// wording, and either half drifting back re-creates the ambiguity.
+		// adding. The other half of that split ("Save device") now lives in the
+		// member editor dialog — see TestMemberEditor_AddMode.
 		">Save</button>",
-		">Save device</button>",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("syncs page missing %q", want)
@@ -819,5 +818,103 @@ func TestValidSlug(t *testing.T) {
 		if validSlug(s) {
 			t.Errorf("validSlug(%q) = true, want false", s)
 		}
+	}
+}
+
+// --- the member editor dialog (GET /syncs/{id}/member-editor) -------------
+//
+// One endpoint, two modes. With ?node= it edits that member; without, it adds
+// one. The fixture's sm-bob sync has bob-deck and carol-deck as members, and
+// "mister" registered but unattached.
+
+// TestMemberEditor_EditMode: the dialog opens on an existing member with that
+// member's path already filled in, offers the Browse picker, and offers to stop
+// syncing that device. The device is fixed — no <select>.
+func TestMemberEditor_EditMode(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "bob")
+
+	rec := getPage(t, f, c, "/syncs/sm-bob/member-editor?node=bob-deck")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"<dialog open",
+		"Save file on bob-deck",
+		// The member's CURRENT path is pre-filled, which is what makes this an
+		// edit rather than a blank re-entry.
+		`value="sm.srm"`,
+		`data-node-id="bob-deck"`,
+		"Browse",
+		// Destructive action lives here, quiet, behind a confirm — not as a
+		// filled red button on the row.
+		"Stop syncing this device",
+		"/api/syncs/sm-bob/members/bob-deck/delete",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("edit dialog missing %q", want)
+		}
+	}
+	// A fixed device must not offer a device picker.
+	if strings.Contains(body, `name="node_id"`) {
+		t.Error("edit mode offered a device <select>; the device is fixed")
+	}
+}
+
+// TestMemberEditor_AddMode: with no node, the dialog offers the devices that are
+// NOT already members and commits with "Save device" — the other half of the
+// Save-vs-add wording rule.
+func TestMemberEditor_AddMode(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "bob")
+
+	rec := getPage(t, f, c, "/syncs/sm-bob/member-editor")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"<dialog open",
+		"Add a device",
+		`name="node_id"`,
+		">Save device</button>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("add dialog missing %q", want)
+		}
+	}
+	// Only the unattached node is offerable; re-picking an existing member would
+	// silently upsert its path rather than add anything.
+	if !strings.Contains(body, `<option value="mister">`) {
+		t.Error("add dialog does not offer the unattached device")
+	}
+	for _, already := range []string{`<option value="bob-deck">`, `<option value="carol-deck">`} {
+		if strings.Contains(body, already) {
+			t.Errorf("add dialog offers %s, which is already a member", already)
+		}
+	}
+	// Nothing to remove when nothing is selected yet.
+	if strings.Contains(body, "Stop syncing this device") {
+		t.Error("add mode offered a remove action")
+	}
+}
+
+// TestMemberEditor_Rejections: unknown sync and unknown member both 404 rather
+// than rendering an editor that would post to nothing; a non-admin never reaches
+// the handler at all (registry editing is admin-only).
+func TestMemberEditor_Rejections(t *testing.T) {
+	f := newActionFixture(t)
+	admin, _ := loginAs(t, f, "bob")
+	plain, _ := loginAs(t, f, "carol")
+
+	if rec := getPage(t, f, admin, "/syncs/nope/member-editor"); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown sync: status = %d, want 404", rec.Code)
+	}
+	if rec := getPage(t, f, admin, "/syncs/sm-bob/member-editor?node=mister"); rec.Code != http.StatusNotFound {
+		t.Errorf("non-member node: status = %d, want 404", rec.Code)
+	}
+	if rec := getPage(t, f, plain, "/syncs/sm-bob/member-editor"); rec.Code != http.StatusForbidden {
+		t.Errorf("non-admin: status = %d, want 403", rec.Code)
 	}
 }

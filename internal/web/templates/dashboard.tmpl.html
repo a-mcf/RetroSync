@@ -1,9 +1,10 @@
 {{define "dashboard"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/htmx.min.js" defer></script>
   <script>
@@ -30,31 +31,39 @@
   </script>
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
-  <!-- Modal mount: the conflict-resolution modal swaps in here. -->
+  <!-- Modal mount: the conflict <dialog> swaps in here. -->
   <div id="modal"></div>
-  <div class="wrap" id="dashboard">
-    <header class="top">
-      <h1>RetroSync</h1>
-      <span class="who">
-        {{if eq .User.Role "admin"}}<a href="/discover">Discover</a> &nbsp;<a href="/syncs">Syncs</a> &nbsp;<a href="/nodes">Devices</a> &nbsp;<a href="/users">People</a> &nbsp;{{end}}
-        <a href="/account">Account</a> &nbsp;
-        {{.User.Display}} ({{.User.Role}})
-        &nbsp;
-        <form class="logout" method="post" action="/logout">
-          <button class="linkbtn" type="submit">Sign out</button>
-        </form>
-      </span>
-    </header>
+  <main class="container" id="dashboard">
+    <nav>
+      <ul><li><strong>RetroSync</strong></li></ul>
+      <ul>
+        {{if eq .User.Role "admin"}}
+        <li><a href="/discover">Discover</a></li>
+        <li><a href="/syncs">Syncs</a></li>
+        <li><a href="/nodes">Devices</a></li>
+        <li><a href="/users">People</a></li>
+        {{end}}
+        <li><a href="/account">Account</a></li>
+        <li class="whoami">
+          <small>{{.User.Display}} ({{.User.Role}})</small>
+          <form method="post" action="/logout">
+            <button class="linkbtn" type="submit">Sign out</button>
+          </form>
+        </li>
+      </ul>
+    </nav>
 
     <!-- MY SYNCS (status) ---------------------------------------------- -->
     <section>
-      <h2>My syncs</h2>
-      <p class="sub">Every sync mirrors automatically. There is nothing to start or
-         stop — this is a status view. The only action is resolving a conflict.</p>
+      <hgroup>
+        <h2>My syncs</h2>
+        <p>Every sync mirrors automatically. There is nothing to start or stop —
+           this is a status view. The only action is resolving a conflict.</p>
+      </hgroup>
       <!-- Client-side filter over the My-syncs cards below (by game label +
            sync name). Each card carries a data-filter string; the input hides
            non-matching cards. No round-trip — the list is already rendered. -->
-      <input class="search" id="mysyncs-search" type="search"
+      <input type="search" id="mysyncs-search"
              placeholder="Search my syncs…"
              oninput="rsFilterMySyncs(this.value)">
       <div id="mysyncs-list">
@@ -63,10 +72,11 @@
            <a href="/discover">Find your saves &rarr;</a>{{end}}</p>
       {{else}}
         {{range .MySyncs}}
-        <div class="card mysync-card" data-filter="{{.Game}} {{.SyncName}}">
-          <h3>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}
-            <a class="history-link sub" href="/syncs/{{.SyncID}}/history">History</a>
-          </h3>
+        <article class="mysync-card" data-filter="{{.Game}} {{.SyncName}}">
+          <header>
+            <strong>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</strong>
+            <a href="/syncs/{{.SyncID}}/history"><small>History</small></a>
+          </header>
           {{if .Conflict}}
             {{if .FirstSync}}
             <!-- Never-synced sync: the setup path leaves each device with a
@@ -75,7 +85,7 @@
             <div class="conflict first-sync">
               <strong>Almost there — pick your starting save.</strong>
               Your devices have different saves for this game.
-              <button class="btn conflict-btn"
+              <button type="button"
                       hx-get="/syncs/{{.SyncID}}/conflict"
                       hx-target="#modal" hx-swap="innerHTML">
                 Choose starting save
@@ -85,7 +95,7 @@
             <div class="conflict">
               <strong>Sync paused — more than one device changed.</strong>
               retrosync won't choose for you.
-              <button class="btn conflict-btn"
+              <button type="button"
                       hx-get="/syncs/{{.SyncID}}/conflict"
                       hx-target="#modal" hx-swap="innerHTML">
                 Resolve conflict
@@ -93,12 +103,21 @@
             </div>
             {{end}}
           {{else}}
-            <div class="sub"><span class="badge ok">in sync</span> &nbsp; last synced: {{.LastSync}}</div>
+            <p><span class="badge ok">in sync</span>
+               <small class="sub">last synced: {{.LastSync}}</small></p>
           {{end}}
-          <ul class="node-lines">
-            {{range .Nodes}}<li>{{.NodeID}}{{if .Owned}} <span class="sub">(yours)</span>{{end}}: {{.Mtime}}</li>{{end}}
-          </ul>
-        </div>
+          <table>
+            <thead><tr><th scope="col">Device</th><th scope="col">Last change</th></tr></thead>
+            <tbody>
+              {{range .Nodes}}
+              <tr>
+                <td>{{.NodeID}}{{if .Owned}} <small class="sub">(yours)</small>{{end}}</td>
+                <td><small>{{.Mtime}}</small></td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </article>
         {{end}}
       {{end}}
       </div>
@@ -110,13 +129,16 @@
       {{if not .Nodes}}
         <p class="empty">No devices registered.</p>
       {{else}}
-        {{range .Nodes}}
-        <div class="card">
-          <h3>{{.Display}} <span class="sub">{{.ID}}</span></h3>
-        </div>
-        {{end}}
+        <table>
+          <thead><tr><th scope="col">Device</th><th scope="col">Id</th></tr></thead>
+          <tbody>
+            {{range .Nodes}}
+            <tr><td>{{.Display}}</td><td><small class="sub">{{.ID}}</small></td></tr>
+            {{end}}
+          </tbody>
+        </table>
       {{end}}
     </section>
-  </div>
+  </main>
 </body>
 </html>{{end}}

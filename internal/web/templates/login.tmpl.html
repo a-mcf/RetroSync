@@ -1,22 +1,30 @@
 {{define "login"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RetroSync — sign in</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <main class="login">
-    <h1>RetroSync</h1>
-    <form method="post" action="/login">
-      <label for="username">User</label>
-      <input id="username" name="username" autocomplete="username" autofocus required>
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
-      <button class="btn" type="submit">Sign in</button>
-      {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-    </form>
+  <main class="container signin">
+    <article>
+      <hgroup>
+        <h1>RetroSync</h1>
+        <p>Sign in to see your saves.</p>
+      </hgroup>
+      <form method="post" action="/login">
+        <label for="username">User
+          <input id="username" name="username" autocomplete="username" autofocus required>
+        </label>
+        <label for="password">Password
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit">Sign in</button>
+        {{if .Error}}<p class="form-error">{{.Error}}</p>{{end}}
+      </form>
+    </article>
   </main>
 </body>
 </html>{{end}}
