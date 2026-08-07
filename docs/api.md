@@ -19,7 +19,7 @@ authorization are enforced by middleware before any handler runs:
   `csrf_token` form field. A missing/invalid token (or no session) → `403`.
 - **Admin-gating** — all **registry** mutations (`/nodes`, `/syncs`, sync + member
   edits, smoke-test, `/users`) are admin-only; a non-admin → `403` ("admins only").
-  The one exception is `/account` + `POST /api/account/password`: any signed-in
+  The one exception is `/settings` + `POST /api/account/password`: any signed-in
   user may change **their own** password.
 - **Member-owner/admin-gating** — `resolve-conflict` (the only play-side action
   under auto-mirror) requires the caller to **own at least one of the sync's
@@ -162,7 +162,7 @@ that user's sessions**.
 
 Admin password **reset** for someone else — no current password required, that is
 the point of a reset. An admin resetting **their own** password → `409` pointing at
-`/account` (which does verify the current password). Short password → `400`;
+`/settings` (which does verify the current password). Short password → `400`;
 unknown user → `404`. Success **revokes every session** of the target user.
 
 ### `POST /api/users/{id}/delete`
@@ -180,12 +180,18 @@ Delete, with three humane refusals (all `409`, never a driver `500`):
 
 Unknown user → `404`. Success revokes the deleted user's sessions.
 
-## Account (any signed-in user)
+## Settings (any signed-in user)
+
+### `GET /settings`
+
+Who you are signed in as, plus the change-password form — the one
+user-management surface a **non-admin** gets — and, for an admin, a summary of
+the people registry linking to `/users`.
 
 ### `GET /account`
 
-The small self-service page: who you are signed in as, plus the change-password
-form. The one user-management surface a **non-admin** gets.
+`301` to `/settings`, preserving the query string. This was the self-service page
+before settings absorbed it; the redirect keeps bookmarks working.
 
 ### `POST /api/account/password`
 
@@ -195,7 +201,7 @@ borrowed unlocked session must not be enough to take an account over); mismatche
 confirmation or a short new password → `400`. On success every session of that
 user is revoked and a **fresh** session (new token + new CSRF) is minted for the
 caller, so other devices are signed out; the response redirects to
-`/account?changed=1` (`HX-Redirect` for an HTMX submit) rather than swapping a
+`/settings?changed=1` (`HX-Redirect` for an HTMX submit) rather than swapping a
 fragment, because the CSRF token rotated.
 
 ## Registry — Syncs (admin-only)

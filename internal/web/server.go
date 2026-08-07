@@ -265,6 +265,15 @@ func (s *Server) Handler() http.Handler {
 	// the admin and CSRF wrappers does not affect safety — each independently
 	// blocks the request — but admin is checked first so a non-admin gets a clean
 	// 403 "admins only" rather than a CSRF error.
+	// Settings: every signed-in user's own account, plus the admin's way through
+	// to People. Absorbed /account, which now redirects here so bookmarks survive.
+	mux.Handle("GET /settings", s.requireAuth(http.HandlerFunc(s.handleSettingsPage)))
+	// Unauthenticated on purpose: it reads nothing about the caller, and behind
+	// requireAuth the same URL would answer 303->/login when logged out and a
+	// hard-cached 301 when not. One answer is easier to reason about, and
+	// /settings bounces an anonymous visitor to /login anyway.
+	mux.HandleFunc("GET /account", s.handleAccountRedirect)
+
 	mux.Handle("GET /nodes", s.requireAuth(s.requireAdmin(http.HandlerFunc(s.handleNodesPage))))
 	mux.Handle("POST /api/nodes", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleCreateNode)))))
 	mux.Handle("POST /api/nodes/{id}", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleEditNode)))))
@@ -322,11 +331,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/users/{id}/password", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleResetPassword)))))
 	mux.Handle("POST /api/users/{id}/delete", s.requireAuth(s.requireAdmin(s.requireCSRF(http.HandlerFunc(s.handleDeleteUser)))))
 
-	// Self-service account (slice-36): the ONE user-management action a non-admin
-	// can take — change their own password, proving the current one. Behind
-	// requireAuth only (NOT requireAdmin); the POST is CSRF-protected like every
-	// other mutation.
-	mux.Handle("GET /account", s.requireAuth(http.HandlerFunc(s.handleAccountPage)))
+	// Self-service password change (slice-36): the ONE user-management action a
+	// non-admin can take — change their own password, proving the current one. Its
+	// form lives on /settings (registered above); this is the mutation. Behind
+	// requireAuth only (NOT requireAdmin), CSRF-protected like every other write.
+	// The path stays /api/account/password: it is an API route, and renaming it
+	// would churn callers and tests for no user-visible gain.
 	mux.Handle("POST /api/account/password", s.requireAuth(s.requireCSRF(http.HandlerFunc(s.handleChangeOwnPassword))))
 
 	// Discovery (slice-22): the on-ramp that replaces manual sync-building. The GET

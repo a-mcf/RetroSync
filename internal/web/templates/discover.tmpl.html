@@ -1,12 +1,7 @@
 {{define "discover"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Discover</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — Discover"}}
   <script>
     // Let HTMX swap the 4xx bodies so inline error text (400/409/422) shows.
     document.addEventListener('htmx:beforeOnLoad', function (e) {
@@ -17,19 +12,7 @@
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <main class="container">
-    <nav>
-      <ul><li><strong>RetroSync — Discover</strong></li></ul>
-      <ul>
-        <li><a href="/">&larr; Dashboard</a></li>
-        <li><a href="/syncs">Syncs</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <hgroup>

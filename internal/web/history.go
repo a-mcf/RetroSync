@@ -20,6 +20,8 @@ const historyListLimit = store.SaveVersionRetention
 // historyPageData drives the save-history page: every member of the sync with
 // its captured save versions (newest-first), each offering a Restore button.
 type historyPageData struct {
+	// User drives the shared nav partial, which is the same on every page.
+	User     userView
 	SyncID   string
 	SyncName string
 	// Game is the sync's free-text game label (a display grouping; "" when unset).
@@ -50,6 +52,13 @@ type historyVersion struct {
 func (s *Server) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
 	syncID := r.PathValue("id")
 
+	// Needed only to render the shared nav; requireAuth already guarantees it.
+	u, ok := userFromContext(r.Context())
+	if !ok {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
 	sy, err := s.store.GetSync(r.Context(), syncID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -69,6 +78,7 @@ func (s *Server) handleHistoryPage(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	data := historyPageData{
+		User:     userView{ID: u.ID, Display: u.Display, Role: u.Role},
 		SyncID:   sy.ID,
 		SyncName: sy.Name,
 		Game:     sy.Game,

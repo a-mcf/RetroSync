@@ -1,12 +1,7 @@
 {{define "history"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Save history</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — Save history"}}
   <script>
     // A successful restore returns the refreshed dashboard fragment. Send the
     // user back to the dashboard once the restore lands so they see the new
@@ -20,14 +15,11 @@
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <main class="container" id="history">
-    <nav>
-      <ul><li><strong>Save history</strong></li></ul>
-      <ul><li><a href="/">&larr; Dashboard</a></li></ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <hgroup>
-        <h2>{{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} — {{.SyncName}}{{end}}</h2>
+        <h2>Save history <small class="sub">— {{if .Game}}{{.Game}}{{else}}(no label){{end}}{{if .SyncName}} · {{.SyncName}}{{end}}</small></h2>
         <p>Every time RetroSync is about to overwrite a save (a normal
            propagation or a conflict resolution), it snapshots the about-to-be-
            overwritten bytes here first. Restore makes a snapshot the current save

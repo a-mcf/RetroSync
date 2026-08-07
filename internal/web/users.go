@@ -12,17 +12,18 @@ import (
 	"github.com/a-mcf/retrosync/internal/store"
 )
 
-// The /users people registry (slice-36) plus the self-service /account page.
+// The /users people registry (slice-36) plus the /settings page.
 //
 // Until this slice a user could only be created with `retrosync user set` on the
 // CLI — unusable in a cluster, where that means a one-off pod just to add a
 // person. /users is the admin surface (list, add, edit display+role, reset
-// password, delete); /account is the ONE thing a non-admin can do — change their
-// own password, which requires their current one.
+// password, delete); /settings carries the ONE thing a non-admin can do — change
+// their own password, which requires their current one — and links an admin
+// through to /users, which used to sit in the top navigation.
 //
 // Everything under /users is mounted behind requireAuth + requireAdmin (and the
 // mutations behind requireCSRF) in Server.Handler, exactly like /nodes, so a
-// non-admin never reaches the Store here. /account is behind requireAuth only.
+// non-admin never reaches the Store here. /settings is behind requireAuth only.
 //
 // Secrets discipline: pw_hash NEVER leaves this package's Store calls. No view
 // model here carries it, no template renders it, no log line mentions it. The
@@ -85,7 +86,7 @@ type userAdminRow struct {
 	// the list links it to /nodes where the admin can reassign them.
 	Devices int
 	// IsSelf marks the signed-in admin's own row: self-delete is refused, and
-	// their own password change belongs on /account (it asks for the current
+	// their own password change belongs on /settings (it asks for the current
 	// password), so the row points there instead of offering a reset.
 	IsSelf bool
 	// IsLastAdmin marks the sole remaining admin: delete and demote are refused
@@ -93,9 +94,10 @@ type userAdminRow struct {
 	IsLastAdmin bool
 }
 
-// accountPageData drives GET /account, the self-service page every signed-in
-// user gets.
-type accountPageData struct {
+// settingsPageData drives GET /settings, the page every signed-in user gets:
+// their own account, plus links to the admin-only configuration that used to
+// crowd the top navigation.
+type settingsPageData struct {
 	User userView
 	CSRF string
 	// Changed is set after a successful password change (the post-change redirect
@@ -104,9 +106,27 @@ type accountPageData struct {
 	// MinPasswordLen is rendered as the form's hint + minlength attribute; it is
 	// auth.MinPasswordLen, the same number the server enforces.
 	MinPasswordLen int
+	// PeopleCount/AdminCount describe the People section for admins, so its link
+	// says something about what is behind it instead of being a bare word. Zero
+	// for a non-admin, who never sees that section.
+	PeopleCount int
+	AdminCount  int
 }
 
 var userRoleOptions = []string{string(store.RoleUser), string(store.RoleAdmin)}
+
+// countAdmins reports how many of these users are admins. Both the People page
+// and the settings summary need it, and the last-admin guard's behaviour is
+// explained in terms of it, so it is one function rather than two loops.
+func countAdmins(users []store.User) int {
+	n := 0
+	for _, u := range users {
+		if u.Role == store.RoleAdmin {
+			n++
+		}
+	}
+	return n
+}
 
 // --- GET /users ----------------------------------------------------------
 
@@ -149,12 +169,7 @@ func (s *Server) buildUsersPage(ctx context.Context, me store.User) (usersPageDa
 			owned[*n.OwnerUserID]++
 		}
 	}
-	admins := 0
-	for _, u := range users {
-		if u.Role == store.RoleAdmin {
-			admins++
-		}
-	}
+	admins := countAdmins(users)
 
 	data := usersPageData{
 		User:           userView{ID: me.ID, Display: me.Display, Role: me.Role},
@@ -311,7 +326,7 @@ func (s *Server) handleEditUser(w http.ResponseWriter, r *http.Request) {
 //
 // It deliberately does NOT ask for the target's current password — that is what
 // makes it a reset. An admin resetting THEIR OWN password is refused here and
-// pointed at /account, which does verify the current password (guardrail 4): a
+// pointed at /settings, which does verify the current password (guardrail 4): a
 // reset is a recovery tool for other people, not a way to skip proving you are
 // still at the keyboard.
 //
@@ -325,7 +340,7 @@ func (s *Server) handleResetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if id == me.ID {
-		http.Error(w, "to change your own password, use Account — it asks for your current password", http.StatusConflict)
+		http.Error(w, "to change your own password, use Settings — it asks for your current password", http.StatusConflict)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -433,27 +448,60 @@ func (s *Server) ownedDevicesError(ctx context.Context, id string) string {
 	return fmt.Sprintf("%s still owns %d %s. %s", id, n, noun, suffix)
 }
 
-// --- GET /account (self-service) -----------------------------------------
+// --- GET /settings --------------------------------------------------------
 
-// handleAccountPage renders the small self-service page: who you are signed in
-// as, and the change-my-password form. Available to EVERY signed-in user — it is
-// the one user-management thing a non-admin can do.
-func (s *Server) handleAccountPage(w http.ResponseWriter, r *http.Request) {
+// handleSettingsPage renders the settings page: who you are signed in as, the
+// change-my-password form, and — for an admin — the way through to People.
+// Available to EVERY signed-in user; changing your own password is the one
+// user-management thing a non-admin can do.
+//
+// People is LINKED from here rather than inlined. Inlining the registry (list +
+// add form + per-person edit/reset/delete) would rebuild the long
+// mixed-purpose page that /syncs and /nodes were pulled apart to avoid. The
+// point of this page is to get those destinations out of the top navigation,
+// not to merge them into one screen.
+func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	u, ok := userFromContext(r.Context())
 	if !ok {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	data := accountPageData{
+	data := settingsPageData{
 		User:           userView{ID: u.ID, Display: u.Display, Role: u.Role},
 		CSRF:           s.csrfFor(r),
 		Changed:        r.URL.Query().Get("changed") == "1",
 		MinPasswordLen: auth.MinPasswordLen,
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.templates.ExecuteTemplate(w, "account", data); err != nil {
-		s.logger.ErrorContext(r.Context(), "account page render failed", "err", err.Error())
+
+	// The People summary is admin-only, and a counting failure must not cost the
+	// user their password form: log it and leave the counts at zero, which the
+	// template reads as "unknown" and omits — zero is otherwise unreachable,
+	// since the admin looking at the page is themselves one of the people.
+	if u.Role == store.RoleAdmin {
+		users, err := s.store.ListUsers(r.Context())
+		if err != nil {
+			s.logger.ErrorContext(r.Context(), "settings: count people failed", "err", err.Error())
+		} else {
+			data.PeopleCount = len(users)
+			data.AdminCount = countAdmins(users)
+		}
 	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.templates.ExecuteTemplate(w, "settings", data); err != nil {
+		s.logger.ErrorContext(r.Context(), "settings page render failed", "err", err.Error())
+	}
+}
+
+// handleAccountRedirect keeps /account working. It was the self-service page
+// until settings absorbed it; bookmarks, and any message that still says
+// "Account", should land somewhere useful rather than 404.
+func (s *Server) handleAccountRedirect(w http.ResponseWriter, r *http.Request) {
+	dest := "/settings"
+	if r.URL.RawQuery != "" {
+		dest += "?" + r.URL.RawQuery
+	}
+	http.Redirect(w, r, dest, http.StatusMovedPermanently)
 }
 
 // --- POST /api/account/password (self-service change) --------------------
@@ -470,7 +518,7 @@ func (s *Server) handleAccountPage(w http.ResponseWriter, r *http.Request) {
 // On success every session of this user is revoked (including the one making the
 // request) and a FRESH session is minted for the caller, so: other devices are
 // logged out, and the caller keeps working with a rotated token + rotated CSRF.
-// Because the CSRF token rotates, the response is a redirect to /account rather
+// Because the CSRF token rotates, the response is a redirect to /settings rather
 // than an in-place fragment — the page reloads with the new token instead of
 // leaving the stale one embedded in the DOM.
 func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
@@ -538,7 +586,7 @@ func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.sessions.setCookie(w, token)
-	s.hxRedirect(w, r, "/account?changed=1")
+	s.hxRedirect(w, r, "/settings?changed=1")
 }
 
 // --- shared helpers ------------------------------------------------------

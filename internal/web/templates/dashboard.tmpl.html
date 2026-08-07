@@ -1,12 +1,7 @@
 {{define "dashboard"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync"}}
   <script>
     // The resolve-conflict POST returns 409 + a dashboard refresh when the sync
     // was already resolved by someone else. htmx swaps only 2xx by default; allow
@@ -34,24 +29,7 @@
   <!-- Modal mount: the conflict <dialog> swaps in here. -->
   <div id="modal"></div>
   <main class="container" id="dashboard">
-    <nav>
-      <ul><li><strong>RetroSync</strong></li></ul>
-      <ul>
-        {{if eq .User.Role "admin"}}
-        <li><a href="/discover">Discover</a></li>
-        <li><a href="/syncs">Syncs</a></li>
-        <li><a href="/nodes">Devices</a></li>
-        <li><a href="/users">People</a></li>
-        {{end}}
-        <li><a href="/account">Account</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <!-- MY SYNCS (status) ---------------------------------------------- -->
     <section>
