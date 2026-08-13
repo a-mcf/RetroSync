@@ -4,7 +4,7 @@
 > token on every state-changing POST, and admin-gating of the registry are all
 > built (`internal/web`, `internal/auth`). The `user set` CLI bootstraps the first
 > admin; **every user after that is managed in the app** (`/users`, admin-only)
-> and anyone can change their own password on `/account`. Reaching nodes is
+> and anyone can change their own password on `/settings`. Reaching nodes is
 > implemented for `syncthing-share` (localfs) only; the ssh path and the
 > smoke-test for ssh nodes are deferred (open-questions.md).
 
@@ -31,7 +31,7 @@ the Store is touched. Resolving a conflict
 (`/api/syncs/{id}/resolve-conflict`) requires the caller to **own a member node
 of that sync** *or* be an admin — enforced by `userOwnsAnyMember` (admins always
 pass). Viewing a sync and its conflict modal is allowed for any authenticated
-user (read-only). `/account` is the one authenticated-but-not-admin mutation:
+user (read-only). `/settings` is the one authenticated-but-not-admin mutation:
 changing your own password. See api.md for the per-route status codes.
 
 ## Managing people
@@ -47,8 +47,9 @@ in the app:
 - **`/users`** (admin-only) — add a person, edit display name + role, reset a
   password, delete an account. See ui.md for the refusals and api.md for the
   status codes.
-- **`/account`** (any signed-in user) — change your own password, proving the
+- **`/settings`** (any signed-in user) — change your own password, proving the
   current one first. This is the only user-management action a non-admin has.
+  Admins also reach `/users` from here; it is deliberately not in the top nav.
 
 **One hashing rule, one hashing path.** Every place a password is set — CLI,
 admin create, admin reset, self-service change — calls the same

@@ -225,20 +225,39 @@ throwing a 500:
 - A person who **still owns devices** cannot be deleted; the message names the
   count and points at `/nodes` to reassign them. Devices are never
   cascade-deleted or silently orphaned to make a user delete succeed.
-- An admin **resetting their own** password is sent to `/account` instead: a
+- An admin **resetting their own** password is sent to `/settings` instead: a
   reset skips proving you are still at the keyboard, which is fine for someone
   else's forgotten password and not fine for your own.
 
 A password reset, a role change, and a delete all **sign that person out
 everywhere** (sessions are server-side, so they can be revoked).
 
-### `/account` — your account
+### `/settings`
 
-Every signed-in user, admin or not. Shows who you are signed in as and lets you
-**change your own password**, which requires your **current** password (a
-borrowed unlocked session is not enough). Changing it signs you out on every
-other device and rotates your session here. Linked from the header on the
-dashboard.
+Every signed-in user, admin or not. Two sections:
+
+- **Your account** — who you are signed in as, and **change your own password**,
+  which requires your **current** password (a borrowed unlocked session is not
+  enough). Changing it signs you out on every other device and rotates your
+  session here.
+- **Administration** (admin only) — a summary of the people registry and a link
+  to `/users`.
+
+People is **linked, not inlined**. The registry is a list plus an add form plus
+per-person edit/reset/delete; folding that in would rebuild the long
+mixed-purpose page `/syncs` and `/nodes` were pulled apart to avoid. The point
+of this page is to get those destinations out of the top navigation, which was
+getting busy — not to merge two screens into one.
+
+`/account` was this page before settings absorbed it, and now **301s here**
+(preserving the query, so the post-change `?changed=1` confirmation survives).
+
+**Appearance is the obvious next section** — a dark/light/system preference. It
+is deliberately not here yet: every page hardcodes `data-theme="dark"` and
+RetroSync's own CSS layer has only ever been rendered on a dark ground, so the
+work is verifying badges, both conflict banners and the `color-mix` backgrounds
+read correctly on light — not adding the control. The shared `head` partial
+exists partly so that when it lands, `data-theme` is set in one place.
 
 ### `/nodes` — devices
 
@@ -287,6 +306,12 @@ The rules that follow from adopting it:
   ever genuinely needs coarse-pointer sizing, scope it to
   `@media (pointer: coarse)` rather than applying it to everything.
 - **Dark by default** — `<html data-theme="dark">` on every page.
+- **Page chrome is two shared partials**, `head` and `nav` (`layout.tmpl.html`).
+  `head` takes the page title as its data; `nav` takes a `userView`. The
+  navigation is the SAME on every page — it used to be an ad-hoc subset, so
+  where you could go depended on where you were. Admin-only destinations are
+  hidden from a non-admin rather than shown and refused (the server still gates
+  every one of them). Add a stylesheet, or the theme attribute, in one place.
 - **Destructive actions are the quietest control on the screen**, never a filled
   red button. Delete/remove is `class="secondary outline"`, lives inside the
   disclosure or dialog that owns the thing, and keeps its `hx-confirm`.

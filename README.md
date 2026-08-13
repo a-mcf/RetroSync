@@ -178,7 +178,7 @@ least 8 characters (the same rule the web forms apply).
 After that first admin exists, **everyone else is added in the app** — the
 admin-only **People** page (`/users`) adds people, edits display name and role,
 resets a password, and removes an account; every signed-in user can change their
-own password from **Account** (`/account`), which asks for the current one. The
+own password from **Settings** (`/settings`), which asks for the current one. The
 CLI stays as the bootstrap/recovery path — no more one-off pods just to add
 someone.
 

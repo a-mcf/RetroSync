@@ -545,7 +545,7 @@ func TestResetPassword_OwnAccountPointedAtSelfService(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("admin resetting their own password = %d, want 409\n%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Account") {
+	if !strings.Contains(rec.Body.String(), "Settings") {
 		t.Errorf("body = %q, want it to point at the self-service page", rec.Body.String())
 	}
 	// The password is unchanged: an admin cannot skip proving they are still at
@@ -576,28 +576,28 @@ func TestResetPassword_Rejections(t *testing.T) {
 
 // --- /account (self-service) ---------------------------------------------
 
-func TestAccountPage_AnySignedInUser(t *testing.T) {
+func TestSettingsPage_AnySignedInUser(t *testing.T) {
 	f := newActionFixture(t)
 	for _, id := range []string{"bob", "carol"} {
 		c, _ := loginAs(t, f, id)
-		rec := getPage(t, f, c, "/account")
+		rec := getPage(t, f, c, "/settings")
 		if rec.Code != http.StatusOK {
-			t.Fatalf("%s GET /account = %d, want 200", id, rec.Code)
+			t.Fatalf("%s GET /settings = %d, want 200", id, rec.Code)
 		}
 		body := rec.Body.String()
 		for _, want := range []string{"current_password", "new_password", "confirm_password", "csrf_token"} {
 			if !strings.Contains(body, want) {
-				t.Errorf("%s account page missing %q", id, want)
+				t.Errorf("%s settings page missing %q", id, want)
 			}
 		}
 	}
 }
 
-func TestAccountPage_UnauthenticatedRedirects(t *testing.T) {
+func TestSettingsPage_UnauthenticatedRedirects(t *testing.T) {
 	f := newActionFixture(t)
-	rec := getPage(t, f, nil, "/account")
+	rec := getPage(t, f, nil, "/settings")
 	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("anonymous GET /account = %d, want 303 to /login", rec.Code)
+		t.Fatalf("anonymous GET /settings = %d, want 303 to /login", rec.Code)
 	}
 }
 
@@ -620,7 +620,7 @@ func TestChangeOwnPassword_WrongCurrentRefused(t *testing.T) {
 		t.Fatal("the old password stopped working after a refused change")
 	}
 	// The refused attempt did not disturb the session.
-	if got := getPage(t, f, c, "/account"); got.Code != http.StatusOK {
+	if got := getPage(t, f, c, "/settings"); got.Code != http.StatusOK {
 		t.Errorf("a refused change logged the user out (status %d)", got.Code)
 	}
 }
@@ -639,8 +639,8 @@ func TestChangeOwnPassword_HappyPathRotatesSession(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("change status = %d, want 303\n%s", rec.Code, rec.Body.String())
 	}
-	if loc := rec.Header().Get("Location"); loc != "/account?changed=1" {
-		t.Errorf("redirect = %q, want /account?changed=1", loc)
+	if loc := rec.Header().Get("Location"); loc != "/settings?changed=1" {
+		t.Errorf("redirect = %q, want /settings?changed=1", loc)
 	}
 	// The new password works for login; the old one does not.
 	if !passwordWorks(t, f, "carol", newTestPassword) {
@@ -657,18 +657,18 @@ func TestChangeOwnPassword_HappyPathRotatesSession(t *testing.T) {
 	if fresh.Value == c.Value {
 		t.Error("the session token was not rotated on a password change")
 	}
-	if got := getPage(t, f, fresh, "/account"); got.Code != http.StatusOK {
+	if got := getPage(t, f, fresh, "/settings"); got.Code != http.StatusOK {
 		t.Errorf("the replacement session does not work (status %d)", got.Code)
 	}
 	// ...while the old token and every other device are signed out.
-	if got := getPage(t, f, c, "/account"); got.Code != http.StatusSeeOther {
+	if got := getPage(t, f, c, "/settings"); got.Code != http.StatusSeeOther {
 		t.Errorf("the pre-change session token still works (status %d)", got.Code)
 	}
-	if got := getPage(t, f, other, "/account"); got.Code != http.StatusSeeOther {
+	if got := getPage(t, f, other, "/settings"); got.Code != http.StatusSeeOther {
 		t.Errorf("the other device was not signed out (status %d)", got.Code)
 	}
 	// The confirmation page renders.
-	if got := getPage(t, f, fresh, "/account?changed=1"); !strings.Contains(got.Body.String(), "Password changed") {
+	if got := getPage(t, f, fresh, "/settings?changed=1"); !strings.Contains(got.Body.String(), "Password changed") {
 		t.Error("the post-change page does not confirm the change")
 	}
 }
@@ -898,7 +898,7 @@ func TestNoPasswordHashInAnyResponse(t *testing.T) {
 	needles = append(needles, "pw_hash", "argon2")
 
 	bodies := map[string]string{}
-	for _, path := range []string{"/users", "/account", "/nodes", "/", "/api/status", "/api/nodes", "/api/syncs"} {
+	for _, path := range []string{"/users", "/settings", "/nodes", "/", "/api/status", "/api/nodes", "/api/syncs"} {
 		bodies[path] = getPage(t, f, c, path).Body.String()
 	}
 	// Mutation responses (the refreshed list fragment) too.
@@ -918,6 +918,84 @@ func TestNoPasswordHashInAnyResponse(t *testing.T) {
 			if strings.Contains(body, needle) {
 				t.Errorf("%s response leaks %q", where, needle)
 			}
+		}
+	}
+}
+
+// --- /settings ------------------------------------------------------------
+
+// TestAccountRedirectsToSettings: /account was the self-service page until
+// settings absorbed it. It has to keep working — bookmarks, and the 409 that
+// sends an admin there to change their own password.
+func TestAccountRedirectsToSettings(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "carol")
+
+	rec := getPage(t, f, c, "/account")
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("GET /account = %d, want 301", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/settings" {
+		t.Errorf("redirect = %q, want /settings", loc)
+	}
+	// The post-change confirmation arrives as ?changed=1, so the query has to
+	// survive the redirect or the confirmation silently disappears.
+	q := getPage(t, f, c, "/account?changed=1")
+	if loc := q.Header().Get("Location"); loc != "/settings?changed=1" {
+		t.Errorf("redirect = %q, want the query preserved", loc)
+	}
+}
+
+// TestSettingsPage_PeopleIsAdminOnly: the People section is the reason People
+// left the top nav, so an admin must find it here — and a non-admin must not,
+// since /users would 403 them anyway.
+func TestSettingsPage_PeopleIsAdminOnly(t *testing.T) {
+	f := newActionFixture(t)
+
+	admin, _ := loginAs(t, f, "bob")
+	body := getPage(t, f, admin, "/settings").Body.String()
+	for _, want := range []string{"Administration", "Manage people", `href="/users"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("admin settings page missing %q", want)
+		}
+	}
+	// The fixture seeds bob (admin) and carol (user).
+	if !strings.Contains(body, "2 people") || !strings.Contains(body, "1 admin") {
+		t.Errorf("admin settings page should summarise the registry, got:\n%s", body)
+	}
+
+	plain, _ := loginAs(t, f, "carol")
+	pbody := getPage(t, f, plain, "/settings").Body.String()
+	for _, unwanted := range []string{"Administration", "Manage people"} {
+		if strings.Contains(pbody, unwanted) {
+			t.Errorf("non-admin settings page offers %q", unwanted)
+		}
+	}
+	// ...but they still get their own password form.
+	if !strings.Contains(pbody, "current_password") {
+		t.Error("non-admin settings page is missing the password form")
+	}
+}
+
+// TestNav_SharedAcrossPages: the navigation is one partial now, so every page
+// offers the same destinations — and People is not among them.
+func TestNav_SharedAcrossPages(t *testing.T) {
+	f := newActionFixture(t)
+	c, _ := loginAs(t, f, "bob")
+
+	// /syncs/{id}/history is the page that needed a NEW User field for the shared
+	// nav — a zero-value userView renders without error, so only an explicit
+	// check catches it going missing.
+	for _, path := range []string{"/", "/syncs", "/nodes", "/users", "/discover", "/settings", "/syncs/sm-bob/history"} {
+		body := getPage(t, f, c, path).Body.String()
+		for _, want := range []string{`href="/discover"`, `href="/syncs"`, `href="/nodes"`, `href="/settings"`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s nav missing %q", path, want)
+			}
+		}
+		// People moved under Settings; the top nav must not link it directly.
+		if strings.Contains(body, `<li><a href="/users">`) {
+			t.Errorf("%s still links People from the nav", path)
 		}
 	}
 }

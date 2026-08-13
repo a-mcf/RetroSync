@@ -1,12 +1,7 @@
 {{define "nodes"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Devices</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — Devices"}}
   <script>
     // Reveal the reach_config fields that apply to the selected reach. Pure
     // progressive-enhancement: the server validates the shape regardless.
@@ -61,18 +56,7 @@
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <main class="container">
-    <nav>
-      <ul><li><strong>RetroSync — Devices</strong></li></ul>
-      <ul>
-        <li><a href="/">&larr; Dashboard</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <hgroup>
@@ -225,11 +209,7 @@
 {{define "forbidden"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Forbidden</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
+  {{template "head" "RetroSync — Forbidden"}}
 </head>
 <body>
   <main class="container">

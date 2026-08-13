@@ -231,7 +231,7 @@ func testLastAdminGuard(t *testing.T, s store.Store) {
 	must(t, s.UpdateUserProfile(c, "plain", "Plain", store.RoleUser))
 
 	// Resetting the SOLE admin's password is always allowed. This is the
-	// recovery path (`retrosync user set <id>` with no --role, and the /account
+	// recovery path (`retrosync user set <id>` with no --role, and the /settings
 	// form): it must never collide with the lockout guard, which is exactly what
 	// a whole-row update did — it carried role=user along and got refused.
 	must(t, s.UpdateUserPassword(c, "root", "h2"))

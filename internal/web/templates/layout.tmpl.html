@@ -1,0 +1,52 @@
+{{/* Shared page chrome. Every full page uses these two, so a change to the
+     stylesheet set or the navigation is one edit rather than eight.
+
+     "head" takes the page TITLE as its data (a plain string), not the page
+     model — the only thing that varies. A page's own inline <script> goes
+     after this template, inside its own <head>.
+
+     Deliberately loaded here rather than per page: adding the theme
+     preference later means setting data-theme in ONE place, which is most of
+     why this partial exists now.
+
+     htmx is loaded unconditionally, so /login and the forbidden page now pull
+     ~50KB they do not use. That is the price of one head instead of eight, and
+     /static/ is already unauthenticated so it changes no exposure. Split the
+     partial if that ever matters. */}}
+{{define "head"}}
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.}}</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+{{end}}
+
+{{/* "nav" takes a userView. The navigation is now the SAME on every page —
+     it used to be an ad-hoc subset per page, so where you could go depended on
+     where you were. The brand links home, so the old per-page "← Dashboard"
+     link is redundant.
+
+     Admin-only destinations are hidden from a non-admin rather than shown and
+     refused: the server still gates every one of them (requireAdmin), this
+     just stops offering doors that will not open. People lives under Settings,
+     not here — it is configuration, not part of the sync workflow. */}}
+{{define "nav"}}
+<nav>
+  <ul><li><a href="/" class="brand"><strong>RetroSync</strong></a></li></ul>
+  <ul>
+    {{if eq .Role "admin"}}
+    <li><a href="/discover">Discover</a></li>
+    <li><a href="/syncs">Syncs</a></li>
+    <li><a href="/nodes">Devices</a></li>
+    {{end}}
+    <li><a href="/settings">Settings</a></li>
+    <li class="whoami">
+      <small>{{.Display}} ({{.Role}})</small>
+      <form method="post" action="/logout">
+        <button class="linkbtn" type="submit">Sign out</button>
+      </form>
+    </li>
+  </ul>
+</nav>
+{{end}}

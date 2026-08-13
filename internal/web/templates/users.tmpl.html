@@ -1,12 +1,7 @@
 {{define "users"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — People</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — People"}}
   <script>
     // Let HTMX swap the 400/409/422 bodies so the refusal text (last admin,
     // still owns devices, password too short) shows in place instead of
@@ -19,19 +14,7 @@
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <main class="container">
-    <nav>
-      <ul><li><strong>RetroSync — People</strong></li></ul>
-      <ul>
-        <li><a href="/">&larr; Dashboard</a></li>
-        <li><a href="/account">Account</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <hgroup>
@@ -62,7 +45,7 @@
                    minlength="{{.MinPasswordLen}}">
           </label>
           <small class="sub">At least {{.MinPasswordLen}} characters. They can change it
-             themselves from Account once they sign in.</small>
+             themselves from Settings once they sign in.</small>
           <button type="submit">Save person</button>
           <div class="form-error"></div>
         </form>
@@ -104,7 +87,7 @@
 
   {{if .IsSelf}}
     <p><small class="sub">This is you — change your own password on
-      <a href="/account">Account</a>.</small></p>
+      <a href="/settings">Settings</a>.</small></p>
   {{end}}
 
   <details>
@@ -151,15 +134,10 @@
 </article>
 {{end}}{{end}}
 
-{{define "account"}}<!doctype html>
+{{define "settings"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Account</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — Settings"}}
   <script>
     // Show the 400/403 refusal text (wrong current password, mismatch, too
     // short) in place rather than swallowing it.
@@ -171,18 +149,7 @@
 </head>
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   <main class="container">
-    <nav>
-      <ul><li><strong>RetroSync — Account</strong></li></ul>
-      <ul>
-        <li><a href="/">&larr; Dashboard</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <h2>Your account</h2>
@@ -218,6 +185,26 @@
         </form>
       </article>
     </section>
+
+    {{if eq .User.Role "admin"}}
+    <section>
+      <h2>Administration</h2>
+      <article>
+        <header><strong>People</strong></header>
+        <p>Everyone who can sign in: add someone, change a display name or role,
+           reset a password, or remove an account.</p>
+        {{/* Zero is unreachable when the count succeeded — the admin reading
+             this is themselves proof of at least one person — so a zero here
+             means the count FAILED, and the summary is omitted rather than
+             stating a confident falsehood. */}}
+        {{if .PeopleCount}}
+        <p><small class="sub">{{.PeopleCount}} {{if eq .PeopleCount 1}}person{{else}}people{{end}}
+           &middot; {{.AdminCount}} admin{{if ne .AdminCount 1}}s{{end}}</small></p>
+        {{end}}
+        <a href="/users" role="button" class="secondary outline">Manage people</a>
+      </article>
+    </section>
+    {{end}}
   </main>
 </body>
 </html>{{end}}

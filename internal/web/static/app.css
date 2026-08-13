@@ -126,6 +126,10 @@ dialog article { margin: 0; }
 dialog article > footer { display: flex; gap: 0.5rem; justify-content: flex-end; }
 dialog article > footer button { margin: 0; width: auto; }
 
+/* The brand links home, which is why the per-page "← Dashboard" link could go.
+   It should read as the page's name, not as one more navigation link. */
+.brand { color: inherit; text-decoration: none; }
+
 /* The nav's identity block: pushed right, quieter than the links. */
 .whoami { color: var(--pico-muted-color); }
 .whoami form { display: inline; margin: 0; }

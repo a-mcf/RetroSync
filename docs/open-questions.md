@@ -159,3 +159,24 @@ the request. RetroSync runs single-replica today. If it ever scales out (or if
 store — a `sessions` table or Redis — behind the same `sessionManager` methods
 (`create` / `lookup` / `destroy` / `destroyUser`); nothing above that interface
 would change.
+
+## `?changed=1` is a spoofable confirmation — OPEN, low
+
+`/settings?changed=1` renders "Password changed. Any other device you were
+signed in on has been signed out." purely from the query flag, so a crafted link
+shows that message to someone whose password did not change. Pre-existing (it
+was `/account?changed=1`), and the impact is UI spoofing only — no state moves,
+and the real change still requires the current password plus CSRF. It survives
+because the CSRF token rotates on a password change, so the response has to be a
+redirect rather than a swapped fragment, and the redirect needs to carry the
+confirmation somehow. The fix if it ever matters is a one-shot server-side flag
+(consumed on first render) instead of a query parameter.
+
+## Counting people reads full user rows — OPEN, informational
+
+The settings page and the People page both derive their counts from
+`ListUsers`, which returns whole `store.User` rows — `pw_hash` included — to
+produce two integers. Nothing renders or logs them, and neither `userView` nor
+`settingsPageData` can structurally carry a hash, so this is defence in depth
+rather than a defect. A `CountUsers(ctx) (people, admins int, err error)` on the
+Store would keep hashes out of those requests' memory entirely.

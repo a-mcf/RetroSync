@@ -1,12 +1,7 @@
 {{define "syncs"}}<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RetroSync — Syncs</title>
-  <link rel="stylesheet" href="/static/pico.min.css">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/htmx.min.js" defer></script>
+  {{template "head" "RetroSync — Syncs"}}
   <script>
     // Let HTMX swap the 4xx bodies so inline error text (409/422/400) shows.
     document.addEventListener('htmx:beforeOnLoad', function (e) {
@@ -92,19 +87,7 @@
   <!-- Modal mount: the member editor <dialog> swaps in here. -->
   <div id="modal"></div>
   <main class="container">
-    <nav>
-      <ul><li><strong>RetroSync — Syncs</strong></li></ul>
-      <ul>
-        <li><a href="/">&larr; Dashboard</a></li>
-        <li><a href="/discover">Discover</a></li>
-        <li class="whoami">
-          <small>{{.User.Display}} ({{.User.Role}})</small>
-          <form method="post" action="/logout">
-            <button class="linkbtn" type="submit">Sign out</button>
-          </form>
-        </li>
-      </ul>
-    </nav>
+    {{template "nav" .User}}
 
     <section>
       <article class="callout">
