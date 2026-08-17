@@ -3,11 +3,9 @@
 // to this interface, so it stays adapter-agnostic and fully unit-testable
 // against an in-memory fake (see internal/reach/fakereach).
 //
-// Real adapters (local Syncthing-share filesystem, ssh/sftp) implement this
-// interface in a later slice.
-//
-// TODO(slice-reach-adapters): provide the concrete syncthing-share (local fs)
-// and ssh/sftp implementations of Reach.
+// The one implementation today is the local Syncthing-share filesystem adapter
+// (internal/reach/localfs). Adding another device transport means adding an
+// adapter here and a `reach` value in the store — the engine does not change.
 package reach
 
 import (
@@ -24,11 +22,13 @@ import (
 var ErrNotExist = errors.New("reach: file does not exist")
 
 // ErrUnsupportedReach is returned by a Resolver when a node's reach strategy has
-// no adapter wired yet. Callers compare with errors.Is. Today the ssh/sftp
-// adapter is unimplemented, so a Resolver returns this for ssh nodes.
+// no adapter. Callers compare with errors.Is.
 //
-// TODO(slice-ssh): remove the ssh case from this sentinel once the ssh/sftp
-// adapter (with secret-store credential handling) lands.
+// Every strategy the registry accepts has an adapter, so this means the node's
+// `reach` value is one nothing can serve — a data fault rather than a missing
+// feature. It stays a sentinel because bulk callers (discovery, the poll loop)
+// use it to skip the offending node and carry on rather than failing the whole
+// pass, and the on-demand smoke test still surfaces it to the admin.
 var ErrUnsupportedReach = errors.New("reach: unsupported reach strategy")
 
 // FileMeta is the fast-path identity of a file: modification time and size.

@@ -3,6 +3,7 @@ package resolve
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,25 +49,24 @@ func TestResolveReach_SyncthingShare_EmptyPath(t *testing.T) {
 	}
 }
 
-func TestResolveReach_SSH_Unsupported(t *testing.T) {
-	node := store.Node{
-		ID:          "mister",
-		Reach:       store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "10.0.0.1", User: "root", SecretRef: "mister-1"},
-	}
-	_, err := ResolveReach(node)
-	if !errors.Is(err, reach.ErrUnsupportedReach) {
-		t.Fatalf("ssh node err = %v, want ErrUnsupportedReach", err)
-	}
-}
-
+// TestResolveReach_Unknown pins the contract that replaced the ssh case (0010).
+// An unrecognized reach is a data fault — the CHECK constraint and
+// store.ValidReach both prevent one being written — but it reports with the
+// ErrUnsupportedReach sentinel rather than a bare error, because bulk callers
+// (discovery, the poll loop) match on it to skip that ONE node and keep going.
+// A bare error there would fail the whole pass over one bad row.
 func TestResolveReach_Unknown(t *testing.T) {
 	node := store.Node{ID: "weird", Reach: store.Reach("carrier-pigeon")}
 	_, err := ResolveReach(node)
 	if err == nil {
 		t.Fatal("unknown reach = nil err, want error")
 	}
-	if errors.Is(err, reach.ErrUnsupportedReach) {
-		t.Fatal("unknown reach should not be ErrUnsupportedReach (that is for ssh)")
+	if !errors.Is(err, reach.ErrUnsupportedReach) {
+		t.Fatalf("unknown reach err = %v, want ErrUnsupportedReach so bulk callers skip it", err)
+	}
+	// The offending value belongs in the message; an operator has to be able to
+	// tell WHICH node and which value from the log alone.
+	if !strings.Contains(err.Error(), "carrier-pigeon") || !strings.Contains(err.Error(), "weird") {
+		t.Errorf("error should name the node and the bad value, got: %v", err)
 	}
 }

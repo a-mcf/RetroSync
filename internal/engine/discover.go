@@ -87,7 +87,7 @@ type DiscoveredGame struct {
 // sync member, and aggregates the survivors by inferred game name. It is
 // READ-ONLY (no store or node writes) and resilient:
 //
-//   - A node whose reach has no directory listing (ssh today, which resolves to
+//   - A node whose reach has no directory listing (which resolves to
 //     reach.ErrUnsupportedReach) is SKIPPED, not errored — one unsupported node
 //     must not fail the whole scan.
 //   - A node whose scan errors (missing share, transient I/O) is SKIPPED with a
@@ -128,8 +128,8 @@ func (e *Engine) DiscoverGames(ctx context.Context) ([]DiscoveredGame, error) {
 	for _, n := range nodes {
 		r, err := e.resolve(n)
 		if err != nil {
-			// A node whose reach has no directory-listing adapter (ssh today) is
-			// skipped — not an error. One unsupported node must not fail the scan.
+			// A node whose reach has no directory-listing adapter is skipped — not
+			// an error. One bad node must not fail the scan.
 			if errors.Is(err, reach.ErrUnsupportedReach) {
 				e.logDiscoverSkip(ctx, n.ID, "reach not supported for directory listing", err)
 				continue

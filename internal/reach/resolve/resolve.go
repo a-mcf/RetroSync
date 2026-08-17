@@ -4,7 +4,7 @@
 // reach strategy and reach_config.
 //
 // It lives in its own package (not in internal/reach) so it can import the
-// concrete adapters (localfs, and ssh later) without creating an import cycle —
+// concrete adapters (localfs today) without creating an import cycle —
 // those adapters depend on internal/reach, which must stay adapter-free.
 package resolve
 
@@ -27,10 +27,12 @@ import (
 //     save root" and join game_paths.path directly under it.
 //     TODO(slice-save-root): honor a separate save_root once it exists in the
 //     registry schema.
-//   - ssh: not implemented this slice. Returns reach.ErrUnsupportedReach.
-//     TODO(slice-ssh): construct the ssh/sftp adapter with secret-store
-//     credential resolution (reach_config.host/user/secret_ref).
-//   - anything else: an error (an unknown/unset reach is a data fault).
+//   - anything else: reach.ErrUnsupportedReach. Both the CHECK constraint and
+//     store.ValidReach limit `reach` to the strategies above, so an unrecognized
+//     value is a data fault (a hand-edited row, or a database written by a newer
+//     build). It is reported with the sentinel rather than a bare error so bulk
+//     callers — discovery, the poll loop — skip that one node and keep going
+//     instead of failing wholesale.
 func ResolveReach(node store.Node) (reach.Reach, error) {
 	switch node.Reach {
 	case store.ReachSyncthingShare:
@@ -43,10 +45,8 @@ func ResolveReach(node store.Node) (reach.Reach, error) {
 			return nil, fmt.Errorf("resolve: node %q: %w", node.ID, err)
 		}
 		return r, nil
-	case store.ReachSSH:
-		// TODO(slice-ssh): build the ssh/sftp adapter here.
-		return nil, fmt.Errorf("resolve: node %q reach=ssh: %w", node.ID, reach.ErrUnsupportedReach)
 	default:
-		return nil, fmt.Errorf("resolve: node %q has unknown reach %q", node.ID, node.Reach)
+		return nil, fmt.Errorf("resolve: node %q has unknown reach %q: %w",
+			node.ID, node.Reach, reach.ErrUnsupportedReach)
 	}
 }

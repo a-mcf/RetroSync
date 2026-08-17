@@ -5,8 +5,7 @@
 > built (`internal/web`, `internal/auth`). The `user set` CLI bootstraps the first
 > admin; **every user after that is managed in the app** (`/users`, admin-only)
 > and anyone can change their own password on `/settings`. Reaching nodes is
-> implemented for `syncthing-share` (localfs) only; the ssh path and the
-> smoke-test for ssh nodes are deferred (open-questions.md).
+> implemented for `syncthing-share` (localfs), the only reach strategy.
 
 ## Identities
 
@@ -14,7 +13,7 @@
   baseline params, constant-time verify). Sessions are server-side, keyed by an
   `HttpOnly`/`Secure`/`SameSite=Lax` cookie; the session token and a paired CSRF
   token rotate on every login (session-fixation defense).
-- **Nodes** are not authenticated peers — retrosync reaches into them. For a Deck it reads the Syncthing share locally on the server. For a MiSTer it SSHs in. For an Anbernic running KNULLI/Batocera, similar SSH/SFTP.
+- **Nodes** are not authenticated peers — retrosync never connects *to* a device. Every device runs Syncthing and shares its save folder to the server; retrosync reads and writes those shares as local files.
 
 There's no per-node API token because nodes don't call retrosync; retrosync calls nodes (or reads files local to itself).
 
@@ -92,9 +91,14 @@ a shared/persistent session store is the follow-up if that changes.
 For each node, retrosync needs credentials *to itself*, not to the user. Stored encrypted in the registry:
 
 - **Syncthing-share node** (Deck): `backup_root` is a path on the server's filesystem. No creds needed beyond filesystem permissions.
-- **SSH/SFTP node** (MiSTer, Anbernic): username + password (or key). Read in from a file on disk that's mode 0600 and owned by the retrosync user. Don't store cleartext in SQLite — keep it in a sidecar `secrets.yaml` referenced by node id, or use the host's existing secret store (sops-encrypted file, vault agent, etc).
+There are **no per-node credentials today** — the only reach strategy is a local
+filesystem path, so there is nothing to authenticate to. `reach_config` carries
+non-secret connection info only.
 
-The MiSTer-specific note: root fs is read-only there; SSH key auth requires rebuilding linux.img. Until then, password auth + the secret store is the path.
+If a future strategy ever needs a credential, it goes in the host's secret store
+(sops file, vault agent) behind a *reference* in `reach_config` — never a
+cleartext secret in the column. The Postgres conformance suite guards that column
+against credential-shaped fields precisely so this stays true.
 
 ## Pairing a new device
 
@@ -102,8 +106,7 @@ Power-user flow (admin, via `/nodes`):
 
 1. Add the node entry: id, kind, display, reach-config.
 2. retrosync runs a smoke test (stat the node's save root). **Implemented for
-   `syncthing-share`** (a localfs stat); for `ssh` nodes the smoke-test reports
-   "not supported yet (ssh adapter pending)" until the ssh adapter lands.
+   `syncthing-share`** (a localfs stat), which is every node.
 3. Smoke pass → node appears as available; it can now be added as a member of a
    sync (via `/discover` or the `/syncs` member picker).
 
