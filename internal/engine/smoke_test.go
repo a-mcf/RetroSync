@@ -67,20 +67,23 @@ func TestSmokeTest_SyncthingShareUnreachable(t *testing.T) {
 	}
 }
 
-func TestSmokeTest_SSHUnsupported(t *testing.T) {
+// The resolver error is injected, so this pins the MAPPING — an unresolvable
+// reach becomes the engine's own sentinel while keeping the cause in the chain —
+// independently of which reach values exist.
+func TestSmokeTest_UnresolvableReach(t *testing.T) {
 	eng, st := newSmokeEngine(t, nil, map[string]error{"mister": reach.ErrUnsupportedReach})
 	if err := st.CreateNode(ctx(), store.Node{
 		ID: "mister", Display: "Living-room MiSTer", Kind: store.KindMister,
-		Reach: store.ReachSSH, ReachConfig: store.ReachConfig{Host: "10.0.0.2", User: "root", SecretRef: "mister-1"},
+		Reach: store.ReachSyncthingShare, ReachConfig: store.ReachConfig{Path: "/shares/mister"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	err := eng.SmokeTest(ctx(), "mister")
 	if !errors.Is(err, engine.ErrSmokeTestUnsupported) {
-		t.Fatalf("ssh smoke-test err = %v, want ErrSmokeTestUnsupported", err)
+		t.Fatalf("smoke-test err = %v, want ErrSmokeTestUnsupported", err)
 	}
 	if !errors.Is(err, reach.ErrUnsupportedReach) {
-		t.Fatalf("ssh smoke-test err = %v should also wrap reach.ErrUnsupportedReach", err)
+		t.Fatalf("smoke-test err = %v should also wrap reach.ErrUnsupportedReach", err)
 	}
 }
 
@@ -134,20 +137,20 @@ func TestBrowseNode_SyncthingShareListsEntries(t *testing.T) {
 	}
 }
 
-func TestBrowseNode_SSHUnsupported(t *testing.T) {
+func TestBrowseNode_UnresolvableReach(t *testing.T) {
 	eng, st := newSmokeEngine(t, nil, map[string]error{"mister": reach.ErrUnsupportedReach})
 	if err := st.CreateNode(ctx(), store.Node{
 		ID: "mister", Display: "Living-room MiSTer", Kind: store.KindMister,
-		Reach: store.ReachSSH, ReachConfig: store.ReachConfig{Host: "10.0.0.2", User: "root", SecretRef: "mister-1"},
+		Reach: store.ReachSyncthingShare, ReachConfig: store.ReachConfig{Path: "/shares/mister"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	_, err := eng.BrowseNode(ctx(), "mister", "")
 	if !errors.Is(err, engine.ErrBrowseUnsupported) {
-		t.Fatalf("ssh browse err = %v, want ErrBrowseUnsupported", err)
+		t.Fatalf("browse err = %v, want ErrBrowseUnsupported", err)
 	}
 	if !errors.Is(err, reach.ErrUnsupportedReach) {
-		t.Fatalf("ssh browse err = %v should also wrap reach.ErrUnsupportedReach", err)
+		t.Fatalf("browse err = %v should also wrap reach.ErrUnsupportedReach", err)
 	}
 }
 

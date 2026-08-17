@@ -190,15 +190,18 @@ func TestPostgresConcurrentDemoteKeepsAnAdmin(t *testing.T) {
 }
 
 // TestPostgresReachConfigNoSecret asserts the persisted reach_config JSON never
-// contains a cleartext secret field — only the secret_ref pointer.
+// contains a cleartext credential field. reach_config carries only non-secret
+// connection info — today just the share path — and this guards the day a
+// strategy needing credentials is added: the credential belongs in the host
+// secret store behind a reference, never in this column.
 func TestPostgresReachConfigNoSecret(t *testing.T) {
 	pool := freshPool(t)
 	s := postgres.New(pool)
 	ctx := context.Background()
 
 	if err := s.CreateNode(ctx, store.Node{
-		ID: "mister", Display: "MiSTer", Kind: store.KindMister, Reach: store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "172.16.7.12", User: "root", SecretRef: "mister-1"},
+		ID: "mister", Display: "MiSTer", Kind: store.KindMister, Reach: store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/mister-saves"},
 	}); err != nil {
 		t.Fatalf("create node: %v", err)
 	}
@@ -212,8 +215,8 @@ func TestPostgresReachConfigNoSecret(t *testing.T) {
 			t.Errorf("reach_config JSON contains banned secret field %q: %s", banned, raw)
 		}
 	}
-	if !containsFold(raw, "secret_ref") {
-		t.Errorf("reach_config JSON missing secret_ref pointer: %s", raw)
+	if !containsFold(raw, "path") {
+		t.Errorf("reach_config JSON missing its path: %s", raw)
 	}
 }
 

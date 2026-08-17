@@ -59,22 +59,20 @@ Decision: ship RetroSync as a **standalone Kubernetes deployment** that mounts t
 **Built:** the read *and* write path for `syncthing-share` nodes goes through the
 **localfs** reach adapter (atomic temp-file-then-rename), rooted at
 `reach_config.path`. The engine writes the winning save back into the same local
-share path it read from — Syncthing then replicates it out. (Writeback *into a
-locked-down device over SSH* is the separate deferred item below; the localfs
-write path itself is implemented.)
+share path it read from — Syncthing then replicates it out.
 
-## Writeback for syncthing-share nodes — partially RESOLVED (ssh deferred)
+## Writeback for syncthing-share nodes — RESOLVED (through the share)
 
-Today's plan: read/write via the local Syncthing share for `syncthing-share`
-nodes (built, via localfs). The remaining open piece is writing back into devices
-that must be reached **over SSH/SFTP** (MiSTer's RO root, locked-down handhelds).
-That requires the device to be SSH-reachable, and for some devices it isn't.
+RetroSync writes the winning save back into the same local share it read from,
+and Syncthing replicates it outward. The concern that motivated an out-of-band
+SSH path — that writing into the share races the device's own writes — is
+handled in the engine instead: it only writes to members that did not change
+since the last poll, and pauses the sync when more than one did.
 
-**Status:** the **ssh adapter is not built** — `ssh` nodes resolve to
-"not supported yet" (`reach.ErrUnsupportedReach`) and the registry smoke-test
-surfaces that. So today only `syncthing-share` (localfs) nodes are fully
-operational. Open: accept "writeable SSH nodes need SSH" as a hard requirement, or
-eventually ship a node-side agent that listens for push.
+The residual coupling is that RetroSync depends on Syncthing *noticing* the
+write, which has bitten once (a byte-identical mtime+size was invisible to its
+scanner) and is now covered by the mtime policy. Verifying delivery rather than
+assuming it is tracked separately below.
 
 ## Conflict resolution UX — RESOLVED (built)
 
@@ -112,7 +110,8 @@ or **match by filename** (group saves whose filenames infer the same game name).
 
 Decision: **filename-match**, shipped as the read-only `/discover` on-ramp (slice
 22). The engine's `DiscoverGames` scans each directory-listing-reachable node's
-save dir (ssh skipped, not errored; the walk is depth-/entry-bounded so it can't
+save dir (a node whose reach cannot be resolved is skipped, not errored; the walk
+is depth-/entry-bounded so it can't
 hang), collects **save-like** files (a fixed SRAM/EEPROM/memory-card extension
 set; `.state*` excluded per "What counts as the same save?" above), infers a game
 name (strip extension + trailing `(...)`/`[...]` region/version tags), excludes
@@ -137,14 +136,22 @@ status surface. (The registry smoke-test *does* probe localfs reachability live;
 this open item is specifically about the always-on Syncthing-derived status, not
 the on-demand smoke-test.)
 
-## SSH adapter pending — OPEN
+## SSH adapter — RESOLVED by removal (migration 0010)
 
-The `ssh` reach strategy has no adapter yet: `ssh` nodes resolve to
-`reach.ErrUnsupportedReach` ("not supported yet"). Until it lands, only
-`syncthing-share` (localfs) nodes are operational, and SSH writeback into
-locked-down devices (see "Writeback for syncthing-share nodes" above) is blocked on
-it. Building it means an ssh/sftp adapter with secret-store credential resolution
-(`reach_config.host/user/secret_ref`).
+The `ssh` reach strategy was an assumption about the MiSTer: its root filesystem
+is read-only, so the design assumed Syncthing could not run there and RetroSync
+would need to SFTP in. **The MiSTer runs Syncthing.** The strategy never had a
+device, was never implemented, and was still offered in the `/nodes` reach
+dropdown — so choosing it produced a node that silently never synced.
+
+Removed rather than built: the strategy, its `reach_config` fields
+(`host`/`user`/`secret_ref`), the form fields, and the enum value (migration
+0010 refuses to run if any node still uses it).
+
+The `Reach` port is untouched. A device that genuinely cannot run Syncthing is
+still served by writing an adapter and adding a `reach` value — that extension
+point was the actual design goal, and it survives without a speculative second
+strategy sitting in it.
 
 ## Sessions are per-process, so revocation is per-replica — OPEN
 
@@ -180,3 +187,15 @@ produce two integers. Nothing renders or logs them, and neither `userView` nor
 `settingsPageData` can structurally carry a hash, so this is defence in depth
 rather than a defect. A `CountUsers(ctx) (people, admins int, err error)` on the
 Store would keep hashes out of those requests' memory entirely.
+
+## Verifying delivery rather than assuming it — OPEN
+
+RetroSync writes a save into the share and treats the write as done. It never
+asks Syncthing whether the file was actually **delivered** to the other devices,
+and Syncthing can silently fail to finalize a transfer (observed on NFS-backed
+folders). Its per-device completion API can answer that question, and
+`POST /rest/db/scan?folder=&sub=` after a fan-out addresses the related blind
+spot where inotify cannot see writes made by another client over NFS.
+
+This is the highest-value remaining integrity work: it covers the path that
+already carries real saves.

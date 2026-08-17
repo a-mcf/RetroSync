@@ -43,7 +43,7 @@ import (
 
 // ResolveReach maps a node to the Reach adapter that talks to it. Injecting
 // this keeps the engine adapter-agnostic: tests supply fakes; production wires
-// the real syncthing-share / ssh adapters.
+// the real syncthing-share adapter.
 type ResolveReach func(node store.Node) (reach.Reach, error)
 
 // Clock returns the current time. Injected so tests get deterministic
@@ -167,18 +167,17 @@ var (
 	// fan-out would silently overwrite members the human never reviewed.
 	ErrNotConflicted = errors.New("engine: sync is not in conflict")
 	// ErrSmokeTestUnsupported is returned by SmokeTest when the node's reach
-	// strategy has no adapter wired yet (today: ssh). It is the engine's own
+	// strategy has no adapter. It is the engine's own
 	// sentinel so the web layer can map "not supported yet" WITHOUT importing
 	// internal/reach (it wraps reach.ErrUnsupportedReach for engine-side callers
 	// that still want the underlying cause).
 	ErrSmokeTestUnsupported = errors.New("engine: smoke-test not supported for this reach")
 	// ErrBrowseUnsupported is returned by BrowseNode when the node's reach
-	// strategy has no adapter wired yet (today: ssh), and by BrowseServer when no
+	// strategy has no adapter, and by BrowseServer when no
 	// share root is configured (WithShareRoot unset). Like ErrSmokeTestUnsupported
 	// it is the engine's own sentinel so the web pickers can render a friendly
 	// "browsing not supported" note WITHOUT importing internal/reach; for the
 	// BrowseNode case the underlying reach.ErrUnsupportedReach stays in the chain.
-	// TODO(slice-ssh): ssh nodes become browsable once the ssh/sftp adapter lands.
 	ErrBrowseUnsupported = errors.New("engine: browsing not supported for this reach")
 	// ErrBrowseUnsafePath is returned by BrowseNode when the requested relPath is
 	// rejected by the adapter's containment check (it is absolute, or it escapes
@@ -479,11 +478,10 @@ const smokeTestRoot = "."
 //   - syncthing-share: a nil return means the share directory exists and is
 //     readable (the node is reachable). A non-nil return is the underlying
 //     reach error, surfaced to the operator (e.g. the share path is missing).
-//   - ssh: resolve has no adapter yet, so this returns ErrSmokeTestUnsupported
+//   - a reach nothing can serve: returns ErrSmokeTestUnsupported
 //     (which wraps reach.ErrUnsupportedReach). The web layer matches the engine
 //     sentinel and renders "smoke-test not supported yet (ssh adapter pending)",
 //     so it never needs to import internal/reach.
-//     TODO(slice-ssh): a real ssh adapter makes this an actual reachability probe.
 //
 // SmokeTest is read-only: it never mutates the store or the node. Its result is
 // transient — nothing is persisted (the web handler renders a one-off
@@ -496,10 +494,10 @@ func (e *Engine) SmokeTest(ctx context.Context, nodeID string) error {
 	}
 	r, err := e.resolve(node)
 	if err != nil {
-		// A resolve with no adapter wired (ssh today) surfaces as the engine's own
-		// ErrSmokeTestUnsupported so the web layer can map "not supported yet"
-		// without importing internal/reach. The underlying reach.ErrUnsupportedReach
-		// is preserved in the chain for engine-side callers.
+		// A reach nothing can serve surfaces as the engine's own
+		// ErrSmokeTestUnsupported so the web layer can report it without importing
+		// internal/reach. The underlying reach.ErrUnsupportedReach is preserved in
+		// the chain for engine-side callers.
 		if errors.Is(err, reach.ErrUnsupportedReach) {
 			return fmt.Errorf("engine: smoke-test %q: %w: %w", nodeID, ErrSmokeTestUnsupported, err)
 		}
@@ -537,11 +535,10 @@ type DirEntry struct {
 //
 //   - syncthing-share: resolves to the localfs adapter and lists the directory
 //     (safepath rejects any traversal/escape path before any I/O).
-//   - ssh: resolve has no adapter yet, so this returns ErrBrowseUnsupported
+//   - a reach nothing can serve: returns ErrBrowseUnsupported
 //     (which wraps reach.ErrUnsupportedReach). The web layer matches the engine
 //     sentinel and renders "browsing not supported for this node" WITHOUT
 //     importing internal/reach.
-//     TODO(slice-ssh): a real ssh adapter makes ssh nodes browsable.
 //
 // BrowseNode is read-only: it never mutates the store or the node. A missing
 // node returns store.ErrNotFound. A traversal/unsafe relPath surfaces the
@@ -553,9 +550,9 @@ func (e *Engine) BrowseNode(ctx context.Context, nodeID, relPath string) ([]DirE
 	}
 	r, err := e.resolve(node)
 	if err != nil {
-		// No adapter wired (ssh today) surfaces as the engine's own
-		// ErrBrowseUnsupported so the web layer maps "not supported yet" without
-		// importing internal/reach; the underlying cause stays in the chain.
+		// A reach nothing can serve surfaces as the engine's own
+		// ErrBrowseUnsupported so the web layer can report it without importing
+		// internal/reach; the underlying cause stays in the chain.
 		if errors.Is(err, reach.ErrUnsupportedReach) {
 			return nil, fmt.Errorf("engine: browse %q: %w: %w", nodeID, ErrBrowseUnsupported, err)
 		}

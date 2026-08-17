@@ -53,14 +53,14 @@ func nodeRowCtx(page nodesPageData, row nodeAdminRow) nodeRowContext {
 // requireAuth + requireAdmin (and the mutations behind requireCSRF) in
 // Server.Handler, so a non-admin never reaches the Store here.
 //
-// Secrets discipline (docs/auth.md): the reach_config form for an ssh node
+// Secrets discipline (docs/auth.md): the reach_config form
 // collects a secret_ref — a NAME/key into the host's secret store — never a
 // cleartext password or key. No handler here reads, stores, displays, or logs an
 // actual secret. reach_config holds only non-secret connection info + secret_ref.
 //
 // Reach boundary: smoke-test goes through the Actioner.SmokeTest engine method,
 // NOT a direct internal/reach call, so this package imports NO internal/reach,
-// pgx, or store-postgres. The ssh "not supported yet" case is matched on the
+// pgx, or store-postgres. The unsupported-reach case is matched on the
 // engine's own engine.ErrSmokeTestUnsupported sentinel (engine is core logic,
 // not infrastructure — the same dependency the conflict handlers already have).
 
@@ -89,10 +89,7 @@ type nodeAdminRow struct {
 	Kind        string
 	Reach       string
 	// reach_config fields for pre-filling the edit form (non-secret only).
-	Path      string
-	Host      string
-	SSHUser   string
-	SecretRef string
+	Path string
 }
 
 var nodeKindOptions = []string{
@@ -101,7 +98,7 @@ var nodeKindOptions = []string{
 }
 
 var nodeReachOptions = []string{
-	string(store.ReachSyncthingShare), string(store.ReachSSH),
+	string(store.ReachSyncthingShare),
 }
 
 // --- GET /nodes ----------------------------------------------------------
@@ -155,10 +152,7 @@ func (s *Server) buildNodesPage(ctx context.Context, u store.User) (nodesPageDat
 			Kind:    string(n.Kind),
 			Reach:   string(n.Reach),
 			// reach_config: only non-secret fields. There is no secret to copy.
-			Path:      n.ReachConfig.Path,
-			Host:      n.ReachConfig.Host,
-			SSHUser:   n.ReachConfig.User,
-			SecretRef: n.ReachConfig.SecretRef,
+			Path: n.ReachConfig.Path,
 		}
 		if n.OwnerUserID != nil {
 			row.OwnerUserID = *n.OwnerUserID
@@ -172,8 +166,8 @@ func (s *Server) buildNodesPage(ctx context.Context, u store.User) (nodesPageDat
 // --- POST /api/nodes (create) --------------------------------------------
 
 // handleCreateNode handles POST /api/nodes. Form fields: id, owner_user_id
-// (optional), display, kind, reach, plus reach_config fields (path for
-// syncthing-share; host/user/secret_ref for ssh). On success it returns the
+// (optional), display, kind, reach, plus the reach_config path. On success it
+// returns the
 // refreshed node-list fragment. Error mapping:
 //   - duplicate id (ErrConflict)         -> 409
 //   - bad kind/reach (caught locally in parseNodeForm) -> 400
@@ -269,7 +263,8 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 // or a driver. The result is purely transient — nothing is persisted (there is no
 // last_seen / reachable storage anymore). Returns an HTML result fragment:
 //   - nil           -> "reachable".
-//   - ErrSmokeTestUnsupported (ssh) -> "smoke-test not supported yet (ssh adapter pending)".
+//   - ErrSmokeTestUnsupported -> a friendly, actionable message (a stored reach
+//     value nothing can serve is a data fault the admin fixes by editing it).
 //   - any other error -> the error, surfaced to the admin.
 func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
 	if s.actioner == nil {
@@ -291,7 +286,7 @@ func (s *Server) handleSmokeTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such node", http.StatusNotFound)
 		return
 	case errors.Is(err, engine.ErrSmokeTestUnsupported):
-		result.Message = "smoke-test not supported yet (ssh adapter pending)"
+		result.Message = "this device has a reach setting RetroSync cannot use — edit the device to change it"
 	default:
 		// Surface the engine error to the admin (the share path is missing, etc).
 		// reach_config holds no secret, so nothing sensitive can leak here.
@@ -391,7 +386,7 @@ type browseEntry struct {
 // bytes. Error mapping:
 //   - unsafe/traversal path (ErrBrowseUnsafePath)   -> 400
 //   - missing node (store.ErrNotFound)              -> 404
-//   - unsupported reach / ssh (ErrBrowseUnsupported)-> 200 + friendly message
+//   - unsupported reach (ErrBrowseUnsupported) -> 200 + friendly message
 //   - missing dir / not-a-directory (other err)     -> 200 + friendly message
 func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 	if s.actioner == nil {
@@ -415,7 +410,7 @@ func (s *Server) handleBrowseNode(w http.ResponseWriter, r *http.Request) {
 			return
 		case errors.Is(err, engine.ErrBrowseUnsupported):
 			pick := nodeBrowsePicker(id, cleanBrowseDir(raw))
-			pick.Message = "browsing not supported for this node yet"
+			pick.Message = "this device has a reach setting RetroSync cannot browse"
 			s.renderBrowse(w, r, pick)
 			return
 		default:
@@ -596,13 +591,9 @@ func (s *Server) renderBrowse(w http.ResponseWriter, r *http.Request, pick brows
 // "" and the id comes from the form. It returns the assembled Node and a non-empty
 // human message string on a validation failure (the caller 400s with it).
 //
-// reach_config shape is validated here per reach:
-//   - syncthing-share: requires a non-empty path.
-//   - ssh: requires host, user, and secret_ref (secret_ref is a NAME into the
-//     host secret store, NEVER a cleartext credential — see docs/auth.md).
-//
-// No password/secret field is ever read. reach_config carries only non-secret
-// reach info + secret_ref.
+// reach_config shape is validated here per reach: syncthing-share requires a
+// non-empty path. No password or secret field is ever read — reach_config
+// carries only non-secret reach info (docs/auth.md).
 func (s *Server) parseNodeForm(r *http.Request, idOverride string) (store.Node, string) {
 	if err := r.ParseForm(); err != nil {
 		return store.Node{}, "bad request"
@@ -630,7 +621,7 @@ func (s *Server) parseNodeForm(r *http.Request, idOverride string) (store.Node, 
 	}
 	rch := store.Reach(strings.TrimSpace(r.PostFormValue("reach")))
 	if !store.ValidReach(rch) {
-		return store.Node{}, "reach must be one of syncthing-share, ssh"
+		return store.Node{}, "reach must be syncthing-share"
 	}
 
 	n := store.Node{ID: id, Display: display, Kind: kind, Reach: rch}
@@ -640,24 +631,13 @@ func (s *Server) parseNodeForm(r *http.Request, idOverride string) (store.Node, 
 		n.OwnerUserID = &owner
 	}
 
-	// reach_config shape per reach. Only the fields valid for the chosen reach are
-	// kept; the others are left zero so a stale path/host can't linger.
-	switch rch {
-	case store.ReachSyncthingShare:
-		path := strings.TrimSpace(r.PostFormValue("path"))
-		if path == "" {
-			return store.Node{}, "syncthing-share requires a non-empty path"
-		}
-		n.ReachConfig = store.ReachConfig{Path: path}
-	case store.ReachSSH:
-		host := strings.TrimSpace(r.PostFormValue("host"))
-		user := strings.TrimSpace(r.PostFormValue("user"))
-		secretRef := strings.TrimSpace(r.PostFormValue("secret_ref"))
-		if host == "" || user == "" || secretRef == "" {
-			return store.Node{}, "ssh requires host, user, and secret_ref"
-		}
-		n.ReachConfig = store.ReachConfig{Host: host, User: user, SecretRef: secretRef}
+	// reach_config shape per reach. ValidReach above has already rejected
+	// anything but syncthing-share, so this is the only shape to assemble.
+	path := strings.TrimSpace(r.PostFormValue("path"))
+	if path == "" {
+		return store.Node{}, "syncthing-share requires a non-empty path"
 	}
+	n.ReachConfig = store.ReachConfig{Path: path}
 	return n, ""
 }
 

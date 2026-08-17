@@ -59,7 +59,6 @@ type Reach string
 
 const (
 	ReachSyncthingShare Reach = "syncthing-share"
-	ReachSSH            Reach = "ssh"
 )
 
 // Allowed enum value sets, mirroring the CHECK constraints in the registry
@@ -68,7 +67,7 @@ const (
 var (
 	validRoles = map[Role]bool{RoleUser: true, RoleAdmin: true}
 	validKinds = map[Kind]bool{KindDeck: true, KindMister: true, KindAnbernic: true, KindGeneric: true}
-	validReach = map[Reach]bool{ReachSyncthingShare: true, ReachSSH: true}
+	validReach = map[Reach]bool{ReachSyncthingShare: true}
 )
 
 // ValidRole reports whether r is an allowed role value.
@@ -83,23 +82,17 @@ func ValidReach(r Reach) bool { return validReach[r] }
 // ReachConfig carries the non-secret connection info for a node.
 //
 // Secrets discipline (docs/auth.md): this struct NEVER holds a cleartext
-// password or private key. For ssh nodes it carries SecretRef, a pointer into
-// the host's secret store (sops file, vault, etc). The actual credential is
-// resolved out of band in a later slice. Do not log this struct's contents
-// without redaction even so, to keep host/user/path out of logs.
+// password or private key. Do not log its contents without redaction even so,
+// to keep paths out of logs.
+//
+// It carries exactly one field today because there is exactly one reach
+// strategy. A future strategy that needs connection details adds its own
+// fields here, alongside a `reach` value and an adapter — that is the whole
+// cost of adding one, which was the point of the Reach port.
 type ReachConfig struct {
 	// Path is the server-local filesystem path of the Syncthing share.
 	// Set for reach=syncthing-share.
 	Path string `json:"path,omitempty"`
-
-	// Host is the ssh host (ip or name). Set for reach=ssh.
-	Host string `json:"host,omitempty"`
-	// User is the ssh login user. Set for reach=ssh.
-	User string `json:"user,omitempty"`
-	// SecretRef is a key into the host's secret store identifying the
-	// credential for this node. It is a pointer, never the secret itself.
-	// Set for reach=ssh.
-	SecretRef string `json:"secret_ref,omitempty"`
 }
 
 // User is a human who logs into the web UI.

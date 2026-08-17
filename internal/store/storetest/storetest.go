@@ -288,14 +288,16 @@ func testNodes(t *testing.T, s store.Store) {
 		t.Fatalf("OwnerUserID = %v, want bob", got.OwnerUserID)
 	}
 
-	// Shared node: nil owner, ssh reach with secret_ref (no cleartext secret).
+	// Shared node: nil owner. A MiSTer is reached the same way every device is —
+	// it runs Syncthing and shares its saves (the `ssh` strategy was dropped in
+	// 0010; see docs/architecture.md).
 	mister := store.Node{
 		ID:          "living-room-mister",
 		OwnerUserID: nil,
 		Display:     "Living Room MiSTer",
 		Kind:        store.KindMister,
-		Reach:       store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "172.16.7.12", User: "root", SecretRef: "mister-1"},
+		Reach:       store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/mister-saves"},
 	}
 	if err := s.CreateNode(c, mister); err != nil {
 		t.Fatalf("CreateNode mister: %v", err)
@@ -307,8 +309,8 @@ func testNodes(t *testing.T, s store.Store) {
 	if gm.OwnerUserID != nil {
 		t.Fatalf("shared node OwnerUserID = %v, want nil", gm.OwnerUserID)
 	}
-	if gm.ReachConfig.SecretRef != "mister-1" {
-		t.Fatalf("SecretRef = %q, want mister-1", gm.ReachConfig.SecretRef)
+	if gm.ReachConfig.Path != "/shares/mister-saves" {
+		t.Fatalf("Path = %q, want /shares/mister-saves", gm.ReachConfig.Path)
 	}
 
 	if _, err := s.GetNode(c, "nope"); !errors.Is(err, store.ErrNotFound) {
@@ -324,7 +326,7 @@ func testNodes(t *testing.T, s store.Store) {
 	if got.Display != "Bob Deck 2" {
 		t.Fatalf("UpdateNode not applied: %+v", got)
 	}
-	if err := s.UpdateNode(c, store.Node{ID: "ghost", Kind: store.KindGeneric, Reach: store.ReachSSH}); !errors.Is(err, store.ErrNotFound) {
+	if err := s.UpdateNode(c, store.Node{ID: "ghost", Kind: store.KindGeneric, Reach: store.ReachSyncthingShare}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("UpdateNode(missing): want ErrNotFound, got %v", err)
 	}
 
@@ -353,8 +355,8 @@ func testInvalidReference(t *testing.T, s store.Store) {
 	// CreateNode with a non-existent owner_user_id.
 	err := s.CreateNode(c, store.Node{
 		ID: "orphan-node", OwnerUserID: ptr("ghost-user"), Display: "Orphan",
-		Kind: store.KindGeneric, Reach: store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "r"},
+		Kind: store.KindGeneric, Reach: store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/orphan"},
 	})
 	if !errors.Is(err, store.ErrInvalidReference) {
 		t.Fatalf("CreateNode(bad owner): want ErrInvalidReference, got %v", err)
@@ -397,8 +399,8 @@ func testInvalidValue(t *testing.T, s store.Store) {
 	// Bad kind.
 	err = s.CreateNode(c, store.Node{
 		ID: "n1", OwnerUserID: ptr("owner"), Display: "N",
-		Kind: store.Kind("toaster"), Reach: store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "r"},
+		Kind: store.Kind("toaster"), Reach: store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/n1"},
 	})
 	if !errors.Is(err, store.ErrInvalidValue) {
 		t.Fatalf("CreateNode(bad kind): want ErrInvalidValue, got %v", err)
@@ -1464,7 +1466,7 @@ func mustNode(t *testing.T, s store.Store, id string, owner *string) {
 		OwnerUserID: owner,
 		Display:     id,
 		Kind:        store.KindGeneric,
-		Reach:       store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "ref"},
+		Reach:       store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/" + id},
 	}))
 }

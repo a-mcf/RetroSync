@@ -151,33 +151,39 @@ func TestCreateNode_SyncthingMissingPath_400(t *testing.T) {
 	}
 }
 
-func TestCreateNode_SSHRequiresHostUserSecretRef(t *testing.T) {
+// TestCreateNode_SSHRejected: `ssh` was dropped in 0010 (the MiSTer runs
+// Syncthing, so the strategy never had a device and was never implemented).
+// It must be REFUSED now, not accepted-and-inert — an accepted ssh node was a
+// node that silently never synced, which is the trap this removal closes.
+func TestCreateNode_SSHRejected(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
 
-	// Missing secret_ref -> 400.
 	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
-		"id": {"mister-2"}, "display": {"MiSTer 2"}, "kind": {"mister"},
-		"reach": {"ssh"}, "host": {"10.0.0.9"}, "user": {"root"},
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("ssh missing secret_ref = %d, want 400", rec.Code)
-	}
-
-	// Full ssh node -> created, secret_ref stored (a NAME, not a secret).
-	rec = postForm(t, f, c, csrf, "/api/nodes", url.Values{
 		"id": {"mister-2"}, "display": {"MiSTer 2"}, "kind": {"mister"},
 		"reach": {"ssh"}, "host": {"10.0.0.9"}, "user": {"root"}, "secret_ref": {"mister-2-key"},
 	})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ssh create status = %d, want 400\n%s", rec.Code, rec.Body.String())
+	}
+	if nodeIDs(t, f)["mister-2"] {
+		t.Error("an ssh node was created; the strategy no longer exists")
+	}
+
+	// A MiSTer is registered like any other device: it runs Syncthing.
+	rec = postForm(t, f, c, csrf, "/api/nodes", url.Values{
+		"id": {"mister-2"}, "display": {"MiSTer 2"}, "kind": {"mister"},
+		"reach": {"syncthing-share"}, "path": {"/shares/mister-saves"},
+	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("ssh create status = %d, want 200\n%s", rec.Code, rec.Body.String())
+		t.Fatalf("mister create status = %d, want 200\n%s", rec.Code, rec.Body.String())
 	}
 	n, err := f.store.GetNode(context.Background(), "mister-2")
 	if err != nil {
-		t.Fatalf("ssh node not created: %v", err)
+		t.Fatalf("mister node not created: %v", err)
 	}
-	if n.ReachConfig.SecretRef != "mister-2-key" || n.ReachConfig.Host != "10.0.0.9" {
-		t.Errorf("ssh reach_config wrong: %+v", n.ReachConfig)
+	if n.Kind != store.KindMister || n.ReachConfig.Path != "/shares/mister-saves" {
+		t.Errorf("mister node wrong: %+v", n)
 	}
 }
 
@@ -291,7 +297,11 @@ func TestSmokeTest_ErrorSurfaced(t *testing.T) {
 	}
 }
 
-func TestSmokeTest_SSHUnsupportedMessage(t *testing.T) {
+// A reach the resolver cannot serve reports as a message rather than an error
+// pill. Every strategy the registry accepts has an adapter, so this now means a
+// node whose stored reach is one nothing can serve — a data fault, but the admin
+// still gets a sentence instead of a 500.
+func TestSmokeTest_UnsupportedReachMessage(t *testing.T) {
 	f := newActionFixture(t)
 	f.act.smokeErr = engine.ErrSmokeTestUnsupported
 	c, csrf := loginAs(t, f, "bob")
@@ -300,8 +310,10 @@ func TestSmokeTest_SSHUnsupportedMessage(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("smoke-test status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "not supported yet") {
-		t.Errorf("expected ssh 'not supported yet' message, got: %s", rec.Body.String())
+	// Assert on an apostrophe-free substring: html/template escapes ' to &#39;,
+	// so copy containing one will not match a naive Contains.
+	if !strings.Contains(rec.Body.String(), "reach setting RetroSync cannot use") {
+		t.Errorf("expected an unsupported-reach message, got: %s", rec.Body.String())
 	}
 }
 
@@ -416,8 +428,10 @@ func TestNodesMutations_CSRF(t *testing.T) {
 // --- secrets discipline --------------------------------------------------
 
 // TestSecretNeverEchoedOrStored confirms a stray cleartext "password"/"secret"
-// field submitted alongside an ssh node is NOT stored and NOT echoed back. Only
-// secret_ref (a name) is retained.
+// field submitted alongside a node is NOT stored and NOT echoed back. The form
+// parser reads only the fields it knows; anything else a browser, a script, or a
+// mistaken operator sends must fall on the floor rather than land in
+// reach_config or come back in the response.
 func TestSecretNeverEchoedOrStored(t *testing.T) {
 	f := newActionFixture(t)
 	c, csrf := loginAs(t, f, "bob")
@@ -425,10 +439,11 @@ func TestSecretNeverEchoedOrStored(t *testing.T) {
 	const leaked = "hunter2-SUPER-SECRET-PASSWORD"
 	rec := postForm(t, f, c, csrf, "/api/nodes", url.Values{
 		"id": {"mister-x"}, "display": {"MiSTer X"}, "kind": {"mister"},
-		"reach": {"ssh"}, "host": {"10.0.0.5"}, "user": {"root"},
-		"secret_ref": {"mister-x-ref"},
+		"reach": {"syncthing-share"}, "path": {"/shares/mister-x"},
 		// Attacker/operator mistakenly pastes a real secret into extra fields.
 		"password": {leaked}, "secret": {leaked}, "key": {leaked},
+		// Fields belonging to the dropped ssh strategy are likewise ignored.
+		"host": {"10.0.0.5"}, "user": {"root"}, "secret_ref": {leaked},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create status = %d, want 200\n%s", rec.Code, rec.Body.String())
@@ -442,10 +457,10 @@ func TestSecretNeverEchoedOrStored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get node: %v", err)
 	}
-	if n.ReachConfig.SecretRef != "mister-x-ref" {
-		t.Errorf("secret_ref = %q, want the ref name", n.ReachConfig.SecretRef)
+	if n.ReachConfig.Path != "/shares/mister-x" {
+		t.Errorf("path = %q, want the submitted share path", n.ReachConfig.Path)
 	}
-	if strings.Contains(n.ReachConfig.Path+n.ReachConfig.Host+n.ReachConfig.User+n.ReachConfig.SecretRef, leaked) {
+	if strings.Contains(n.ReachConfig.Path, leaked) {
 		t.Error("a cleartext secret was stored in reach_config")
 	}
 	// And it must not appear when the node is rendered on the registry page.

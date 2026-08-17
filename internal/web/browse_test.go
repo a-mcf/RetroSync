@@ -155,8 +155,9 @@ func TestBrowse_TraversalRejected400(t *testing.T) {
 	}
 }
 
-// TestBrowse_UnsupportedReachFriendly: an ssh / unsupported-reach node returns
-// 200 with a friendly "not supported" message rather than an error status.
+// TestBrowse_UnsupportedReachFriendly: a node whose reach cannot be browsed
+// returns 200 with a friendly message rather than an error status, so the picker
+// explains itself in place instead of failing the request.
 func TestBrowse_UnsupportedReachFriendly(t *testing.T) {
 	f := newActionFixture(t)
 	f.act.browseErr = engine.ErrBrowseUnsupported
@@ -166,8 +167,8 @@ func TestBrowse_UnsupportedReachFriendly(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unsupported browse status = %d, want 200 + message", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "not supported") {
-		t.Errorf("expected friendly 'not supported' message, got: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "reach setting RetroSync cannot browse") {
+		t.Errorf("expected a friendly unsupported-reach message, got: %s", rec.Body.String())
 	}
 }
 
