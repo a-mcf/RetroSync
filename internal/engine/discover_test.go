@@ -62,14 +62,11 @@ func newDiscoverHarness(t *testing.T) *discoverHarness {
 		fakes: map[string]*fakereach.Fake{},
 	}
 	resolve := func(n store.Node) (reach.Reach, error) {
-		if n.Reach == store.ReachSSH {
-			// Production resolve returns ErrUnsupportedReach for ssh; discovery must
-			// SKIP such a node, not error.
-			return nil, fmt.Errorf("resolve %q: %w", n.ID, reach.ErrUnsupportedReach)
-		}
+		// A node with no fake stands in for one production cannot resolve — a
+		// reach with no adapter. Discovery must SKIP it, not fail the whole scan.
 		f, ok := h.fakes[n.ID]
 		if !ok {
-			t.Fatalf("no fake for node %q", n.ID)
+			return nil, fmt.Errorf("resolve %q: %w", n.ID, reach.ErrUnsupportedReach)
 		}
 		return f, nil
 	}
@@ -91,12 +88,14 @@ func (h *discoverHarness) node(id string) *fakereach.Fake {
 	return f
 }
 
-// sshNode registers an ssh node (no fake; the resolver returns ErrUnsupportedReach).
-func (h *discoverHarness) sshNode(id string) {
+// unresolvableNode registers a node with NO fake behind it, so the harness
+// resolver returns ErrUnsupportedReach for it — standing in for a reach the
+// production resolver has no adapter for.
+func (h *discoverHarness) unresolvableNode(id string) {
 	h.t.Helper()
 	if err := h.store.CreateNode(context.Background(), store.Node{
-		ID: id, Display: id, Kind: store.KindMister, Reach: store.ReachSSH,
-		ReachConfig: store.ReachConfig{Host: "h", User: "u", SecretRef: "s"},
+		ID: id, Display: id, Kind: store.KindMister, Reach: store.ReachSyncthingShare,
+		ReachConfig: store.ReachConfig{Path: "/shares/" + id},
 	}); err != nil {
 		h.t.Fatal(err)
 	}
@@ -128,7 +127,7 @@ func TestDiscoverGames_AggregatesAcrossNodes(t *testing.T) {
 
 	bob := h.node("bob-deck")
 	alice := h.node("alice-deck")
-	h.sshNode("mister") // must be SKIPPED, not errored
+	h.unresolvableNode("mister") // must be SKIPPED, not errored
 
 	// Same inferred game on two nodes (different region tags) -> one group, two
 	// candidates.
@@ -282,7 +281,7 @@ func TestDiscoverGames_SkipsBadNode(t *testing.T) {
 func TestDiscoverGames_SkipHookFiresForSSH(t *testing.T) {
 	h := newDiscoverHarness(t)
 	h.node("deck").Put("Game (USA).srm", []byte("a"), mt("2026-06-20T10:00:00Z"))
-	h.sshNode("mister")
+	h.unresolvableNode("mister")
 
 	var skipped []string
 	engine.SetDiscoverSkipHookForTest(func(nodeID, reason string, err error) {

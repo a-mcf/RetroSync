@@ -127,7 +127,7 @@ conflict modal above).
 Scan rules (all in the engine, read-only):
 
 - Only **directory-listing-reachable** nodes are scanned (syncthing-share today);
-  ssh nodes are **skipped**, not errored. A node whose scan fails (missing share,
+  a node whose reach cannot be resolved is **skipped**, not errored. A node whose scan fails (missing share,
   I/O) is skipped too — one bad node never fails discovery.
 - The per-node walk is **bounded** (max depth, max total entries) so a deep or
   pathological tree can't hang it.

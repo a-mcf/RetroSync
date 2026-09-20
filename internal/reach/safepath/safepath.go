@@ -1,7 +1,7 @@
 // Package safepath resolves a node-relative path against an absolute root and
 // guarantees the result stays inside that root. It is the single chokepoint for
 // path-traversal defense shared by every filesystem-backed Reach adapter (the
-// local syncthing-share adapter today, the ssh/sftp adapter in a later slice),
+// local syncthing-share adapter today, any future transport adapter),
 // so the containment policy lives in exactly one place.
 //
 // The threat it defends against: a game_paths.path row is registry data and

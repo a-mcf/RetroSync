@@ -9,7 +9,7 @@
 //
 // Note on the writeback model: docs/architecture.md flags that writing into a
 // Syncthing share races with the device's own writes, so the real production
-// writeback for these nodes is intended to go out of band (ssh). This adapter
+// writeback for these nodes goes back through the share. This adapter
 // still implements WriteAtomic faithfully — it is exercised by the engine's
 // fan-out and is the correct primitive for any local-fs destination (e.g. the
 // server's own node, tests). The race policy is a Resolver/wiring concern, not

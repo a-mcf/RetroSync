@@ -111,7 +111,7 @@ returned only by the mutation routes' refresh responses.)
 
 Create. Form fields: `id`, `owner_user_id?`, `display`, `kind`, `reach`, plus
 reach-config fields (`path` for `syncthing-share`; `host`/`user`/`secret_ref` for
-`ssh`). Errors: duplicate id → `409`; bad owner FK → `422`; bad kind/reach or bad
+`syncthing-share` only). Errors: duplicate id → `409`; bad owner FK → `422`; bad kind/reach or bad
 reach-config shape (caught in form validation) → `400`.
 
 ### `POST /api/nodes/{id}`
@@ -130,8 +130,8 @@ no active-session FK to block it.
 Probe reachability (engine `SmokeTest` → localfs stat of the save root). Returns an
 HTML result fragment with a **transient** result — "reachable" on success, or the
 error surfaced to the admin. Nothing is persisted; the fragment reflects only the
-live probe at click time. For an `ssh` node the adapter is not wired yet, so the
-fragment says "not supported yet (ssh adapter pending)". Unknown node → `404`.
+live probe at click time. A node whose stored reach cannot be resolved reports a
+friendly message rather than an error. Unknown node → `404`.
 
 ## Registry — People (admin-only)
 
@@ -263,7 +263,7 @@ create.
 ### `GET /discover`
 
 The discovery admin page. On load it runs a read-only scan of every
-directory-listing-reachable node (syncthing-share; **ssh nodes are skipped**, not
+directory-listing-reachable node (**a node whose reach cannot be resolved is skipped**, not
 errored), infers a game name from each **save-like** file (a fixed SRAM/EEPROM/
 memory-card extension set; `.state*` save-states excluded), drops files already in
 a sync (`(node, path)` already a `sync_member`), and renders the survivors grouped

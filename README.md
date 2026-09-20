@@ -105,9 +105,8 @@ RetroSync is a single **Go 1.23** service backed by **Postgres**.
 - **The `reach` abstraction.** Nodes are reached through a `Reach` adapter
   resolved from the node's reach strategy. Today only **`syncthing-share`** is
   wired — a localfs adapter rooted at `reach_config.path`, with atomic
-  temp-file-then-rename writes. The **`ssh`/sftp** adapter is a documented future
-  strategy: `ssh` nodes currently resolve to "not supported yet"
-  (`reach.ErrUnsupportedReach`).
+  temp-file-then-rename writes. It is the only strategy — every device, MiSTer
+  included, runs Syncthing and shares its save folder.
 
 ### Deployment
 
@@ -211,9 +210,9 @@ never corrupts the real save.
 
 Registered as `TODO(...)` hook points in the code, not yet built:
 
-- **ssh/sftp reach adapter** — `ssh` nodes resolve to `reach.ErrUnsupportedReach`;
-  only `syncthing-share` (localfs) is wired. Writeback into a device that must be
-  reached over SSH (MiSTer's RO root, locked-down handhelds) is blocked on this.
+- **Delivery verification** — RetroSync writes a save into the share and treats
+  the write as done; it never asks Syncthing whether the bytes actually reached
+  the other devices. Syncthing's per-device completion API can answer that.
 - **Syncthing-status poller** — there is no always-on, Syncthing-derived node
   status (reachability / backup-health). The only reachability check today is the
   on-demand smoke-test, which probes localfs reachability live and persists nothing;

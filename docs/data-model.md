@@ -60,13 +60,12 @@ A node is any device that holds save files. Decks, MiSTers, Anbernics, the house
 | owner_user_id   | text   | FK → users; nullable for shared nodes (the MiSTer)      |
 | display         | text   | "Bob's Deck"                                            |
 | kind            | text   | `deck`, `mister`, `anbernic`, `generic`                 |
-| reach           | text   | `syncthing-share` or `ssh`                              |
+| reach           | text   | `syncthing-share` (the only strategy; see migration 0010) |
 | reach_config    | json   | shape depends on `reach` (see below)                    |
 
 #### reach_config shapes
 
 - `syncthing-share`: `{ "path": "/srv/syncthing/bob-deck-saves" }`
-- `ssh`: `{ "host": "172.16.7.12", "user": "root", "secret_ref": "mister-1" }` — `secret_ref` is a key into the host's secret store (sops file, vault, etc).
 
 ### `syncs`
 
@@ -112,7 +111,6 @@ want playable.
 separate `save_roots` field) so that:
 
 - For `syncthing-share` nodes, retrosync resolves to `<reach_config.path>/<save_root>/<path>` on the local filesystem.
-- For `ssh` nodes, retrosync resolves to `<save_root>/<path>` on the remote.
 
 This keeps registry rows portable if a path prefix moves.
 

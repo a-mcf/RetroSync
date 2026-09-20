@@ -3,51 +3,26 @@
 <head>
   {{template "head" "RetroSync — Devices"}}
   <script>
-    // Reveal the reach_config fields that apply to the selected reach. Pure
-    // progressive-enhancement: the server validates the shape regardless.
-    function syncReachFields(form) {
-      var reach = form.querySelector('[name=reach]').value;
-      form.querySelectorAll('[data-reach]').forEach(function (el) {
-        el.style.display = (el.getAttribute('data-reach') === reach) ? '' : 'none';
-      });
-    }
-    document.addEventListener('DOMContentLoaded', function () {
-      document.querySelectorAll('form.node-form').forEach(function (f) {
-        syncReachFields(f);
-        var sel = f.querySelector('[name=reach]');
-        if (sel) sel.addEventListener('change', function () { syncReachFields(f); });
-      });
-    });
     // Let HTMX swap the 409/422/4xx bodies so the inline error text shows.
     document.addEventListener('htmx:beforeOnLoad', function (e) {
       var s = e.detail.xhr.status;
       if (s >= 400 && s < 500) { e.detail.shouldSwap = true; e.detail.isError = false; }
     });
-    // A swapped-in nodes list carries fresh edit forms, so re-apply the
-    // reach-field reveal to them (DOMContentLoaded has long since fired).
-    document.addEventListener('htmx:afterSwap', function (e) {
-      if (!e.target || !e.target.querySelectorAll) return;
-      e.target.querySelectorAll('form.node-form').forEach(function (f) {
-        syncReachFields(f);
-        var sel = f.querySelector('[name=reach]');
-        if (sel) sel.addEventListener('change', function () { syncReachFields(f); });
-      });
-    });
-    // Server folder picker (slice-29): clicking "Use this folder" fills the sibling
-    // syncthing-share path input with the current folder's ABSOLUTE path (rendered
-    // server-side into data-abs, since the client can't know the share root) and
-    // collapses the panel. Folder rows are htmx re-browse requests handled
-    // server-side; file rows in this mode are inert. Progressive-enhancement only —
-    // the manual path field stays as a fallback and the server validates regardless.
+    // Server folder picker (slice-29): clicking "Use this folder" fills the path
+    // input with the current folder's ABSOLUTE path (rendered server-side into
+    // data-abs, since the client can't know the share root) and collapses the
+    // panel. Folder rows are htmx re-browse requests handled server-side; file
+    // rows in this mode are inert. Progressive-enhancement only — the manual path
+    // field stays as a fallback and the server validates regardless.
     document.addEventListener('click', function (e) {
       var t = e.target.closest && e.target.closest('.browse-usedir');
       if (!t) return;
       e.preventDefault();
       var abs = t.getAttribute('data-abs') || '';
-      var block = t.closest('[data-reach="syncthing-share"]');
+      var form = t.closest('form.node-form');
       var panel = t.closest('.browse-panel');
-      if (block) {
-        var pathInput = block.querySelector('[name=path]');
+      if (form) {
+        var pathInput = form.querySelector('[name=path]');
         if (pathInput) pathInput.value = abs;
       }
       if (panel) panel.innerHTML = '';
@@ -91,25 +66,15 @@
               {{range .Reaches}}<option value="{{.}}">{{.}}</option>{{end}}
             </select>
           </label>
-          <div data-reach="syncthing-share">
-            <label>Path <input type="text" name="path" placeholder="/shares/bob-deck-saves"></label>
-            <!-- Server folder picker (slice-29): browse the server's share mount and
-                 click "Use this folder" to fill the absolute path above, instead of
-                 typing it. The panel is the next sibling. The manual field stays as a
-                 fallback. -->
-            <button class="secondary outline node-browse" type="button"
-                    hx-get="/api/server/browse?path="
-                    hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
-            <div class="browse-panel"></div>
-          </div>
-          <div data-reach="ssh">
-            <label>Host <input type="text" name="host" placeholder="172.16.7.12"></label>
-            <label>User <input type="text" name="user" placeholder="root"></label>
-            <!-- secret_ref is a NAME into the host secret store, never a password. -->
-            <label>Secret ref <input type="text" name="secret_ref" placeholder="mister-1"></label>
-            <small class="sub">secret_ref names a credential in the host secret store.
-               Never paste a password or key here.</small>
-          </div>
+          <label>Path <input type="text" name="path" placeholder="/shares/bob-deck-saves"></label>
+          <!-- Server folder picker (slice-29): browse the server's share mount and
+               click "Use this folder" to fill the absolute path above, instead of
+               typing it. The panel is the next sibling. The manual field stays as a
+               fallback. -->
+          <button class="secondary outline node-browse" type="button"
+                  hx-get="/api/server/browse?path="
+                  hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+          <div class="browse-panel"></div>
           <button type="submit">Add device</button>
           <div class="form-error"></div>
         </form>
@@ -175,19 +140,12 @@
           {{range $reaches}}<option value="{{.}}" {{if eq . $reach}}selected{{end}}>{{.}}</option>{{end}}
         </select>
       </label>
-      <div data-reach="syncthing-share">
-        <label>Path <input type="text" name="path" value="{{.Path}}"></label>
-        <!-- Server folder picker (slice-29): same as the add form above. -->
-        <button class="secondary outline node-browse" type="button"
-                hx-get="/api/server/browse?path="
-                hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
-        <div class="browse-panel"></div>
-      </div>
-      <div data-reach="ssh">
-        <label>Host <input type="text" name="host" value="{{.Host}}"></label>
-        <label>User <input type="text" name="user" value="{{.SSHUser}}"></label>
-        <label>Secret ref <input type="text" name="secret_ref" value="{{.SecretRef}}"></label>
-      </div>
+      <label>Path <input type="text" name="path" value="{{.Path}}"></label>
+      <!-- Server folder picker (slice-29): same as the add form above. -->
+      <button class="secondary outline node-browse" type="button"
+              hx-get="/api/server/browse?path="
+              hx-target="next .browse-panel" hx-swap="innerHTML">Browse&hellip;</button>
+      <div class="browse-panel"></div>
       <button type="submit">Save changes</button>
     </form>
     <!-- Destructive, so it is the quietest control on the card and lives behind

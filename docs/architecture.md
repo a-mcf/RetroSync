@@ -5,17 +5,15 @@
 ```
    node A              node B               node C            node D
    (Deck:bob)          (Deck:alice)         (Anbernic:kid)    (MiSTer)
-   ├─ syncthing        ├─ syncthing         ├─ syncthing       (no agent;
-   └─ retrosync-       └─ retrosync-        └─ retrosync-       SSH only)
-      agent (opt)         agent (opt)          agent (opt)
+   └─ syncthing        └─ syncthing         └─ syncthing      └─ syncthing
         │                   │                    │                │
-        └───────────────────┼────────────────────┘                │
-                            │                                     │
-                  ┌─────────▼──────────┐                          │
-                  │  server            │                          │
-                  │  ├─ syncthing      │                          │
-                  │  │  (backup)       │                          │
-                  │  └─ retrosync      │── SFTP/SSH ──────────────┘
+        └───────────────────┼────────────────────┴────────────────┘
+                            │
+                  ┌─────────▼──────────┐
+                  │  server            │
+                  │  ├─ syncthing      │
+                  │  │  (backup)       │
+                  │  └─ retrosync      │
                   │     ├─ web UI      │
                   │     ├─ registry    │
                   │     └─ auto-mirror │
@@ -25,14 +23,15 @@
 
 retrosync the service knows how to reach each node by its **kind** + reach-config:
 
-- **syncthing-share** — the server already has the device's save dir mounted via Syncthing. Pure local filesystem read/write.
-- **ssh** — server SSHs in. Used for nodes that don't run Syncthing or where it's awkward (MiSTer's RO root, locked-down handhelds).
+- **syncthing-share** — the server already has the device's save dir mounted via Syncthing. Pure local filesystem read/write. **This is the only strategy**, and every device kind uses it: a Deck, a MiSTer and an Anbernic all run Syncthing and share their save folder.
 
-Adding a new device kind is "register a new reach-config strategy," not "fork the codebase." A v2 could add agents that push direct.
+Adding a device that *cannot* run Syncthing means writing a new adapter behind the `Reach` port and adding a `reach` value — "register a new strategy," not "fork the codebase." That extension point is the design; a second strategy is not.
 
-> **Implemented:** the **syncthing-share → localfs** reach adapter (read *and*
-> write, atomic temp-then-rename). The **ssh** strategy is registered but not yet
-> wired (resolves to "not supported yet"); see open-questions.md.
+> **An `ssh` strategy was removed in migration 0010.** It assumed a MiSTer could
+> not run Syncthing (read-only root), so RetroSync would have to SFTP in. The
+> MiSTer runs Syncthing, so it never had a device and was never implemented —
+> while still being offered in the `/nodes` dropdown, where choosing it produced
+> a node that silently never synced.
 
 ## Roles
 
@@ -67,16 +66,28 @@ Independent. Each node send-only-shares its save dirs to the server. retrosync r
 
 ### Per-node reachability
 
-| kind             | how retrosync reads | how retrosync writes |
+| reach            | how retrosync reads | how retrosync writes |
 |------------------|---------------------|----------------------|
-| syncthing-share  | local fs            | not via Syncthing — out of band (see below) |
-| ssh              | SFTP                | SFTP, atomic rename  |
+| syncthing-share  | local fs            | local fs, atomic temp-then-rename |
 
-For syncthing-share nodes the writeback path is the tricky one: writing into the local share would Syncthing-replicate back to the device, but that race-conflicts with the device's own writes. v1 plan: writeback via SSH/SFTP into the device when needed. The Syncthing share is read-only-ish from retrosync's perspective. (Optional v2: agent on the device that takes pushes directly.)
+**Writeback goes back through the share**, and Syncthing replicates it outward.
+An earlier plan called for writing back *out of band over SSH* to avoid racing
+the device's own writes; that is not what shipped and not what is wanted. The
+race is handled where it belongs — in the engine, which only writes to members
+that did not change since the last poll, and pauses the sync outright when more
+than one did.
+
+Writing into the share does mean RetroSync depends on Syncthing noticing the
+change. That is a real coupling and it has bitten once: a fan-out that published
+a byte-identical mtime *and* size was invisible to Syncthing's scanner. See the
+mtime policy in `state-machine.md` for the rule that came out of it.
 
 ### MiSTer specifics
 
-retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root prevents key auth without rebuilding linux.img; see the home_infra ansible role for context).
+The MiSTer runs Syncthing and shares its save folder like every other device, so
+it is an ordinary `syncthing-share` node — `kind: mister` is informational only.
+Its read-only root once motivated an SSH-based design; that turned out to be
+unnecessary (see migration 0010).
 
 ## Backup vs. mirroring (recap)
 
@@ -90,7 +101,7 @@ retrosync uses SSH/SFTP, root, password from a secrets file (MiSTer's RO root pr
 
 ## Deployment
 
-RetroSync runs in **Kubernetes** as a **standalone deployment** in its own namespace. The per-device Syncthing save shares live on a network volume (NFS); RetroSync mounts that same export as its own volume, which preserves the local-side model from above — RetroSync reads the shares as ordinary local filesystem paths and writes back out of band via **SSH/SFTP** into the device, never through Syncthing. It runs with the same uid/fsGroup as the Syncthing workload so files written by either stay mutually readable and writable. (An earlier plan had RetroSync as a sidecar container in the Syncthing pod; the shared network volume makes that coupling unnecessary — the two deploy and upgrade independently.)
+RetroSync runs in **Kubernetes** as a **standalone deployment** in its own namespace. The per-device Syncthing save shares live on a network volume (NFS); RetroSync mounts that same export as its own volume, which preserves the local-side model from above — RetroSync reads *and writes* the shares as ordinary local filesystem paths, and Syncthing replicates its writes back out to the devices. It runs with the same uid/fsGroup as the Syncthing workload so files written by either stay mutually readable and writable. (An earlier plan had RetroSync as a sidecar container in the Syncthing pod; the shared network volume makes that coupling unnecessary — the two deploy and upgrade independently.)
 
 The mount point of that shared save volume is `RETROSYNC_SHARE_ROOT` (default `/shares`). It is the root the node-registry folder picker browses (docs/ui.md) so an admin can point-and-click a device's absolute mount path when registering a syncthing-share node, instead of hand-typing it. It is not existence-checked at startup — a missing directory surfaces as a friendly browse-time message.
 
